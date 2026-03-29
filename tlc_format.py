@@ -25,7 +25,7 @@ ESCAPE_PREFIX_BITS = 7   # 1111111
 ESCAPE_RAW_BITS = 16
 ESCAPE_TOTAL_BITS = 23   # 7 + 16
 MAX_SHAPE_DIMS = 8
-BLOCK_SIZE = 256          # block pointer every 256 values
+BLOCK_SIZE = 64           # block pointer every 64 values (balance: GPU parallelism vs overhead)
 BLOCK_PTR_ENTRY_SIZE = 8  # uint32 bit_offset + uint32 escape_index
 
 # Tensor header struct format (little-endian, packed)

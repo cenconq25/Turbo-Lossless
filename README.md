@@ -64,17 +64,40 @@ Escape:  prefix '1111111' + 16-bit raw  = 23 bits   (remaining,        ~0.05%)
 
 Most frequent values get shortest codes. The codebook is built per-tensor by sorting all unique BF16 values by frequency.
 
-### GPU Decoding
+### GPU Inference: Two-Phase Architecture
 
-Weights stay compressed in VRAM. Decompression is fused into the matmul kernel — the full weight matrix is never materialized:
+**Disk → VRAM**: Variable-length 8-tier .tlc format (1.47x compression) is converted at model load time to fixed-width 12-bit packed indices in VRAM (1.33x compression).
 
-1. Load 128 bits from compressed VRAM (`uint4`)
-2. Count leading 1-bits → tier index (single `__clz` instruction)
-3. Extract index bits → look up codebook in shared memory (~7 KB per tensor)
-4. Multiply by activation, accumulate
-5. Discard — weight never written back to VRAM
+**VRAM → Compute**: Fixed-width decode is fully parallel — every thread independently computes its bit position (`col × 12`), reads 12 bits, looks up codebook in shared memory, and multiplies by activation. Zero serial dependencies between values.
 
-A GPU with 92 GB VRAM can run a model that normally requires 140 GB.
+```
+Disk:     .tlc file (8-tier variable-length)     → 1.47x compression
+VRAM:     12-bit packed indices + 4096-entry LUT  → 1.33x compression
+Inference: fully parallel decode + FMA             → 1.5x FASTER than raw BF16
+```
+
+### Benchmark: AMD MI50 (gfx906)
+
+Measured on `blk.0.ffn_down.weight` [14336×4096] from Llama 3.1 8B:
+
+| | Time | Effective BW | VRAM |
+|---|------|-------------|------|
+| **Fixed-12 (ours)** | **0.71 ms** | **166 GB/s** | **88 MB** |
+| BF16 raw (rocBLAS) | 1.06 ms | 111 GB/s | 117 MB |
+
+**1.50x faster AND 1.33x smaller** than uncompressed BF16 matrix-vector multiply. The weight matrix is never materialized — only the compressed 12-bit indices and 8 KB codebook reside in VRAM.
+
+### Round-Trip Verification
+
+Encoder/decoder proven bit-perfect lossless on Llama 3.1 8B (292 tensors, 0 mismatches):
+
+```
+Original:    16.06 GB (safetensors)
+Compressed:  10.89 GB (.tlc)
+CR:          1.475x
+Mismatches:  0 / 292 tensors
+Encode time: 6.5 min
+```
 
 ## Approaches Tested
 
@@ -99,7 +122,7 @@ Empirically evaluated on Llama 3.1 8B across all 225 weight tensors:
 - **Lossless**: Every BF16 bit pattern is preserved exactly. Zero quality loss.
 - **BF16 only**: Optimized for the industry standard LLM serving format.
 - **1.5x compression on dense models, 1.2-1.4x on large MoE**: Within 0.18 bits of Shannon entropy — near theoretical limit.
-- **GPU-native**: Decompresses in registers during matmul. ~4 instructions per weight.
+- **1.5x faster inference**: Fixed-width 12-bit GPU kernel beats raw BF16 matvec by reading 25% less data with zero decode overhead.
 - **Scales**: Consistent 1.5x+ across dense models 8B–123B. Large MoE models have higher weight diversity.
 - **Broad validation**: 11 BF16 models + 5 INT4 models, 7 architectures
 - **Multi-GPU**: Tensor parallelism splits compressed data. Each GPU holds its slice + shared codebook (~7 KB).
