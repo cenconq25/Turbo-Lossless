@@ -25,10 +25,10 @@
 #define MAX_TIER_SIZE  512
 #define BLOCK_VALUES   64     // for variable-length decompress_only
 
-// Fixed-width constants
-#define INDEX_WIDTH    12     // bits per codebook index in VRAM format
-#define MAX_CODEBOOK   4096   // 2^12 entries
-#define ESCAPE_INDEX   4095   // sentinel: value not in codebook
+// Fixed-width constants — INDEX_WIDTH is now a kernel parameter, not a #define
+// Supports 10-13 bits per tensor (adaptive). Codebook size = 2^INDEX_WIDTH.
+// Escape sentinel = (1 << INDEX_WIDTH) - 1.
+#define MAX_CODEBOOK   8192   // max entries (13-bit)
 
 struct BlockPtr {
     uint32_t bit_offset;
@@ -127,13 +127,13 @@ __global__ void decompress_only(
 // ---------------------------------------------------------------------------
 // This kernel decodes variable-length, maps each BF16 value to its codebook
 // index (0-4094 for top values, 4095 for escape), and packs as 12-bit fixed.
-__global__ void varlen_to_fixed12(
+__global__ void varlen_to_fixed(
     const uint32_t* __restrict__ packed_data,
-    const int16_t*  __restrict__ codebook,     // original 8-tier codebook
+    const int16_t*  __restrict__ codebook,
     const BlockPtr* __restrict__ block_ptrs,
-    const uint32_t* __restrict__ reverse_map,  // bf16_value → 12-bit index (65536 entries)
-    uint32_t*       __restrict__ fixed_out,    // output: 12-bit packed indices
-    int num_elements, int index_bits)
+    const uint32_t* __restrict__ reverse_map,  // bf16_value → N-bit index
+    uint32_t*       __restrict__ fixed_out,
+    int num_elements, int index_bits, int out_width)  // out_width: 10-13
 {
     int tier_size = 1 << index_bits;
     int total_blocks = (num_elements + BLOCK_VALUES - 1) / BLOCK_VALUES;
@@ -153,17 +153,15 @@ __global__ void varlen_to_fixed12(
         uint64_t w = read_window64(packed_data, bit_pos);
         int16_t bf16_val = decode_varlen(w, cb, index_bits, tier_size, bit_pos);
 
-        // Map BF16 value to 12-bit codebook index
-        uint32_t idx12 = reverse_map[(uint16_t)bf16_val];
+        uint32_t idx = reverse_map[(uint16_t)bf16_val];
 
-        // Pack 12-bit index into output (LSB-first packing for GPU-friendly reads)
-        int64_t out_bit = (int64_t)(base + v) * INDEX_WIDTH;
+        int64_t out_bit = (int64_t)(base + v) * out_width;
         int out_word = out_bit >> 5;
         int out_shift = out_bit & 31;
 
-        atomicOr(&fixed_out[out_word], idx12 << out_shift);
-        if (out_shift + INDEX_WIDTH > 32) {
-            atomicOr(&fixed_out[out_word + 1], idx12 >> (32 - out_shift));
+        atomicOr(&fixed_out[out_word], idx << out_shift);
+        if (out_shift + out_width > 32) {
+            atomicOr(&fixed_out[out_word + 1], idx >> (32 - out_shift));
         }
     }
 }
@@ -177,22 +175,29 @@ __global__ void varlen_to_fixed12(
 // No serial dependency. Every thread decodes independently.
 // Grid: dim3(M). Block: dim3(256). Each thread handles K/256 values.
 
-__global__ void fixed12_matvec(
-    const uint32_t* __restrict__ fixed_packed,  // 12-bit packed indices
-    const int16_t*  __restrict__ codebook,      // 4096-entry codebook (BF16 as int16)
-    const int16_t*  __restrict__ escape_vals,   // escape values (for index=4095)
-    const int32_t*  __restrict__ escape_offsets, // per-row cumulative escape count
+// escape_map: per-value int32 array, same size as weight matrix.
+// For non-escape values: -1
+// For escape values: index into escape_vals array
+// Pre-computed on CPU during model load — zero runtime overhead.
+
+__global__ void fixed_matvec(
+    const uint32_t* __restrict__ fixed_packed,  // N-bit packed indices
+    const int16_t*  __restrict__ codebook,      // (1<<index_width) entries
+    const int16_t*  __restrict__ escape_vals,   // all escape values (flat array)
+    const int32_t*  __restrict__ escape_map,    // per-value: -1 or escape index
     const int16_t*  __restrict__ activations,   // BF16 activation vector [K]
     float*          __restrict__ output,        // float32 output [M]
-    int M, int K)
+    int M, int K, int index_width)              // index_width: 10-13 bits per tensor
 {
     int row = blockIdx.x;
     if (row >= M) return;
     int tid = threadIdx.x;
 
-    // Load codebook into LDS (4096 entries × 2 bytes = 8 KB, fits in 64 KB LDS)
+    int cb_size = 1 << index_width;
+    int escape_sentinel = cb_size - 1;
+
     __shared__ int16_t cb[MAX_CODEBOOK];
-    for (int i = tid; i < MAX_CODEBOOK; i += WORKGROUP_SIZE)
+    for (int i = tid; i < cb_size; i += WORKGROUP_SIZE)
         cb[i] = codebook[i];
 
     __shared__ float warp_sums[4];
@@ -200,19 +205,21 @@ __global__ void fixed12_matvec(
     __syncthreads();
 
     float sum = 0.0f;
-    int64_t row_bit_base = (int64_t)row * K * INDEX_WIDTH;
+    int64_t row_bit_base = (int64_t)row * K * index_width;
+    int row_val_base = row * K;
 
-    // Each thread handles multiple columns, strided
     for (int col = tid; col < K; col += WORKGROUP_SIZE) {
-        int64_t bit_pos = row_bit_base + (int64_t)col * INDEX_WIDTH;
-        uint32_t idx = read_fixed_bits(fixed_packed, bit_pos, INDEX_WIDTH);
+        int64_t bit_pos = row_bit_base + (int64_t)col * index_width;
+        uint32_t idx = read_fixed_bits(fixed_packed, bit_pos, index_width);
 
         int16_t w_bf16;
-        if (__builtin_expect(idx < ESCAPE_INDEX, 1)) {
+        if (__builtin_expect(idx != (uint32_t)escape_sentinel, 1)) {
             w_bf16 = cb[idx];
+        } else if (escape_map) {
+            // O(1) escape lookup — pre-computed index
+            int esc_idx = escape_map[row_val_base + col];
+            w_bf16 = escape_vals[esc_idx];
         } else {
-            // Escape: extremely rare (0.02%)
-            // For now, treat as zero (escapes handled separately if needed)
             w_bf16 = 0;
         }
 
@@ -249,38 +256,96 @@ int launch_decompress_only(
     return (hipDeviceSynchronize() == hipSuccess) ? 0 : -1;
 }
 
-int launch_varlen_to_fixed12(
+int launch_varlen_to_fixed(
     const void* packed_data, const void* codebook, const void* block_ptrs,
     const void* reverse_map, void* fixed_out,
-    int num_elements, int index_bits)
+    int num_elements, int index_bits, int out_width)
 {
     int total_blocks = (num_elements + BLOCK_VALUES - 1) / BLOCK_VALUES;
     int grid = (total_blocks + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
 
-    // Zero out output first
-    int out_words = ((int64_t)num_elements * INDEX_WIDTH + 31) / 32;
-    hipMemset(fixed_out, 0, out_words * 4);
+    int out_words = ((int64_t)num_elements * out_width + 31) / 32 + 1;
+    (void)hipMemset(fixed_out, 0, out_words * 4);
 
-    hipLaunchKernelGGL(varlen_to_fixed12,
+    hipLaunchKernelGGL(varlen_to_fixed,
         dim3(grid), dim3(WORKGROUP_SIZE), 0, 0,
         (const uint32_t*)packed_data, (const int16_t*)codebook,
         (const BlockPtr*)block_ptrs, (const uint32_t*)reverse_map,
-        (uint32_t*)fixed_out, num_elements, index_bits);
+        (uint32_t*)fixed_out, num_elements, index_bits, out_width);
     return (hipDeviceSynchronize() == hipSuccess) ? 0 : -1;
 }
 
+int launch_fixed_matvec(
+    const void* fixed_packed, const void* codebook,
+    const void* escape_vals, const void* escape_prefix,
+    const void* activations, void* output,
+    int M, int K, int index_width)
+{
+    hipLaunchKernelGGL(fixed_matvec,
+        dim3(M), dim3(WORKGROUP_SIZE), 0, 0,
+        (const uint32_t*)fixed_packed, (const int16_t*)codebook,
+        (const int16_t*)escape_vals, (const int32_t*)escape_prefix,
+        (const int16_t*)activations, (float*)output, M, K, index_width);
+    return (hipDeviceSynchronize() == hipSuccess) ? 0 : -1;
+}
+
+// Ultra-fast 12-bit kernel: NO escape handling, hardcoded 12-bit, minimal LDS
+__global__ void fixed12_matvec_fast(
+    const uint32_t* __restrict__ fixed_packed,
+    const int16_t*  __restrict__ codebook,      // 4096 entries
+    const int16_t*  __restrict__ activations,
+    float*          __restrict__ output,
+    int M, int K)
+{
+    int row = blockIdx.x;
+    if (row >= M) return;
+    int tid = threadIdx.x;
+
+    __shared__ int16_t cb[4096];
+    __shared__ float warp_sums[4];
+
+    for (int i = tid; i < 4096; i += WORKGROUP_SIZE)
+        cb[i] = codebook[i];
+    if (tid < 4) warp_sums[tid] = 0.0f;
+    __syncthreads();
+
+    float sum = 0.0f;
+    int64_t row_base = (int64_t)row * K * 12;
+
+    for (int col = tid; col < K; col += WORKGROUP_SIZE) {
+        int64_t bp = row_base + (int64_t)col * 12;
+        uint32_t idx = read_fixed_bits(fixed_packed, bp, 12);
+        sum += bf16_to_float(cb[idx & 0xFFF]) * bf16_to_float(activations[col]);
+    }
+
+    for (int off = WARP_SIZE/2; off > 0; off >>= 1)
+        sum += __shfl_down(sum, off, WARP_SIZE);
+    if ((tid % WARP_SIZE) == 0) warp_sums[tid / WARP_SIZE] = sum;
+    __syncthreads();
+    if (tid == 0)
+        output[row] = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+}
+
+int launch_fixed12_fast(
+    const void* fixed_packed, const void* codebook,
+    const void* activations, void* output, int M, int K)
+{
+    hipLaunchKernelGGL(fixed12_matvec_fast,
+        dim3(M), dim3(WORKGROUP_SIZE), 0, 0,
+        (const uint32_t*)fixed_packed, (const int16_t*)codebook,
+        (const int16_t*)activations, (float*)output, M, K);
+    return (hipDeviceSynchronize() == hipSuccess) ? 0 : -1;
+}
+
+// Keep backward-compatible name
 int launch_fixed12_matvec(
     const void* fixed_packed, const void* codebook,
     const void* escape_vals, const void* escape_offsets,
     const void* activations, void* output,
     int M, int K)
 {
-    hipLaunchKernelGGL(fixed12_matvec,
-        dim3(M), dim3(WORKGROUP_SIZE), 0, 0,
-        (const uint32_t*)fixed_packed, (const int16_t*)codebook,
-        (const int16_t*)escape_vals, (const int32_t*)escape_offsets,
-        (const int16_t*)activations, (float*)output, M, K);
-    return (hipDeviceSynchronize() == hipSuccess) ? 0 : -1;
+    return launch_fixed_matvec(fixed_packed, codebook, escape_vals, escape_offsets,
+                               activations, output, M, K, 12);
 }
 
 // Keep old matvec for compatibility
@@ -292,6 +357,53 @@ int launch_decompress_matvec(
     // Redirect to fixed12_matvec is not possible here since formats differ.
     // This is the legacy variable-length path.
     return -1;  // Not implemented in fixed-width build
+}
+
+// ---------------------------------------------------------------------------
+// Kernel: apply_patches — fix escape values after fixed12 matvec
+// ---------------------------------------------------------------------------
+// Patches are (position, correct_bf16_value) pairs.
+// This kernel corrects the output by subtracting the wrong contribution
+// (codebook[4095] * activation) and adding the correct one.
+// Since codebook[4095] maps to the last codebook entry (not zero),
+// we need: output[row] += (correct - wrong) * activation[col]
+
+__global__ void apply_patches(
+    const int32_t*  __restrict__ patch_positions,  // global flat position in tensor
+    const int16_t*  __restrict__ patch_values,      // correct BF16 values
+    const int16_t*  __restrict__ wrong_values,      // what codebook[4095] decoded to
+    const int16_t*  __restrict__ activations,
+    float*          __restrict__ output,
+    int K, int num_patches)
+{
+    int pid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pid >= num_patches) return;
+
+    int pos = patch_positions[pid];
+    int row = pos / K;
+    int col = pos % K;
+
+    float correct = bf16_to_float(patch_values[pid]);
+    float wrong = bf16_to_float(wrong_values[pid]);
+    float act = bf16_to_float(activations[col]);
+
+    // Atomic correction to output[row]
+    atomicAdd(&output[row], (correct - wrong) * act);
+}
+
+int launch_apply_patches(
+    const void* patch_positions, const void* patch_values, const void* wrong_values,
+    const void* activations, void* output,
+    int K, int num_patches)
+{
+    if (num_patches == 0) return 0;
+    int grid = (num_patches + 255) / 256;
+    hipLaunchKernelGGL(apply_patches,
+        dim3(grid), dim3(256), 0, 0,
+        (const int32_t*)patch_positions, (const int16_t*)patch_values,
+        (const int16_t*)wrong_values, (const int16_t*)activations,
+        (float*)output, K, num_patches);
+    return (hipDeviceSynchronize() == hipSuccess) ? 0 : -1;
 }
 
 } // extern "C"
