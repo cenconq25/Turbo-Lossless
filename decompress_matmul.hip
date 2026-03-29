@@ -407,3 +407,53 @@ int launch_apply_patches(
 }
 
 } // extern "C"
+
+// Ultra-fast 11-bit kernel
+__global__ void fixed11_matvec_fast(
+    const uint32_t* __restrict__ fixed_packed,
+    const int16_t*  __restrict__ codebook,      // 2048 entries
+    const int16_t*  __restrict__ activations,
+    float*          __restrict__ output,
+    int M, int K)
+{
+    int row = blockIdx.x;
+    if (row >= M) return;
+    int tid = threadIdx.x;
+
+    __shared__ int16_t cb[2048];
+    __shared__ float warp_sums[4];
+
+    for (int i = tid; i < 2048; i += WORKGROUP_SIZE)
+        cb[i] = codebook[i];
+    if (tid < 4) warp_sums[tid] = 0.0f;
+    __syncthreads();
+
+    float sum = 0.0f;
+    int64_t row_base = (int64_t)row * K * 11;
+
+    for (int col = tid; col < K; col += WORKGROUP_SIZE) {
+        int64_t bp = row_base + (int64_t)col * 11;
+        uint32_t idx = read_fixed_bits(fixed_packed, bp, 11);
+        sum += bf16_to_float(cb[idx & 0x7FF]) * bf16_to_float(activations[col]);
+    }
+
+    for (int off = WARP_SIZE/2; off > 0; off >>= 1)
+        sum += __shfl_down(sum, off, WARP_SIZE);
+    if ((tid % WARP_SIZE) == 0) warp_sums[tid / WARP_SIZE] = sum;
+    __syncthreads();
+    if (tid == 0)
+        output[row] = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+}
+
+extern "C" {
+int launch_fixed11_fast(
+    const void* fixed_packed, const void* codebook,
+    const void* activations, void* output, int M, int K)
+{
+    hipLaunchKernelGGL(fixed11_matvec_fast,
+        dim3(M), dim3(WORKGROUP_SIZE), 0, 0,
+        (const uint32_t*)fixed_packed, (const int16_t*)codebook,
+        (const int16_t*)activations, (float*)output, M, K);
+    return (hipDeviceSynchronize() == hipSuccess) ? 0 : -1;
+}
+}
