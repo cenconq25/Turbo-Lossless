@@ -6,3 +6,5 @@ __pycache__/
 test_model.*
 *.json
 !package.json
+llama.cpp/
+engine/turbo-engine

@@ -492,3 +492,36 @@ int launch_fixed12_decompress(
 }
 
 }
+
+// Async versions — no hipDeviceSynchronize, use stream ordering
+extern "C" {
+int launch_fixed12_fused_async(
+    const void* packed, const void* codebook, const void* activations,
+    const void* escape_offsets, const void* escape_vals,
+    void* output, int M, int K, void* stream)
+{
+    hipLaunchKernelGGL(fixed12_matvec_fused,
+        dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
+        (const uint32_t*)packed, (const int16_t*)codebook,
+        (const int16_t*)activations,
+        (const int32_t*)escape_offsets, (const int16_t*)escape_vals,
+        (float*)output, M, K);
+    return 0;
+}
+
+int launch_fixed12_batch4_async(
+    const void* packed, const void* codebook,
+    const void* a0, const void* a1, const void* a2, const void* a3,
+    const void* esc_off, const void* esc_vals,
+    void* o0, void* o1, void* o2, void* o3, int M, int K, void* stream)
+{
+    hipLaunchKernelGGL(fixed12_matvec_batch4,
+        dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
+        (const uint32_t*)packed, (const int16_t*)codebook,
+        (const int16_t*)a0, (const int16_t*)a1,
+        (const int16_t*)a2, (const int16_t*)a3,
+        (const int32_t*)esc_off, (const int16_t*)esc_vals,
+        (float*)o0, (float*)o1, (float*)o2, (float*)o3, M, K);
+    return 0;
+}
+}
