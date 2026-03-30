@@ -74,6 +74,8 @@ InferenceState* create_inference_state(Model* model, int batch_size, int max_seq
     hipMalloc(&s->bf16_act2, bs * max_act * sizeof(int16_t));
     s->stream = 0;
     hipStreamCreateWithFlags(&s->stream2, hipStreamNonBlocking);
+    // Event for safe cross-stream synchronization (lighter than hipStreamSynchronize)
+    hipEventCreateWithFlags(&s->sync_event, hipEventDisableTiming);
     init_sampler();
     return s;
 }
@@ -223,7 +225,9 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
 
         // Fused RMSNorm → BF16 for gate/up (saves 1 launch)
         launch_rms_norm_bf16_batch(res, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, B, stream);
-        // gate on stream0, up on stream2 (concurrent — both read same bf16_a, write different outputs)
+        // Signal that bf16_a is ready, then gate on stream0, up on stream2 concurrently
+        hipEventRecord(state->sync_event, stream);
+        hipStreamWaitEvent(state->stream2, state->sync_event, 0);
         launch_fixed12_batch4_async(L.w_gate.packed, L.w_gate.codebook,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.w_gate.escape_row_base, L.w_gate.escape_thread_off, L.w_gate.escape_vals,
@@ -233,7 +237,10 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.w_up.escape_row_base, L.w_up.escape_thread_off, L.w_up.escape_vals,
             SEQ(state->ffn_up,0,n_ff), SEQ(state->ffn_up,1,n_ff), SEQ(state->ffn_up,2,n_ff), SEQ(state->ffn_up,3,n_ff),
-            L.w_up.M, L.w_up.K, stream);
+            L.w_up.M, L.w_up.K, state->stream2);
+        // Wait for w_up on stream2 before SiLU reads ffn_up
+        hipEventRecord(state->sync_event, state->stream2);
+        hipStreamWaitEvent(stream, state->sync_event, 0);
         // Fused SiLU*mul → BF16 for w_down (saves 1 launch)
         launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, B, stream);
         launch_fixed12_batch4_async(L.w_down.packed, L.w_down.codebook,
