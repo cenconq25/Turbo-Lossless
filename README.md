@@ -1,6 +1,6 @@
 # Turbo Lossless: BF16 Compression Engine
 
-100% bit-perfect lossless compression for LLM weights. BF16 in, BF16 out — no precision loss, 1.5x smaller, 2.87x faster inference.
+100% bit-perfect lossless compression for LLM weights. BF16 in, BF16 out — no precision loss, 1.5x smaller, 2.90x faster inference.
 
 ## Benchmark: Fused 12-bit Kernel on AMD MI50 (32GB)
 
@@ -10,18 +10,18 @@ Measured on Llama 3.1 8B, all 226 weight tensors, 100% lossless bit-perfect:
 
 | Tensor Type | Shape | Ours | BF16 | Speedup | BW |
 |-------------|-------|------|------|---------|-----|
-| attn_k | [4096x1024] | 0.088ms | 0.111ms | 1.25x | 95 GB/s |
+| attn_k | [4096x1024] | 0.089ms | 0.111ms | 1.25x | 94 GB/s |
 | attn_v | [4096x1024] | 0.087ms | 0.111ms | 1.28x | 96 GB/s |
-| attn_q | [4096x4096] | 0.166ms | 0.358ms | **2.15x** | 202 GB/s |
-| attn_output | [4096x4096] | 0.143ms | 0.358ms | **2.50x** | 235 GB/s |
-| ffn_down | [14336x4096] | 0.476ms | 1.084ms | **2.28x** | 247 GB/s |
-| ffn_gate | [4096x14336] | 0.379ms | 1.091ms | **2.88x** | 310 GB/s |
-| ffn_up | [4096x14336] | 0.377ms | 1.091ms | **2.90x** | 312 GB/s |
-| output | [4096x128256] | 3.013ms | 9.360ms | **3.11x** | 349 GB/s |
-| token_embd | [4096x128256] | 3.099ms | 9.409ms | **3.04x** | 339 GB/s |
-| **Weighted avg** | **(226 tensors)** | **0.712ms** | **2.042ms** | **2.87x** | |
+| attn_q | [4096x4096] | 0.160ms | 0.358ms | **2.24x** | 210 GB/s |
+| attn_output | [4096x4096] | 0.145ms | 0.355ms | **2.47x** | 232 GB/s |
+| ffn_down | [14336x4096] | 0.471ms | 1.084ms | **2.30x** | 249 GB/s |
+| ffn_gate | [4096x14336] | 0.375ms | 1.091ms | **2.90x** | 313 GB/s |
+| ffn_up | [4096x14336] | 0.375ms | 1.084ms | **2.89x** | 313 GB/s |
+| output | [4096x128256] | 2.975ms | 9.339ms | **3.14x** | 353 GB/s |
+| token_embd | [4096x128256] | 3.048ms | 9.380ms | **3.08x** | 345 GB/s |
+| **Weighted avg** | **(226 tensors)** | **0.704ms** | **2.039ms** | **2.90x** | |
 
-All tensors lossless (226/226). Large tensors achieve 349 GB/s effective bandwidth (34% of MI50's 1 TB/s HBM2 peak).
+All tensors lossless (226/226). Large tensors achieve 353 GB/s effective bandwidth (34% of MI50's 1 TB/s HBM2 peak).
 
 ### Compression Ratios
 
@@ -71,6 +71,8 @@ Thread tid in row block:
 
 **2x loop unroll**: Two columns per iteration for instruction-level parallelism. Overlaps packed data reads with LDS codebook lookups and FMA.
 
+**Incremental bit positions**: Replace `col * 12` (64-bit multiply, ~4 cycles on GCN) with `bp += stride_bits` (64-bit add, ~2 cycles). Bit positions computed once at loop entry, then incremented.
+
 ### Optimization History
 
 | Step | Speedup | Change |
@@ -81,7 +83,8 @@ Thread tid in row block:
 | 2x loop unroll | 1.88x | ILP |
 | Fused kernel (O(1) escape table) | 1.88x | Single launch, per-thread offsets |
 | Branchless 64-bit read | 2.29x | Eliminated 37% warp divergence |
-| **LDS codebook** | **2.87x** | **1-cycle vs 10-cycle lookup** |
+| LDS codebook | 2.87x | 1-cycle vs 10-cycle lookup |
+| **Incremental bit positions** | **2.90x** | **Replace 64-bit multiply with add in hot loop** |
 
 ### What Was Tested and Rejected
 

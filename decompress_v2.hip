@@ -68,14 +68,19 @@ __global__ void fixed12_matvec_fused(
 
     float sum0 = 0.0f;
     float sum1 = 0.0f;
-    int64_t row_base = (int64_t)row * K * 12;
-    int stride = WORKGROUP_SIZE;
 
-    // 2x unrolled with LDS codebook
+    // Precompute bit positions — use incremental adds instead of per-iteration multiply
+    // col * 12 as 64-bit multiply is ~4 cycles on GCN (no native imul64)
+    // Incremental: bp += stride_bits is just a 64-bit add (~2 cycles)
+    int64_t bp0 = (int64_t)row * K * 12 + (int64_t)tid * 12;
+    const int64_t stride_bits = (int64_t)WORKGROUP_SIZE * 12;      // 3072
+    const int64_t stride_bits_2x = stride_bits * 2;                // 6144
+
+    // 2x unrolled with LDS codebook + incremental bit positions
     int col = tid;
-    for (; col + stride < K; col += stride * 2) {
-        uint32_t idx0 = read12(packed, row_base + (int64_t)col * 12);
-        uint32_t idx1 = read12(packed, row_base + (int64_t)(col + stride) * 12);
+    for (; col + WORKGROUP_SIZE < K; col += WORKGROUP_SIZE * 2) {
+        uint32_t idx0 = read12(packed, bp0);
+        uint32_t idx1 = read12(packed, bp0 + stride_bits);
 
         float w0 = (__builtin_expect(idx0 != 4095, 1))
             ? bf16_to_float(cb[idx0])
@@ -84,15 +89,16 @@ __global__ void fixed12_matvec_fused(
             ? bf16_to_float(cb[idx1])
             : bf16_to_float(escape_vals[esc_ptr++]);
 
-        sum0 += w0 * bf16_to_float(act[col]);
-        sum1 += w1 * bf16_to_float(act[col + stride]);
+        sum0 += w0 * bf16_to_float(activations[col]);
+        sum1 += w1 * bf16_to_float(activations[col + WORKGROUP_SIZE]);
+        bp0 += stride_bits_2x;
     }
     if (col < K) {
-        uint32_t idx = read12(packed, row_base + (int64_t)col * 12);
+        uint32_t idx = read12(packed, bp0);
         float w = (__builtin_expect(idx != 4095, 1))
             ? bf16_to_float(cb[idx])
             : bf16_to_float(escape_vals[esc_ptr++]);
-        sum0 += w * bf16_to_float(act[col]);
+        sum0 += w * bf16_to_float(activations[col]);
     }
     float sum = sum0 + sum1;
 

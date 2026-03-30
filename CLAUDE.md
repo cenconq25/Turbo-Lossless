@@ -12,8 +12,8 @@
 
 ## Current Results
 
-- **2.87x** weighted avg inference speedup (fused kernel, all 226 Llama 8B tensors, 100% lossless)
-- **349 GB/s** effective bandwidth on large tensors (34% of MI50 32GB's 1 TB/s HBM2 peak)
+- **2.90x** weighted avg inference speedup (fused kernel, all 226 Llama 8B tensors, 100% lossless)
+- **353 GB/s** effective bandwidth on large tensors (34% of MI50 32GB's 1 TB/s HBM2 peak)
 - **1.47x** disk compression (.tlc 8-tier variable-length)
 - **1.33x** VRAM compression (12-bit fixed-width + escape table)
 - Validated compression on 11 BF16 models, 7 architectures, 8B–671B params
@@ -39,7 +39,8 @@ Single GPU kernel launch per matvec. Decodes 12-bit packed indices, looks up L1-
 - Fused binary search: 1.32x on token_embd — L2 latency per comparison.
 - Per-thread escape offset table (fused): 1.88x — O(1) escape, single kernel.
 - Branchless 64-bit read: 2.29x — eliminated 37% warp divergence.
-- **LDS codebook (fused): 2.87x — 1-cycle vs 10-cycle codebook lookup.**
+- LDS codebook (fused): 2.87x — 1-cycle vs 10-cycle codebook lookup.
+- **Incremental bit positions: 2.90x — replace imul64 with iadd64 in hot loop.**
 
 ### Disk Format (.tlc)
 
