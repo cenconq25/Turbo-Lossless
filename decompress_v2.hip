@@ -1,10 +1,14 @@
 /**
- * Turbo Lossless — V2 Fused 12-bit Matvec Kernel
- * L1-cached codebook + inline escape handling via CSR patches
+ * Turbo Lossless — V2 12-bit Matvec Kernels (AMD MI50 / gfx906)
  *
- * Single kernel launch: decode 12-bit indices, lookup codebook,
- * handle escapes inline (binary search CSR patches), FMA accumulate.
- * No separate patch kernel. No atomics.
+ * Three kernel variants:
+ *   1. Fused: single launch, inline escape via merge-scan of CSR patches
+ *   2. Two-pass: matvec + separate wavefront-parallel patch correction
+ *
+ * Common optimizations:
+ *   - L1-cached codebook (8 KB fits in 16 KB L1, zero LDS overhead)
+ *   - 2x loop unroll for instruction-level parallelism
+ *   - Contiguous tile access (adjacent threads read adjacent bit positions)
  */
 
 #include <hip/hip_runtime.h>
@@ -30,30 +34,20 @@ uint32_t read12(const uint32_t* __restrict__ p, int64_t bp) {
     return v & 0xFFF;
 }
 
-// Binary search for col in sorted patch_cols[start..end)
-__device__ __forceinline__
-int binary_search(const int32_t* __restrict__ patch_cols, int start, int end, int col) {
-    while (start < end) {
-        int mid = (start + end) >> 1;
-        if (patch_cols[mid] < col)
-            start = mid + 1;
-        else
-            end = mid;
-    }
-    return start;
-}
-
-// Fused 12-bit matvec with inline escape correction
-// - L1-cached codebook (8 KB, zero LDS)
-// - When idx == 4095 (escape), binary search CSR patches for correct value
-// - Single kernel launch, no atomics, no separate patch pass
+// ---------------------------------------------------------------------------
+// Fused kernel: single launch, inline escape handling
+// ---------------------------------------------------------------------------
+// Each thread keeps a cursor into the row's CSR patches. When idx==4095,
+// it advances the cursor (merge-scan) to find the matching column.
+// Patches are sorted by column within each row, and each thread processes
+// columns in ascending order — so the cursor only moves forward. O(1) amortized.
 __global__ void fixed12_matvec_fused(
     const uint32_t* __restrict__ packed,
     const int16_t*  __restrict__ codebook,
     const int16_t*  __restrict__ activations,
-    const int32_t*  __restrict__ row_offsets,   // CSR: M+1 entries
-    const int32_t*  __restrict__ patch_cols,    // sorted column indices per row
-    const int16_t*  __restrict__ patch_vals,    // correct BF16 values
+    const int32_t*  __restrict__ row_offsets,
+    const int32_t*  __restrict__ patch_cols,
+    const int16_t*  __restrict__ patch_vals,
     float*          __restrict__ output,
     int M, int K)
 {
@@ -61,7 +55,6 @@ __global__ void fixed12_matvec_fused(
     if (row >= M) return;
     int tid = threadIdx.x;
 
-    // Load this row's patch range once (L1-cached after first wavefront reads it)
     int patch_start = row_offsets[row];
     int patch_end   = row_offsets[row + 1];
 
@@ -69,24 +62,59 @@ __global__ void fixed12_matvec_fused(
     if (tid < 4) warp_sums[tid] = 0.0f;
     __syncthreads();
 
-    float sum = 0.0f;
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
     int64_t row_base = (int64_t)row * K * 12;
+    int stride = WORKGROUP_SIZE;
 
-    for (int col = tid; col < K; col += WORKGROUP_SIZE) {
-        int64_t bp = row_base + (int64_t)col * 12;
-        uint32_t idx = read12(packed, bp);
+    // Each thread keeps a cursor into the row's sorted patches.
+    // When idx==4095, advance cursor to find matching column.
+    // Patches are sorted by column, so cursor only moves forward.
+    int esc_pos = patch_start;
 
-        float w_val;
-        if (__builtin_expect(idx != 4095, 1)) {
-            w_val = bf16_to_float(codebook[idx]);
+    // 2x unrolled main loop with inline escape handling
+    int col = tid;
+    for (; col + stride < K; col += stride * 2) {
+        int64_t bp0 = row_base + (int64_t)col * 12;
+        int64_t bp1 = row_base + (int64_t)(col + stride) * 12;
+        uint32_t idx0 = read12(packed, bp0);
+        uint32_t idx1 = read12(packed, bp1);
+
+        float w0, w1;
+        if (__builtin_expect(idx0 != 4095, 1)) {
+            w0 = bf16_to_float(codebook[idx0]);
         } else {
-            // Escape: binary search this row's patches for col
-            int pos = binary_search(patch_cols, patch_start, patch_end, col);
-            w_val = bf16_to_float(patch_vals[pos]);
+            // Advance cursor to col (skip patches for other threads' columns)
+            while (esc_pos < patch_end && patch_cols[esc_pos] < col)
+                esc_pos++;
+            w0 = bf16_to_float(patch_vals[esc_pos++]);
+        }
+        if (__builtin_expect(idx1 != 4095, 1)) {
+            w1 = bf16_to_float(codebook[idx1]);
+        } else {
+            while (esc_pos < patch_end && patch_cols[esc_pos] < (col + stride))
+                esc_pos++;
+            w1 = bf16_to_float(patch_vals[esc_pos++]);
         }
 
-        sum += w_val * bf16_to_float(activations[col]);
+        sum0 += w0 * bf16_to_float(activations[col]);
+        sum1 += w1 * bf16_to_float(activations[col + stride]);
     }
+    // Remainder
+    if (col < K) {
+        int64_t bp = row_base + (int64_t)col * 12;
+        uint32_t idx = read12(packed, bp);
+        float w;
+        if (__builtin_expect(idx != 4095, 1)) {
+            w = bf16_to_float(codebook[idx]);
+        } else {
+            while (esc_pos < patch_end && patch_cols[esc_pos] < col)
+                esc_pos++;
+            w = bf16_to_float(patch_vals[esc_pos++]);
+        }
+        sum0 += w * bf16_to_float(activations[col]);
+    }
+    float sum = sum0 + sum1;
 
     // Wavefront reduction
     for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
@@ -99,7 +127,9 @@ __global__ void fixed12_matvec_fused(
         output[row] = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
 }
 
-// Two-pass matvec kernel: L1-cached codebook, 2x unrolled inner loop
+// ---------------------------------------------------------------------------
+// Two-pass kernel: matvec (ignores escapes) + separate patch correction
+// ---------------------------------------------------------------------------
 __global__ void fixed12_matvec_v2(
     const uint32_t* __restrict__ packed,
     const int16_t*  __restrict__ codebook,
@@ -120,7 +150,6 @@ __global__ void fixed12_matvec_v2(
     int64_t row_base = (int64_t)row * K * 12;
     int stride = WORKGROUP_SIZE;
 
-    // 2x unrolled: process two columns per iteration for ILP
     int col = tid;
     for (; col + stride < K; col += stride * 2) {
         int64_t bp0 = row_base + (int64_t)col * 12;
@@ -130,7 +159,6 @@ __global__ void fixed12_matvec_v2(
         sum0 += bf16_to_float(codebook[idx0]) * bf16_to_float(activations[col]);
         sum1 += bf16_to_float(codebook[idx1]) * bf16_to_float(activations[col + stride]);
     }
-    // Handle remainder
     if (col < K) {
         int64_t bp = row_base + (int64_t)col * 12;
         uint32_t idx = read12(packed, bp);
@@ -138,7 +166,6 @@ __global__ void fixed12_matvec_v2(
     }
     float sum = sum0 + sum1;
 
-    // Wavefront reduction
     for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
         sum += __shfl_down(sum, off, WARP_SIZE);
 
@@ -177,9 +204,11 @@ __global__ void apply_patches(
         output[row] += correction;
 }
 
+// ---------------------------------------------------------------------------
+// C launch wrappers
+// ---------------------------------------------------------------------------
 extern "C" {
 
-// Fused kernel — single launch, handles escapes inline
 int launch_fixed12_fused(
     const void* packed, const void* codebook, const void* activations,
     const void* row_offsets, const void* patch_cols, const void* patch_vals,
@@ -195,7 +224,6 @@ int launch_fixed12_fused(
     return (hipDeviceSynchronize() == hipSuccess) ? 0 : -1;
 }
 
-// Legacy two-pass interface
 int launch_fixed12_v2(
     const void* packed, const void* codebook,
     const void* activations, void* output, int M, int K)

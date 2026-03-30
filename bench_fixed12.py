@@ -30,12 +30,16 @@ _pack_lib.pack_fixed12.argtypes = [
 ]
 _pack_lib.pack_fixed12.restype = ctypes.c_int64
 
-# Load HIP kernel (V2)
+# Load HIP kernels
 _hip_lib = ctypes.CDLL(os.path.join(os.path.dirname(__file__), "decompress_v2.so"))
+_hip_lib.launch_fixed12_fused.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_int] * 2
+_hip_lib.launch_fixed12_fused.restype = ctypes.c_int
 _hip_lib.launch_fixed12_v2.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 2
 _hip_lib.launch_fixed12_v2.restype = ctypes.c_int
 _hip_lib.launch_patches_v2.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_int] * 1
 _hip_lib.launch_patches_v2.restype = ctypes.c_int
+
+USE_FUSED = False  # Toggle: True = fused kernel, False = two-pass
 
 
 def prepare_tensor(W, device="cuda:0"):
@@ -115,30 +119,32 @@ def benchmark_tensor(name, W, device="cuda:0", warmup=30, iters=200):
     xi = x.view(torch.int16)
     o = torch.zeros(M, dtype=torch.float32, device=device)
 
+    # Upload patch data
+    ro = torch.from_numpy(data["row_offsets"]).to(torch.int32).to(device)
+    pc_col = torch.from_numpy(data["patch_cols"]).to(torch.int32).to(device)
+    pc = torch.from_numpy(data["patch_correct"]).to(torch.int16).to(device)
+    pw = torch.from_numpy(data["patch_wrong"]).to(torch.int16).to(device)
     has_patches = data["num_patches"] > 0
-    if has_patches:
-        ro = torch.from_numpy(data["row_offsets"]).to(torch.int32).to(device)
-        pc_col = torch.from_numpy(data["patch_cols"]).to(torch.int32).to(device)
-        pc = torch.from_numpy(data["patch_correct"]).to(torch.int16).to(device)
-        pw = torch.from_numpy(data["patch_wrong"]).to(torch.int16).to(device)
+
+    if USE_FUSED:
+        def run_ours():
+            _hip_lib.launch_fixed12_fused(
+                pg.data_ptr(), cg.data_ptr(), xi.data_ptr(),
+                ro.data_ptr(), pc_col.data_ptr(), pc.data_ptr(),
+                o.data_ptr(), M, K)
+    else:
+        def run_ours():
+            _hip_lib.launch_fixed12_v2(pg.data_ptr(), cg.data_ptr(), xi.data_ptr(), o.data_ptr(), M, K)
+            if has_patches:
+                _hip_lib.launch_patches_v2(
+                    ro.data_ptr(), pc_col.data_ptr(), pc.data_ptr(), pw.data_ptr(),
+                    xi.data_ptr(), o.data_ptr(), M)
 
     # Correctness check
-    _hip_lib.launch_fixed12_v2(pg.data_ptr(), cg.data_ptr(), xi.data_ptr(), o.data_ptr(), M, K)
-    if has_patches:
-        _hip_lib.launch_patches_v2(
-            ro.data_ptr(), pc_col.data_ptr(), pc.data_ptr(), pw.data_ptr(),
-            xi.data_ptr(), o.data_ptr(), M)
+    run_ours()
     y_ref = W.float().to(device) @ x.float()
     err = (o - y_ref).abs().max().item()
     lossless = err < 0.01
-
-    # Benchmark ours
-    def run_ours():
-        _hip_lib.launch_fixed12_v2(pg.data_ptr(), cg.data_ptr(), xi.data_ptr(), o.data_ptr(), M, K)
-        if has_patches:
-            _hip_lib.launch_patches_v2(
-                ro.data_ptr(), pc_col.data_ptr(), pc.data_ptr(), pw.data_ptr(),
-                xi.data_ptr(), o.data_ptr(), M)
 
     for _ in range(warmup):
         run_ours()
@@ -169,9 +175,7 @@ def benchmark_tensor(name, W, device="cuda:0", warmup=30, iters=200):
     speedup = avg_bf16 / avg_ours
     eff_bw = M * K * 2 / avg_ours / 1e9
 
-    del pg, cg, Wg
-    if has_patches:
-        del ro, pc_col, pc, pw
+    del pg, cg, Wg, ro, pc_col, pc, pw
     torch.cuda.empty_cache()
 
     return {
