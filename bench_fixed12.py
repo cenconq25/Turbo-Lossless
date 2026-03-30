@@ -43,6 +43,8 @@ _pack_lib.pack_fixed12_fused.restype = ctypes.c_int64
 _hip_lib = ctypes.CDLL(os.path.join(os.path.dirname(__file__), "decompress_v2.so"))
 _hip_lib.launch_fixed12_fused.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_int] * 2
 _hip_lib.launch_fixed12_fused.restype = ctypes.c_int
+_hip_lib.launch_fixed12_decompress.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 2
+_hip_lib.launch_fixed12_decompress.restype = ctypes.c_int
 _hip_lib.launch_fixed12_v2.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 2
 _hip_lib.launch_fixed12_v2.restype = ctypes.c_int
 _hip_lib.launch_patches_v2.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_int] * 1
@@ -166,11 +168,23 @@ def benchmark_tensor(name, W, device="cuda:0", warmup=30, iters=200):
                     ro.data_ptr(), pc_col.data_ptr(), pc.data_ptr(), pw.data_ptr(),
                     xi.data_ptr(), o.data_ptr(), M)
 
-    # Correctness check
-    run_ours()
-    y_ref = W.float().to(device) @ x.float()
-    err = (o - y_ref).abs().max().item()
-    lossless = err < 0.01
+    # Bit-exact verification: decompress all weights and compare
+    if USE_FUSED:
+        decoded = torch.empty(M * K, dtype=torch.int16, device=device)
+        _hip_lib.launch_fixed12_decompress(
+            pg.data_ptr(), cg.data_ptr(),
+            eo.data_ptr(), ev.data_ptr(),
+            decoded.data_ptr(), M, K)
+        orig_bits = W.contiguous().view(torch.int16).to(device)
+        mismatches = (decoded != orig_bits.view(-1)).sum().item()
+        lossless = mismatches == 0
+        del decoded, orig_bits
+    else:
+        # Fallback: matvec error check for two-pass path
+        run_ours()
+        y_ref = W.float().to(device) @ x.float()
+        err = (o - y_ref).abs().max().item()
+        lossless = err < 0.01
 
     for _ in range(warmup):
         run_ours()
