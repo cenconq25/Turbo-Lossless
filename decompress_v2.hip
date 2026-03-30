@@ -228,6 +228,68 @@ __global__ void fixed12_matvec_batch2(
     }
 }
 
+// Batch4: decode once, multiply by 4 activation vectors
+__launch_bounds__(WORKGROUP_SIZE)
+__global__ void fixed12_matvec_batch4(
+    const uint32_t* __restrict__ packed,
+    const int16_t*  __restrict__ codebook,
+    const int16_t*  __restrict__ act0, const int16_t* __restrict__ act1,
+    const int16_t*  __restrict__ act2, const int16_t* __restrict__ act3,
+    const int32_t*  __restrict__ escape_offsets,
+    const int16_t*  __restrict__ escape_vals,
+    float* __restrict__ out0, float* __restrict__ out1,
+    float* __restrict__ out2, float* __restrict__ out3,
+    int M, int K)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    int esc_ptr = escape_offsets[row * WORKGROUP_SIZE + tid];
+
+    __shared__ int16_t cb[4096];
+    __shared__ float warp_sums[16];  // 4 per output vector
+
+    for (int i = tid; i < 4096; i += WORKGROUP_SIZE)
+        cb[i] = codebook[i];
+    __syncthreads();
+
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    int64_t bp = (int64_t)row * K * 12 + (int64_t)tid * 12;
+
+    for (int col = tid; col < K; col += WORKGROUP_SIZE) {
+        uint32_t idx = read12(packed, bp);
+        float w = (__builtin_expect(idx != 4095, 1))
+            ? bf16_to_float(cb[idx])
+            : bf16_to_float(escape_vals[esc_ptr++]);
+
+        s0 += w * bf16_to_float(act0[col]);
+        s1 += w * bf16_to_float(act1[col]);
+        s2 += w * bf16_to_float(act2[col]);
+        s3 += w * bf16_to_float(act3[col]);
+        bp += (int64_t)(WORKGROUP_SIZE * 12);
+    }
+
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        s0 += __shfl_down(s0, off, WARP_SIZE);
+        s1 += __shfl_down(s1, off, WARP_SIZE);
+        s2 += __shfl_down(s2, off, WARP_SIZE);
+        s3 += __shfl_down(s3, off, WARP_SIZE);
+    }
+    int wid = tid >> 6;
+    if ((tid & (WARP_SIZE - 1)) == 0) {
+        warp_sums[wid]      = s0;
+        warp_sums[wid + 4]  = s1;
+        warp_sums[wid + 8]  = s2;
+        warp_sums[wid + 12] = s3;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        out0[row] = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+        out1[row] = warp_sums[4] + warp_sums[5] + warp_sums[6] + warp_sums[7];
+        out2[row] = warp_sums[8] + warp_sums[9] + warp_sums[10] + warp_sums[11];
+        out3[row] = warp_sums[12] + warp_sums[13] + warp_sums[14] + warp_sums[15];
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Decompress-only: decode all weights to BF16 buffer for bit-exact verification
 // ---------------------------------------------------------------------------
@@ -295,6 +357,22 @@ int launch_fixed12_batch2(
         (const int16_t*)act0, (const int16_t*)act1,
         (const int32_t*)escape_offsets, (const int16_t*)escape_vals,
         (float*)out0, (float*)out1, M, K);
+    return (hipDeviceSynchronize() == hipSuccess) ? 0 : -1;
+}
+
+int launch_fixed12_batch4(
+    const void* packed, const void* codebook,
+    const void* a0, const void* a1, const void* a2, const void* a3,
+    const void* esc_off, const void* esc_vals,
+    void* o0, void* o1, void* o2, void* o3, int M, int K)
+{
+    hipLaunchKernelGGL(fixed12_matvec_batch4,
+        dim3(M), dim3(WORKGROUP_SIZE), 0, 0,
+        (const uint32_t*)packed, (const int16_t*)codebook,
+        (const int16_t*)a0, (const int16_t*)a1,
+        (const int16_t*)a2, (const int16_t*)a3,
+        (const int32_t*)esc_off, (const int16_t*)esc_vals,
+        (float*)o0, (float*)o1, (float*)o2, (float*)o3, M, K);
     return (hipDeviceSynchronize() == hipSuccess) ? 0 : -1;
 }
 
