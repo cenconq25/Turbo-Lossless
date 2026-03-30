@@ -45,12 +45,7 @@ _hip_lib.launch_fixed12_fused.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_int] 
 _hip_lib.launch_fixed12_fused.restype = ctypes.c_int
 _hip_lib.launch_fixed12_decompress.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 2
 _hip_lib.launch_fixed12_decompress.restype = ctypes.c_int
-_hip_lib.launch_fixed12_v2.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 2
-_hip_lib.launch_fixed12_v2.restype = ctypes.c_int
-_hip_lib.launch_patches_v2.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_int] * 1
-_hip_lib.launch_patches_v2.restype = ctypes.c_int
 
-USE_FUSED = True  # Toggle: True = fused kernel, False = two-pass
 WORKGROUP_SIZE = 256
 
 
@@ -83,53 +78,25 @@ def prepare_tensor(W, device="cuda:0"):
     packed = np.zeros(num_words, dtype=np.uint32)
     max_patches = max(n // 100, 1024)
 
-    if USE_FUSED:
-        # Per-thread-stride escape layout
-        escape_offsets = np.zeros(M * WORKGROUP_SIZE, dtype=np.int32)
-        escape_vals = np.zeros(max_patches, dtype=np.int16)
+    # Per-thread-stride escape layout for fused kernel
+    escape_offsets = np.zeros(M * WORKGROUP_SIZE, dtype=np.int32)
+    escape_vals = np.zeros(max_patches, dtype=np.int16)
 
-        num_patches = _pack_lib.pack_fixed12_fused(
-            raw.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
-            ctypes.c_int64(n),
-            reverse_map.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
-            packed.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
-            escape_offsets.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
-            escape_vals.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
-            ctypes.c_int32(M), ctypes.c_int32(K), ctypes.c_int32(WORKGROUP_SIZE),
-        )
-        return {
-            "packed": packed[:num_words], "codebook": codebook,
-            "escape_offsets": escape_offsets,
-            "escape_vals": escape_vals[:num_patches],
-            "num_patches": int(num_patches), "M": M, "K": K,
-        }
-    else:
-        # CSR row-grouped patches for two-pass
-        row_offsets = np.zeros(M + 1, dtype=np.int32)
-        patch_cols = np.zeros(max_patches, dtype=np.int32)
-        patch_correct = np.zeros(max_patches, dtype=np.int16)
-        patch_wrong = np.zeros(max_patches, dtype=np.int16)
-        wrong_val = codebook[4095]
-
-        num_patches = _pack_lib.pack_fixed12(
-            raw.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
-            ctypes.c_int64(n),
-            reverse_map.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
-            packed.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
-            row_offsets.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
-            patch_cols.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
-            patch_correct.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
-            patch_wrong.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
-            ctypes.c_int16(wrong_val), ctypes.c_int32(M), ctypes.c_int32(K),
-        )
-        return {
-            "packed": packed[:num_words], "codebook": codebook,
-            "row_offsets": row_offsets,
-            "patch_cols": patch_cols[:num_patches],
-            "patch_correct": patch_correct[:num_patches],
-            "patch_wrong": patch_wrong[:num_patches],
-            "num_patches": int(num_patches), "M": M, "K": K,
-        }
+    num_patches = _pack_lib.pack_fixed12_fused(
+        raw.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+        ctypes.c_int64(n),
+        reverse_map.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
+        packed.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
+        escape_offsets.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+        escape_vals.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
+        ctypes.c_int32(M), ctypes.c_int32(K), ctypes.c_int32(WORKGROUP_SIZE),
+    )
+    return {
+        "packed": packed[:num_words], "codebook": codebook,
+        "escape_offsets": escape_offsets,
+        "escape_vals": escape_vals[:num_patches],
+        "num_patches": int(num_patches), "M": M, "K": K,
+    }
 
 
 def benchmark_tensor(name, W, device="cuda:0", warmup=30, iters=200):
@@ -147,44 +114,25 @@ def benchmark_tensor(name, W, device="cuda:0", warmup=30, iters=200):
     xi = x.view(torch.int16)
     o = torch.zeros(M, dtype=torch.float32, device=device)
 
-    if USE_FUSED:
-        eo = torch.from_numpy(data["escape_offsets"]).to(torch.int32).to(device)
-        ev = torch.from_numpy(data["escape_vals"]).to(torch.int16).to(device)
-        def run_ours():
-            _hip_lib.launch_fixed12_fused(
-                pg.data_ptr(), cg.data_ptr(), xi.data_ptr(),
-                eo.data_ptr(), ev.data_ptr(),
-                o.data_ptr(), M, K)
-    else:
-        ro = torch.from_numpy(data["row_offsets"]).to(torch.int32).to(device)
-        pc_col = torch.from_numpy(data["patch_cols"]).to(torch.int32).to(device)
-        pc = torch.from_numpy(data["patch_correct"]).to(torch.int16).to(device)
-        pw = torch.from_numpy(data["patch_wrong"]).to(torch.int16).to(device)
-        has_patches = data["num_patches"] > 0
-        def run_ours():
-            _hip_lib.launch_fixed12_v2(pg.data_ptr(), cg.data_ptr(), xi.data_ptr(), o.data_ptr(), M, K)
-            if has_patches:
-                _hip_lib.launch_patches_v2(
-                    ro.data_ptr(), pc_col.data_ptr(), pc.data_ptr(), pw.data_ptr(),
-                    xi.data_ptr(), o.data_ptr(), M)
+    eo = torch.from_numpy(data["escape_offsets"]).to(torch.int32).to(device)
+    ev = torch.from_numpy(data["escape_vals"]).to(torch.int16).to(device)
 
-    # Bit-exact verification: decompress all weights and compare
-    if USE_FUSED:
-        decoded = torch.empty(M * K, dtype=torch.int16, device=device)
-        _hip_lib.launch_fixed12_decompress(
-            pg.data_ptr(), cg.data_ptr(),
+    def run_ours():
+        _hip_lib.launch_fixed12_fused(
+            pg.data_ptr(), cg.data_ptr(), xi.data_ptr(),
             eo.data_ptr(), ev.data_ptr(),
-            decoded.data_ptr(), M, K)
-        orig_bits = W.contiguous().view(torch.int16).to(device)
-        mismatches = (decoded != orig_bits.view(-1)).sum().item()
-        lossless = mismatches == 0
-        del decoded, orig_bits
-    else:
-        # Fallback: matvec error check for two-pass path
-        run_ours()
-        y_ref = W.float().to(device) @ x.float()
-        err = (o - y_ref).abs().max().item()
-        lossless = err < 0.01
+            o.data_ptr(), M, K)
+
+    # Bit-exact verification: decompress all weights and compare original BF16
+    decoded = torch.empty(M * K, dtype=torch.int16, device=device)
+    _hip_lib.launch_fixed12_decompress(
+        pg.data_ptr(), cg.data_ptr(),
+        eo.data_ptr(), ev.data_ptr(),
+        decoded.data_ptr(), M, K)
+    orig_bits = W.contiguous().view(torch.int16).to(device)
+    mismatches = (decoded != orig_bits.view(-1)).sum().item()
+    lossless = mismatches == 0
+    del decoded, orig_bits
 
     for _ in range(warmup):
         run_ours()
@@ -215,7 +163,7 @@ def benchmark_tensor(name, W, device="cuda:0", warmup=30, iters=200):
     speedup = avg_bf16 / avg_ours
     eff_bw = M * K * 2 / avg_ours / 1e9
 
-    del pg, cg, Wg
+    del pg, cg, Wg, eo, ev
     torch.cuda.empty_cache()
 
     return {

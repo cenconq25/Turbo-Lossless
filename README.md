@@ -124,7 +124,7 @@ python3 bench_fixed12.py models/llama-3.1-8b/llama-3.1-8b.safetensors
 |------|---------|
 | `bench_fixed12.py` | Benchmark: GPU freq sort, C packing, fused kernel timing |
 | `fixed12_pack.c` | C packer: 12-bit indices + per-thread escape offset table |
-| `decompress_v2.hip` | Fused kernel: branchless read + LDS codebook + O(1) escape + 2x unroll |
+| `decompress_v2.hip` | Fused kernel (fused matvec + decompress-only for verification) |
 | `decompress_matmul.hip` | V1 kernels: variable-length decode, format conversion |
 | `tlc_encode.py` | .tlc encoder (8-tier variable-length for disk) |
 | `tlc_decode.py` | .tlc decoder (CPU) |
