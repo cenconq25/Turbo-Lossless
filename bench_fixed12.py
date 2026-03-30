@@ -63,9 +63,9 @@ def prepare_tensor(W, device="cuda:0"):
         reverse_map.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
     )
 
-    num_words = (n * 12 + 31) // 32 + 2
+    num_words = (n * 12 + 31) // 32 + 4  # +4 padding for branchless write overflow
     packed = np.zeros(num_words, dtype=np.uint32)
-    max_patches = max(n // 100, 1024)
+    max_patches = max(n // 10, 1024)  # ~10% headroom for high-escape tensors
 
     # Per-thread-stride escape layout for fused kernel
     escape_offsets = np.zeros(M * WORKGROUP_SIZE, dtype=np.int32)
