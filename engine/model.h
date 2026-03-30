@@ -30,7 +30,7 @@ struct CompressedWeight {
     int num_patches;
     // Fused escape table (built at load time from CSR)
     int32_t* escape_row_base;     // [M] absolute start of row's escapes (5.6 MB total)
-    uint16_t* escape_thread_off;  // [M*256] optional: NULL = on-the-fly scan (saves 721 MB)
+    uint8_t* escape_counts;       // [M*256] optional: per-thread escape count (361 MB, max val 12)
     int16_t* escape_vals;         // [num_patches] correct BF16 values in thread-stride order
 };
 

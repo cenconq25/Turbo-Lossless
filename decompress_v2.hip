@@ -278,7 +278,8 @@ __global__ void fixed12_matvec_batch2(
         out3[row] = warp_sums[12]+warp_sums[13]+warp_sums[14]+warp_sums[15]; \
     }
 
-// Fast batch4: uses pre-computed escape_thread_off table (8KB LDS, max occupancy)
+// Fast batch4: uses uint8 escape counts + shared-memory prefix sum (9KB LDS)
+// Reads 361 MB count table instead of scanning 10 GB packed data
 __launch_bounds__(WORKGROUP_SIZE)
 __global__ void fixed12_matvec_batch4(
     const uint32_t* __restrict__ packed,
@@ -286,7 +287,7 @@ __global__ void fixed12_matvec_batch4(
     const int16_t*  __restrict__ act0, const int16_t* __restrict__ act1,
     const int16_t*  __restrict__ act2, const int16_t* __restrict__ act3,
     const int32_t*  __restrict__ escape_row_base,
-    const uint16_t* __restrict__ escape_thread_off,
+    const uint8_t*  __restrict__ escape_counts,
     const int16_t*  __restrict__ escape_vals,
     float* __restrict__ out0, float* __restrict__ out1,
     float* __restrict__ out2, float* __restrict__ out3,
@@ -296,9 +297,28 @@ __global__ void fixed12_matvec_batch4(
     const int tid = threadIdx.x;
     __shared__ int16_t cb[4096];
     __shared__ float warp_sums[16];
+    __shared__ int warp_esc_totals[4];
     for (int i = tid; i < 4096; i += WORKGROUP_SIZE) cb[i] = codebook[i];
+
+    // Load escape count (1 byte, coalesced) and compute prefix sum via warp shuffles
+    int my_count = (int)escape_counts[row * WORKGROUP_SIZE + tid];
+    int lane = tid & (WARP_SIZE - 1);
+    int warp_id = tid >> 6;
+    // Warp-level inclusive prefix sum (Hillis-Steele)
+    int prefix = my_count;
+    for (int off = 1; off < WARP_SIZE; off <<= 1) {
+        int v = __shfl_up(prefix, off, WARP_SIZE);
+        if (lane >= off) prefix += v;
+    }
+    int warp_total = __shfl(prefix, WARP_SIZE - 1, WARP_SIZE);
+    prefix -= my_count;  // exclusive
+    // Cross-warp prefix sum
+    if (lane == WARP_SIZE - 1) warp_esc_totals[warp_id] = warp_total;
     __syncthreads();
-    int esc_ptr = escape_row_base[row] + (int)escape_thread_off[row * WORKGROUP_SIZE + tid];
+    int cross = 0;
+    for (int w = 0; w < warp_id; w++) cross += warp_esc_totals[w];
+    int esc_ptr = escape_row_base[row] + cross + prefix;
+
     int64_t bp = (int64_t)row * K * 12 + (int64_t)tid * 12;
     float s0a=0,s0b=0,s1a=0,s1b=0,s2a=0,s2b=0,s3a=0,s3b=0;
     BATCH4_FMA_BODY()
@@ -493,7 +513,7 @@ int launch_fixed12_batch2(
 int launch_fixed12_batch4(
     const void* packed, const void* codebook,
     const void* a0, const void* a1, const void* a2, const void* a3,
-    const void* esc_row_base, const void* esc_thread_off, const void* esc_vals,
+    const void* esc_row_base, const void* esc_counts, const void* esc_vals,
     void* o0, void* o1, void* o2, void* o3, int M, int K)
 {
     hipLaunchKernelGGL(fixed12_matvec_batch4,
@@ -501,7 +521,7 @@ int launch_fixed12_batch4(
         (const uint32_t*)packed, (const int16_t*)codebook,
         (const int16_t*)a0, (const int16_t*)a1,
         (const int16_t*)a2, (const int16_t*)a3,
-        (const int32_t*)esc_row_base, (const uint16_t*)esc_thread_off,
+        (const int32_t*)esc_row_base, (const uint8_t*)esc_counts,
         (const int16_t*)esc_vals,
         (float*)o0, (float*)o1, (float*)o2, (float*)o3, M, K);
     return (hipDeviceSynchronize() == hipSuccess) ? 0 : -1;
@@ -555,17 +575,17 @@ int launch_fixed12_fused_async(
 int launch_fixed12_batch4_async(
     const void* packed, const void* codebook,
     const void* a0, const void* a1, const void* a2, const void* a3,
-    const void* esc_row_base, const void* esc_thread_off, const void* esc_vals,
+    const void* esc_row_base, const void* esc_counts, const void* esc_vals,
     void* o0, void* o1, void* o2, void* o3, int M, int K, void* stream)
 {
-    if (esc_thread_off) {
-        // Fast path: pre-computed offset table
+    if (esc_counts) {
+        // Fast path: uint8 count table + shared-memory prefix sum
         hipLaunchKernelGGL(fixed12_matvec_batch4,
             dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
             (const uint32_t*)packed, (const int16_t*)codebook,
             (const int16_t*)a0, (const int16_t*)a1,
             (const int16_t*)a2, (const int16_t*)a3,
-            (const int32_t*)esc_row_base, (const uint16_t*)esc_thread_off,
+            (const int32_t*)esc_row_base, (const uint8_t*)esc_counts,
             (const int16_t*)esc_vals,
             (float*)o0, (float*)o1, (float*)o2, (float*)o3, M, K);
     } else {
