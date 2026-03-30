@@ -12,81 +12,94 @@
 
 ## Current Results
 
-- **2.90x** weighted avg inference speedup (fused kernel, all 226 Llama 8B tensors, 100% lossless)
+- **2.90x** weighted avg inference speedup (fused kernel, all 226 Llama 8B tensors, bit-perfect)
 - **353 GB/s** effective bandwidth on large tensors (34% of MI50 32GB's 1 TB/s HBM2 peak)
 - **1.47x** disk compression (.tlc 8-tier variable-length)
 - **1.33x** VRAM compression (12-bit fixed-width + escape table)
 - Validated compression on 11 BF16 models, 7 architectures, 8B–671B params
+- Use case: autoregressive decoding (memory-bound matvec), not prefill (compute-bound matmul)
 
-## Architecture
+## Fused Kernel Architecture (decompress_v2.hip)
 
-### Fused Kernel (decompress_v2.hip)
+Single GPU kernel launch per matvec. Decodes 12-bit packed indices, looks up LDS codebook, handles escapes inline via per-thread offset table, accumulates FMA.
 
-Single GPU kernel launch per matvec. Decodes 12-bit packed indices, looks up L1-cached codebook, handles escapes inline via per-thread offset table, accumulates FMA.
+**Hot loop per element (~8 ALU + 3 memory ops):**
+1. Incremental bit position (iadd64, avoids imul64)
+2. Branchless 64-bit read → 12-bit index (2 global loads + shift + mask)
+3. LDS codebook lookup (1 cycle, 8 KB int16)
+4. bf16_to_float (2 ALU)
+5. Activation read + bf16_to_float (1 global load + 2 ALU)
+6. FMA accumulate
+7. Escape check (branch predicted 99.92%)
 
-**Key design:**
-- Branchless 64-bit read: 12-bit index straddles word boundary 37% of the time. Always load two uint32 as one uint64 and shift. Zero branches, zero divergence. 1.88x → 2.29x.
-- LDS codebook: MI50 has 1 TB/s HBM — kernel is compute-bound. 8 KB codebook in LDS (1-cycle) vs L1 (~10-cycle). 2.29x → 2.87x.
-- Per-thread escape table: `escape_offsets[row * 256 + tid]` → O(1) lookup, zero scanning.
-- 2x loop unroll: ILP for overlapping packed reads with LDS codebook lookups and FMA.
-- Wavefront reduction via `__shfl_down` + shared `warp_sums[4]`.
+**Design constraints on MI50 32GB:**
+- 8 KB LDS (int16 codebook) = 8 blocks/CU = 80% occupancy (sweet spot)
+- 16 KB LDS (float32 codebook) = 4 blocks/CU = 40% slower (occupancy kills it)
+- L1 cache codebook = 10-cycle latency = 22% slower than LDS
+- Kernel is compute-bound at 34% of 1 TB/s HBM bandwidth
 
-**Optimization history:**
-- atomicAdd patches: 0.02x on token_embd — MI50 lacks hardware float atomics → CAS stall.
-- CSR wavefront-parallel patches (two-pass): 1.73x.
-- L1-cached codebook + 2x unroll (two-pass): 1.88x.
-- Fused merge-scan: 0.15x on token_embd — O(N) scan per escape.
-- Fused binary search: 1.32x on token_embd — L2 latency per comparison.
-- Per-thread escape offset table (fused): 1.88x — O(1) escape, single kernel.
-- Branchless 64-bit read: 2.29x — eliminated 37% warp divergence.
-- LDS codebook (fused): 2.87x — 1-cycle vs 10-cycle codebook lookup.
-- **Incremental bit positions: 2.90x — replace imul64 with iadd64 in hot loop.**
+**Optimization history (this session):**
+- 0.05x: atomicAdd patches — MI50 CAS retry loop stall
+- 1.73x: CSR wavefront-parallel patches, no atomics
+- 1.88x: Fused kernel + 2x unroll + per-thread escape O(1) table
+- 2.29x: Branchless 64-bit read — eliminated 37% warp divergence
+- 2.87x: LDS codebook — 1-cycle vs 10-cycle L1 access
+- **2.90x: Incremental bit positions + dead code removal + bit-exact verification**
 
-### Disk Format (.tlc)
+**Tested and rejected:**
+- Float32 LDS codebook: -40% (occupancy)
+- Split 2K LDS + L1: -12% (branch divergence)
+- LDS activation cache: -40% (occupancy)
+- Float32 activations: -2% (bandwidth)
+- 4x unroll: -1% (register pressure)
+- Software pipelining: -1% (compiler already does it)
+- Fused merge-scan: -19x on token_embd
+- Fused binary search: -2.2x on token_embd
+- __launch_bounds__ hints: 0% (compiler is smart)
 
-8-tier variable-length prefix code per tensor. Tiers 0-6 use 512-entry codebooks (9-bit index + unary prefix). Tier 7 is raw BF16 escape. ~10.6 bits/param average.
+## Correctness Verification
 
-### VRAM Format (12-bit fixed)
+Bit-exact verification using decompress kernel (`fixed12_decompress_fused`):
+1. Decompress all weights via same codebook + escape logic
+2. Compare every int16 (BF16 bit pattern) against original tensor
+3. Zero mismatches required: `(decoded != original).sum() == 0`
+4. Stronger than matvec error threshold which could miss canceling errors
 
-4096-entry codebook per tensor. Each weight stored as 12-bit index. Index 4095 = escape sentinel. Escape values stored in per-thread-stride order with offset table for O(1) kernel access.
+## Packing (fixed12_pack.c)
 
-### Packing (fixed12_pack.c)
-
-Two packing functions:
-- `pack_fixed12()`: CSR row-grouped patches for two-pass path
-- `pack_fixed12_fused()`: Per-thread-stride escape layout for fused kernel
-
-Both use GPU `torch.unique()` for frequency sort, then C loop for 12-bit bit-packing.
+`pack_fixed12_fused()`: Per-thread-stride escape layout
+- Escape values ordered by `(row, tid=col%256, encounter_order)`
+- `escape_offsets[row * 256 + tid]` = exclusive prefix sum over (row, tid) counts
+- Three passes: count escapes per (row,tid), prefix sum, fill values
 
 ## Compression Validation
 
 | Model | Params | Type | CR | Escape % |
 |-------|--------|------|----|----------|
 | Llama 3.1 8B | 8B | Dense | 1.509x | 0.03% |
-| Phi-4 | 14B | Dense | 1.507x | 0.03% |
-| Codestral 22B | 22B | Dense | 1.504x | 0.03% |
 | Llama 3.1 70B | 70B | Dense | 1.516x | 0.05% |
 | Mistral Large 123B | 123B | Dense | 1.503x | 0.03% |
 | MiniMax-Text-01 | 456B | MoE | 1.507x | 0.03% |
 | DeepSeek V3 | 671B | MoE | 1.185x | 2.02% |
 
-Dense models: 1.50x+ consistently. Large MoE reduced due to training recipe diversity.
-
 ## Implementation Status
 
 | Component | Status |
 |-----------|--------|
-| Compression analysis (12 models) | Done |
-| .tlc encoder/decoder | Done |
-| Round-trip verification | Done (292 tensors, 0 mismatches) |
-| Fused GPU kernel (12-bit) | Done |
-| Benchmark harness | Done |
-| End-to-end runtime | WIP (tlc_runtime.py needs fused kernel wiring) |
-| NVIDIA/CUDA port | TODO (warp size 64→32) |
+| Fused GPU kernel (12-bit matvec) | Done — decompress_v2.hip |
+| Bit-exact verification kernel | Done — decompress_v2.hip |
+| Benchmark harness | Done — bench_fixed12.py |
+| C packer (fused escape layout) | Done — fixed12_pack.c |
+| .tlc encoder/decoder | Done — tlc_encode.py, tlc_decode.py |
+| Round-trip verification | Done — tlc_verify.py |
+| End-to-end runtime | WIP — tlc_runtime.py needs fused kernel wiring |
+| NVIDIA/CUDA port | TODO — warp size 64→32 |
+| Batch matvec (small batch decode) | TODO — reuse weight reads across batch |
 
 ## Scope
 
 - **Target**: Dense BF16 safetensors models (Llama, Mistral, Phi, Qwen, Yi, etc.)
-- **Works well**: All dense + small MoE → 1.50x+ compression, 1.88x inference
+- **Best for**: Autoregressive decoding (memory-bound matvec)
+- **Works well**: All dense + small MoE → 1.50x+ compression, 2.90x inference
 - **Partial**: Large MoE (DeepSeek V3) → 1.2x compression
-- **Out of scope**: FP16, FP32, GGUF, GPTQ/AWQ INT4
+- **Not beneficial**: Prefill (compute-bound), GPTQ/AWQ INT4 (~1.11x)

@@ -2,11 +2,11 @@
 
 100% bit-perfect lossless compression for LLM weights. BF16 in, BF16 out — no precision loss, 1.5x smaller, 2.90x faster inference.
 
-## Benchmark: Fused 12-bit Kernel on AMD MI50 (32GB)
+## Benchmark: Fused 12-bit Kernel on AMD MI50 32GB
 
 Single fused kernel — decode + escape correction + matvec in one GPU dispatch. Zero atomics, zero separate passes.
 
-Measured on Llama 3.1 8B, all 226 weight tensors, 100% lossless bit-perfect:
+Measured on Llama 3.1 8B, all 226 weight tensors, 100% bit-perfect lossless:
 
 | Tensor Type | Shape | Ours | BF16 | Speedup | BW |
 |-------------|-------|------|------|---------|-----|
@@ -21,7 +21,7 @@ Measured on Llama 3.1 8B, all 226 weight tensors, 100% lossless bit-perfect:
 | token_embd | [4096x128256] | 3.048ms | 9.380ms | **3.08x** | 345 GB/s |
 | **Weighted avg** | **(226 tensors)** | **0.704ms** | **2.039ms** | **2.90x** | |
 
-All tensors lossless (226/226). Large tensors achieve 353 GB/s effective bandwidth (34% of MI50's 1 TB/s HBM2 peak).
+Large tensors achieve 353 GB/s effective bandwidth (34% of MI50's 1 TB/s HBM2 peak). Kernel is at the compute-memory balance point — remaining gap is data-dependent LDS lookup latency.
 
 ### Compression Ratios
 
@@ -55,47 +55,59 @@ Every BF16 weight is encoded as a 12-bit codebook index. The top 4095 most frequ
 
 ```
 Thread tid in row block:
-  1. Branchless 64-bit read of 12-bit index       (HBM → L2)
-  2. If idx < 4095: lookup codebook[idx]           (LDS, 1-cycle)
-     If idx == 4095: read escape_vals[esc_ptr++]   (O(1), per-thread offset table)
-  3. Multiply weight × activation, accumulate      (registers)
+  1. bp += stride_bits (incremental, avoids 64-bit multiply)
+  2. Branchless 64-bit read → extract 12-bit index
+  3. If idx < 4095: lookup cb[idx] in LDS (1 cycle)
+     If idx == 4095: read escape_vals[esc_ptr++] (O(1))
+  4. bf16_to_float conversion (2 ALU)
+  5. FMA: sum += weight × activation
 ```
 
 ### Key Optimizations
 
-**Branchless 64-bit read** (+22%): 12-bit values straddle 32-bit word boundaries 37% of the time. Always load two words as one uint64 and shift — zero branches, zero warp divergence. This single change: 1.88x → 2.29x.
+| Optimization | Impact | Detail |
+|-------------|--------|--------|
+| **Branchless 64-bit read** | 1.88→2.29x | 12-bit values cross word boundary 37% of time. Always load uint64, shift — zero divergence |
+| **LDS codebook (8 KB int16)** | 2.29→2.87x | 1-cycle LDS vs 10-cycle L1. Compute-bound at 1 TB/s HBM |
+| **Per-thread escape table** | Enables fused | `escape_offsets[row*256+tid]` → O(1), no scanning |
+| **2x loop unroll** | +5% | ILP for overlapping reads with compute |
+| **Incremental bit positions** | +1% | `bp += const` (iadd64) vs `col*12` (imul64) |
+| **Bitwise warp indexing** | <1% | `tid >> 6` and `tid & 63` vs integer div/mod |
 
-**LDS codebook** (+25%): MI50 has 1 TB/s HBM bandwidth — the kernel is compute-bound, not bandwidth-bound. Moving the 8 KB codebook from L1 cache (~10 cycle latency) to LDS (1 cycle) eliminates the main compute bottleneck. This change: 2.29x → 2.87x.
+### Tested and Rejected
 
-**Per-thread escape offset table**: `escape_offsets[row * 256 + tid]` gives each thread its pre-computed pointer. On escape, just read and increment — O(1), zero scanning.
-
-**2x loop unroll**: Two columns per iteration for instruction-level parallelism. Overlaps packed data reads with LDS codebook lookups and FMA.
-
-**Incremental bit positions**: Replace `col * 12` (64-bit multiply, ~4 cycles on GCN) with `bp += stride_bits` (64-bit add, ~2 cycles). Bit positions computed once at loop entry, then incremented.
-
-### Optimization History
-
-| Step | Speedup | Change |
-|------|---------|--------|
-| Starting point (broken atomicAdd) | 0.05x | MI50 CAS retry loop stall |
-| CSR wavefront-parallel patches | 1.73x | Row-grouped, no atomics |
-| L1-cached codebook (no LDS) | 1.80x | Max occupancy |
-| 2x loop unroll | 1.88x | ILP |
-| Fused kernel (O(1) escape table) | 1.88x | Single launch, per-thread offsets |
-| Branchless 64-bit read | 2.29x | Eliminated 37% warp divergence |
-| LDS codebook | 2.87x | 1-cycle vs 10-cycle lookup |
-| **Incremental bit positions** | **2.90x** | **Replace 64-bit multiply with add in hot loop** |
-
-### What Was Tested and Rejected
-
-| Approach | Result | Why |
-|----------|--------|-----|
-| Fused with CSR merge-scan | 0.15x on token_embd | Strided threads scan O(N) patches each |
-| Fused with binary search | 1.32x on token_embd | L2 latency per comparison |
-| atomicAdd patch kernel | 0.02x on token_embd | MI50 lacks hardware float atomics |
-| 4x loop unroll | -3% vs 2x | Register pressure reduces occupancy |
-| Software pipelining | -1% vs 2x | Compiler already schedules well at -O3 |
+| Approach | Result | Why rejected |
+|----------|--------|-------------|
+| Float32 LDS codebook (16 KB) | -40% | Halves occupancy (4 vs 8 blocks/CU) |
+| Split codebook (2K LDS + L1) | -12% | Extra branch divergence on random idx |
+| L1-only codebook (no LDS) | -22% | 10-cycle latency, compute-bound kernel |
+| Float32 pre-converted activations | -2% | Doubles activation bandwidth (4 vs 2 bytes) |
+| LDS activation cache | -40% | Same occupancy problem as float32 codebook |
+| 4x loop unroll | -1% | Register pressure reduces occupancy |
+| Software pipelining | -1% | Compiler already schedules well at -O3 |
+| Fused CSR merge-scan | -19x on token_embd | O(N) scan for strided thread access |
+| Fused binary search | -2.2x on token_embd | L2 latency per comparison |
+| atomicAdd patch kernel | -58x on token_embd | MI50 lacks hardware float atomics |
+| `__launch_bounds__(256, 7)` | 0% | Compiler already makes good register decisions |
 | 11-bit codebook (2048 entries) | N/A | 9.6% escape rate on attn_k — too high |
+
+### Performance Limits
+
+At 353 GB/s effective bandwidth (34% of 1 TB/s peak), the kernel is at the **compute-memory balance point**:
+- 8 ALU + 3 memory ops per element
+- Data-dependent LDS lookup (codebook[random_idx]) creates serial dependency
+- 8 KB LDS = 8 blocks/CU = 32 wavefronts = 80% occupancy (sweet spot)
+- More occupancy requires less LDS, but reducing codebook size increases escape rate
+
+## Correctness Verification
+
+Each tensor is verified **bit-exact** using a separate decompress kernel:
+
+1. **Decompress kernel** (`fixed12_decompress_fused`): Decodes every 12-bit index through the same codebook + escape logic as the matvec kernel, writes raw int16 BF16 values to a buffer
+2. **Bit comparison**: `(decoded != original.view(int16)).sum() == 0` — every BF16 bit pattern must match exactly
+3. **Result**: 226/226 tensors pass with zero mismatches on Llama 3.1 8B
+
+This is stronger than matvec error checking (`|y - y_ref| < threshold`) which could miss individual weight errors that cancel out in the dot product.
 
 ## Build & Run
 
@@ -118,19 +130,36 @@ hipcc -O3 --offload-arch=gfx906 -shared -fPIC -o decompress_v2.so decompress_v2.
 python3 bench_fixed12.py models/llama-3.1-8b/llama-3.1-8b.safetensors
 ```
 
+### What the benchmark does
+
+1. For each 2D BF16 tensor (>100K params):
+   - **GPU frequency sort**: `torch.unique()` on GPU for codebook construction
+   - **C packing**: `pack_fixed12_fused()` produces 12-bit packed data + per-thread escape offset table
+   - **Bit-exact verification**: Decompress kernel decodes all weights, compare against original BF16
+   - **Timing**: Fused matvec kernel vs `W.float() @ x.float()` BF16 baseline (30 warmup + 200 timed runs, trimmed mean)
+2. Reports per-tensor speedup, effective bandwidth, lossless status, weighted average
+
 ### File Overview
 
 | File | Purpose |
 |------|---------|
-| `bench_fixed12.py` | Benchmark: GPU freq sort, C packing, fused kernel timing |
+| `bench_fixed12.py` | Benchmark: GPU freq sort, C packing, fused kernel timing + verification |
 | `fixed12_pack.c` | C packer: 12-bit indices + per-thread escape offset table |
-| `decompress_v2.hip` | Fused kernel (fused matvec + decompress-only for verification) |
+| `decompress_v2.hip` | Fused kernel: matvec + decompress-only (fully commented) |
 | `decompress_matmul.hip` | V1 kernels: variable-length decode, format conversion |
 | `tlc_encode.py` | .tlc encoder (8-tier variable-length for disk) |
 | `tlc_decode.py` | .tlc decoder (CPU) |
 | `tlc_format.py` | .tlc binary format definitions |
 | `tlc_runtime.py` | GPU runtime for .tlc models |
 | `tlc_verify.py` | Round-trip lossless verification |
+| `bitpack_fast.c` | C packer for .tlc variable-length format |
+| `bitunpack_fast.c` | C unpacker for .tlc variable-length format |
+
+## Use Case
+
+This engine accelerates **autoregressive decoding** (token generation) where inference is memory-bandwidth bound. Each decoding step does matrix × vector (weight × single token activation), reading the entire weight matrix. Our 12-bit format reads 25% less data with negligible decode overhead.
+
+Not beneficial for **prefill** (prompt processing) which is compute-bound — weights are reused across the token batch and the codebook lookup overhead would hurt.
 
 ## Target Hardware
 
