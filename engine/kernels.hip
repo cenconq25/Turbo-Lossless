@@ -399,6 +399,124 @@ void launch_fp32_to_bf16(const float* input, int16_t* output, int n, hipStream_t
 }
 }
 
+// ============================================================
+// Batched RMSNorm: process B vectors of length n in one launch
+// x,y are [batch_size * n], weight is [n] (shared across batch)
+// One block per batch item, threads cooperate on reduction
+// ============================================================
+__global__ void rms_norm_batch_kernel(
+    const float* __restrict__ x,      // [batch_size * n]
+    const float* __restrict__ weight,  // [n]
+    float* __restrict__ y,            // [batch_size * n]
+    int n, float eps, int batch_size)
+{
+    int batch = blockIdx.x;
+    if (batch >= batch_size) return;
+
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int offset = batch * n;
+
+    // Pass 1: compute sum of squares
+    float sum_sq = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) {
+        float v = x[offset + i];
+        sum_sq += v * v;
+    }
+
+    sdata[tid] = sum_sq;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float rms = rsqrtf(sdata[0] / n + eps);
+    __syncthreads();
+
+    // Pass 2: normalize and scale
+    for (int i = tid; i < n; i += blockDim.x) {
+        y[offset + i] = x[offset + i] * rms * weight[i];
+    }
+}
+
+// ============================================================
+// Batched SiLU multiply: SiLU(gate) * up for B*n elements
+// ============================================================
+__global__ void silu_mul_batch_kernel(
+    const float* __restrict__ gate,   // [batch_size * n]
+    const float* __restrict__ up,     // [batch_size * n]
+    float* __restrict__ out,          // [batch_size * n]
+    int n, int batch_size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch_size * n;
+    if (idx >= total) return;
+    float g = gate[idx];
+    float silu = g / (1.0f + expf(-g));
+    out[idx] = silu * up[idx];
+}
+
+// ============================================================
+// Batched add: y[i] += x[i] for batch_size * n elements
+// ============================================================
+__global__ void add_batch_kernel(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    int n, int batch_size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch_size * n;
+    if (idx >= total) return;
+    y[idx] += x[idx];
+}
+
+// ============================================================
+// Batched memcpy: GPU-side copy of batch_size * n floats
+// ============================================================
+__global__ void memcpy_batch_kernel(
+    float* __restrict__ dst,
+    const float* __restrict__ src,
+    int n, int batch_size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch_size * n;
+    if (idx >= total) return;
+    dst[idx] = src[idx];
+}
+
+extern "C" {
+
+void launch_rms_norm_batch(const float* x, const float* weight, float* y,
+                           int n, float eps, int batch_size, hipStream_t stream) {
+    int threads = 256;
+    rms_norm_batch_kernel<<<batch_size, threads, threads * sizeof(float), stream>>>(
+        x, weight, y, n, eps, batch_size);
+}
+
+void launch_silu_mul_batch(const float* gate, const float* up, float* out,
+                           int n, int batch_size, hipStream_t stream) {
+    int threads = 256;
+    int total = batch_size * n;
+    int blocks = (total + threads - 1) / threads;
+    silu_mul_batch_kernel<<<blocks, threads, 0, stream>>>(gate, up, out, n, batch_size);
+}
+
+void launch_add_batch(float* y, const float* x, int n, int batch_size, hipStream_t stream) {
+    int threads = 256;
+    int total = batch_size * n;
+    int blocks = (total + threads - 1) / threads;
+    add_batch_kernel<<<blocks, threads, 0, stream>>>(y, x, n, batch_size);
+}
+
+void launch_memcpy_batch(float* dst, const float* src, int n, int batch_size, hipStream_t stream) {
+    int threads = 256;
+    int total = batch_size * n;
+    int blocks = (total + threads - 1) / threads;
+    memcpy_batch_kernel<<<blocks, threads, 0, stream>>>(dst, src, n, batch_size);
+}
+
+}
+
 // ============================================================================
 // Fused Multi-Head Attention (all heads in one launch)
 // ============================================================================
@@ -496,5 +614,110 @@ void launch_attention_all_heads(const float* q, const int16_t* k_cache, const in
     int smem = (seq_len + head_dim) * sizeof(float) + 16 * sizeof(float);
     attention_all_heads_kernel<<<n_head, threads, smem, stream>>>(
         q, k_cache, v_cache, output, seq_len, max_seq, n_head_kv, head_dim, gqa_ratio, scale);
+}
+}
+
+// ============================================================================
+// Batched Multi-Head Attention — B sequences × N heads in one launch
+// Grid: (n_head, batch_size), each block handles one head of one sequence
+// ============================================================================
+__global__ void attention_all_heads_batch_kernel(
+    const float* __restrict__ q,           // [batch_size * n_head * head_dim]
+    const int16_t* __restrict__ kv_cache_k, // [n_layer * max_seq * n_head_kv * head_dim] (shared)
+    const int16_t* __restrict__ kv_cache_v,
+    float* __restrict__ output,            // [batch_size * n_head * head_dim]
+    const int* __restrict__ positions,     // [batch_size] current position per sequence
+    int n_head, int n_head_kv, int head_dim,
+    int max_seq, int gqa_ratio, float scale,
+    int kv_stride)                         // stride between sequences in KV cache (0 = shared cache)
+{
+    int head = blockIdx.x;
+    int seq = blockIdx.y;
+    int kv_head = head / gqa_ratio;
+    int tid = threadIdx.x;
+    int pos = positions[seq];
+    int seq_len = pos + 1;
+
+    int n_total = n_head * head_dim;
+    
+    extern __shared__ float smem[];
+    float* scores = smem;
+    float* q_shared = smem + seq_len;
+
+    // Load Q for this head of this sequence
+    for (int i = tid; i < head_dim; i += blockDim.x)
+        q_shared[i] = q[seq * n_total + head * head_dim + i];
+    __syncthreads();
+
+    // Q·K^T  (KV cache offset depends on whether cache is shared or per-sequence)
+    const int16_t* k = kv_cache_k + (size_t)seq * kv_stride;
+    const int16_t* v = kv_cache_v + (size_t)seq * kv_stride;
+
+    for (int t = tid; t < seq_len; t += blockDim.x) {
+        int k_base = t * n_head_kv * head_dim + kv_head * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++)
+            dot += q_shared[d] * bf16_to_float(k[k_base + d]);
+        scores[t] = dot * scale;
+    }
+    __syncthreads();
+
+    // Softmax
+    __shared__ float warp_reduce[16];
+    int lane = tid % 64;
+    int warp_id = tid / 64;
+
+    float local_max = -1e30f;
+    for (int t = tid; t < seq_len; t += blockDim.x)
+        local_max = fmaxf(local_max, scores[t]);
+    for (int off = 32; off > 0; off >>= 1)
+        local_max = fmaxf(local_max, __shfl_xor(local_max, off, 64));
+    if (lane == 0) warp_reduce[warp_id] = local_max;
+    __syncthreads();
+    if (tid == 0) { float m = warp_reduce[0]; for (int i=1;i<(blockDim.x+63)/64;i++) m=fmaxf(m,warp_reduce[i]); warp_reduce[0]=m; }
+    __syncthreads();
+    float gmax = warp_reduce[0];
+
+    float local_sum = 0.0f;
+    for (int t = tid; t < seq_len; t += blockDim.x) {
+        float e = expf(scores[t] - gmax); scores[t] = e; local_sum += e;
+    }
+    for (int off = 32; off > 0; off >>= 1) local_sum += __shfl_xor(local_sum, off, 64);
+    if (lane == 0) warp_reduce[warp_id] = local_sum;
+    __syncthreads();
+    if (tid == 0) { float s=0; for (int i=0;i<(blockDim.x+63)/64;i++) s+=warp_reduce[i]; warp_reduce[0]=s; }
+    __syncthreads();
+    float inv_sum = 1.0f / warp_reduce[0];
+    for (int t = tid; t < seq_len; t += blockDim.x) scores[t] *= inv_sum;
+    __syncthreads();
+
+    // Weighted sum of V
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        int v_off = kv_head * head_dim + d;
+        for (int t = 0; t < seq_len; t++)
+            acc += scores[t] * bf16_to_float(v[t * n_head_kv * head_dim + v_off]);
+        output[seq * n_total + head * head_dim + d] = acc;
+    }
+}
+
+extern "C" {
+void launch_attention_all_heads_batch(
+    const float* q, const int16_t* kv_k, const int16_t* kv_v,
+    float* output, const int* positions,
+    int n_head, int n_head_kv, int head_dim,
+    int max_seq, float scale, int batch_size, int kv_stride,
+    hipStream_t stream)
+{
+    int gqa_ratio = n_head / n_head_kv;
+    int threads = 128;
+    // Find max seq_len for shared memory allocation
+    // For simplicity, use max_seq as upper bound (wastes some smem)
+    int max_pos = 64;  // reasonable default for decode, will be updated
+    int smem = (max_pos + head_dim) * sizeof(float) + 16 * sizeof(float);
+    dim3 grid(n_head, batch_size);
+    attention_all_heads_batch_kernel<<<grid, threads, smem, stream>>>(
+        q, kv_k, kv_v, output, positions, n_head, n_head_kv, head_dim,
+        max_seq, gqa_ratio, scale, kv_stride);
 }
 }

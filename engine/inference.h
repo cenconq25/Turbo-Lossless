@@ -19,6 +19,8 @@ struct InferenceState {
     float* ffn_down;      // [batch_size, n_embd]
     float* logits;        // [batch_size, n_vocab]
     float* attn_scores_buf; // [max_seq_len] temp for attention scores
+    int* d_positions;       // [batch_size] positions on GPU
+    int* d_tokens;          // [batch_size] token IDs on GPU
 
     hipStream_t stream;
 };
