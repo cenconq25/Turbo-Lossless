@@ -58,10 +58,14 @@ static void ensure_bf16_bufs(int K, int batch_size) {
 #define B 4
 #define SEQ(buf, s, sz) ((buf) + (s) * (sz))
 
-// B=1 FP32 direct matvec (no BF16 conversion launch!)
+// Skip patches for tensors with <0.01% escape rate (< 1 in 10000)
+// Error is undetectable in practice but saves ~900 kernel launches at B=4
+#define PATCH_THRESHOLD 0  // 0 = true lossless (correct ALL escapes)
+
+// B=1 FP32 direct matvec
 static void matvec_b1(const CompressedWeight& w, const float* x, float* out, hipStream_t stream) {
     launch_fixed12_v2_f32(w.packed, w.codebook, x, out, w.M, w.K, stream);
-    if (w.num_patches > 0 && w.row_offsets) {
+    if (w.num_patches > PATCH_THRESHOLD && w.row_offsets) {
         // Patch kernel still needs BF16 activations — convert just for patches
         ensure_bf16_bufs(w.K, 1);
         launch_fp32_to_bf16(x, s_bf16_bufs[0], w.K, stream);
@@ -77,7 +81,7 @@ static void matvec_b4(const CompressedWeight& w,
         SEQ(x,0,n_in), SEQ(x,1,n_in), SEQ(x,2,n_in), SEQ(x,3,n_in),
         SEQ(out,0,n_out), SEQ(out,1,n_out), SEQ(out,2,n_out), SEQ(out,3,n_out),
         w.M, w.K, stream);
-    if (w.num_patches > 0 && w.row_offsets) {
+    if (w.num_patches > PATCH_THRESHOLD && w.row_offsets) {
         ensure_bf16_bufs(w.K, 4);
         for (int s = 0; s < B; s++) {
             launch_fp32_to_bf16(SEQ(x,s,n_in), s_bf16_bufs[s], w.K, stream);
