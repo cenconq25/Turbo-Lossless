@@ -20,17 +20,6 @@ _pack_lib.build_codebook_12bit.argtypes = [
 ]
 _pack_lib.build_codebook_12bit.restype = ctypes.c_int
 
-_pack_lib.pack_fixed12.argtypes = [
-    ctypes.POINTER(ctypes.c_uint16), ctypes.c_int64,
-    ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32),
-    ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
-    ctypes.POINTER(ctypes.c_int16),
-    ctypes.POINTER(ctypes.c_int16), ctypes.c_int16,
-    ctypes.c_int32, ctypes.c_int32,
-]
-_pack_lib.pack_fixed12.restype = ctypes.c_int64
-
-# C packer - fused layout
 _pack_lib.pack_fixed12_fused.argtypes = [
     ctypes.POINTER(ctypes.c_uint16), ctypes.c_int64,
     ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32),
