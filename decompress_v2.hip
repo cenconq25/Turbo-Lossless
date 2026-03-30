@@ -252,21 +252,39 @@ __global__ void fixed12_matvec_batch4(
         cb[i] = codebook[i];
     __syncthreads();
 
-    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    // Use same 2x unroll pattern as single/batch2 for bit-exact accumulation
+    float s0a = 0.0f, s0b = 0.0f;
+    float s1a = 0.0f, s1b = 0.0f;
+    float s2a = 0.0f, s2b = 0.0f;
+    float s3a = 0.0f, s3b = 0.0f;
     int64_t bp = (int64_t)row * K * 12 + (int64_t)tid * 12;
 
-    for (int col = tid; col < K; col += WORKGROUP_SIZE) {
+    int col = tid;
+    for (; col + WORKGROUP_SIZE < K; col += WORKGROUP_SIZE * 2) {
+        uint32_t idx0 = read12(packed, bp);
+        uint32_t idx1 = read12(packed, bp + (int64_t)(WORKGROUP_SIZE * 12));
+
+        float w0 = (__builtin_expect(idx0 != 4095, 1))
+            ? bf16_to_float(cb[idx0]) : bf16_to_float(escape_vals[esc_ptr++]);
+        float w1 = (__builtin_expect(idx1 != 4095, 1))
+            ? bf16_to_float(cb[idx1]) : bf16_to_float(escape_vals[esc_ptr++]);
+
+        s0a += w0 * bf16_to_float(act0[col]);  s0b += w1 * bf16_to_float(act0[col + WORKGROUP_SIZE]);
+        s1a += w0 * bf16_to_float(act1[col]);  s1b += w1 * bf16_to_float(act1[col + WORKGROUP_SIZE]);
+        s2a += w0 * bf16_to_float(act2[col]);  s2b += w1 * bf16_to_float(act2[col + WORKGROUP_SIZE]);
+        s3a += w0 * bf16_to_float(act3[col]);  s3b += w1 * bf16_to_float(act3[col + WORKGROUP_SIZE]);
+        bp += (int64_t)(WORKGROUP_SIZE * 2 * 12);
+    }
+    if (col < K) {
         uint32_t idx = read12(packed, bp);
         float w = (__builtin_expect(idx != 4095, 1))
-            ? bf16_to_float(cb[idx])
-            : bf16_to_float(escape_vals[esc_ptr++]);
-
-        s0 += w * bf16_to_float(act0[col]);
-        s1 += w * bf16_to_float(act1[col]);
-        s2 += w * bf16_to_float(act2[col]);
-        s3 += w * bf16_to_float(act3[col]);
-        bp += (int64_t)(WORKGROUP_SIZE * 12);
+            ? bf16_to_float(cb[idx]) : bf16_to_float(escape_vals[esc_ptr++]);
+        s0a += w * bf16_to_float(act0[col]);
+        s1a += w * bf16_to_float(act1[col]);
+        s2a += w * bf16_to_float(act2[col]);
+        s3a += w * bf16_to_float(act3[col]);
     }
+    float s0 = s0a + s0b, s1 = s1a + s1b, s2 = s2a + s2b, s3 = s3a + s3b;
 
     for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
         s0 += __shfl_down(s0, off, WARP_SIZE);
