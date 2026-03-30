@@ -236,7 +236,6 @@ __global__ void fixed12_matvec_batch4(
     const int16_t*  __restrict__ act0, const int16_t* __restrict__ act1,
     const int16_t*  __restrict__ act2, const int16_t* __restrict__ act3,
     const int32_t*  __restrict__ escape_row_base,
-    const uint16_t* __restrict__ escape_thread_off,
     const int16_t*  __restrict__ escape_vals,
     float* __restrict__ out0, float* __restrict__ out1,
     float* __restrict__ out2, float* __restrict__ out3,
@@ -244,16 +243,47 @@ __global__ void fixed12_matvec_batch4(
 {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
-    int esc_ptr = escape_row_base[row] + (int)escape_thread_off[row * WORKGROUP_SIZE + tid];
 
     __shared__ int16_t cb[4096];
-    __shared__ float warp_sums[16];  // 4 per output vector
+    __shared__ float warp_sums[16];
+    __shared__ int esc_offsets[WORKGROUP_SIZE];  // 1 KB for prefix sum
 
     for (int i = tid; i < 4096; i += WORKGROUP_SIZE)
         cb[i] = codebook[i];
     __syncthreads();
 
-    // Use same 2x unroll pattern as single/batch2 for bit-exact accumulation
+    // Phase 1: count escapes by scanning packed data for sentinel 4095
+    // Must exactly mirror the main loop's access pattern
+    int64_t bp_start = (int64_t)row * K * 12 + (int64_t)tid * 12;
+    int my_esc_count = 0;
+    {
+        int64_t bp_s = bp_start;
+        int c = tid;
+        for (; c + WORKGROUP_SIZE < K; c += WORKGROUP_SIZE * 2) {
+            if (read12(packed, bp_s) == 4095) my_esc_count++;
+            if (read12(packed, bp_s + (int64_t)(WORKGROUP_SIZE * 12)) == 4095) my_esc_count++;
+            bp_s += (int64_t)(WORKGROUP_SIZE * 2 * 12);
+        }
+        if (c < K) {
+            if (read12(packed, bp_s) == 4095) my_esc_count++;
+        }
+    }
+
+    // Phase 2: exclusive prefix sum via shared memory (thread 0 scans, ~256 cycles)
+    esc_offsets[tid] = my_esc_count;
+    __syncthreads();
+    if (tid == 0) {
+        int sum = 0;
+        for (int i = 0; i < WORKGROUP_SIZE; i++) {
+            int c = esc_offsets[i];
+            esc_offsets[i] = sum;
+            sum += c;
+        }
+    }
+    __syncthreads();
+    int esc_ptr = escape_row_base[row] + esc_offsets[tid];
+
+    // Phase 3: main FMA loop (identical to original)
     float s0a = 0.0f, s0b = 0.0f;
     float s1a = 0.0f, s1b = 0.0f;
     float s2a = 0.0f, s2b = 0.0f;
@@ -452,7 +482,7 @@ int launch_fixed12_batch2(
 int launch_fixed12_batch4(
     const void* packed, const void* codebook,
     const void* a0, const void* a1, const void* a2, const void* a3,
-    const void* esc_row_base, const void* esc_thread_off, const void* esc_vals,
+    const void* esc_row_base, const void* esc_vals,
     void* o0, void* o1, void* o2, void* o3, int M, int K)
 {
     hipLaunchKernelGGL(fixed12_matvec_batch4,
@@ -460,7 +490,7 @@ int launch_fixed12_batch4(
         (const uint32_t*)packed, (const int16_t*)codebook,
         (const int16_t*)a0, (const int16_t*)a1,
         (const int16_t*)a2, (const int16_t*)a3,
-        (const int32_t*)esc_row_base, (const uint16_t*)esc_thread_off,
+        (const int32_t*)esc_row_base,
         (const int16_t*)esc_vals,
         (float*)o0, (float*)o1, (float*)o2, (float*)o3, M, K);
     return (hipDeviceSynchronize() == hipSuccess) ? 0 : -1;
@@ -514,7 +544,7 @@ int launch_fixed12_fused_async(
 int launch_fixed12_batch4_async(
     const void* packed, const void* codebook,
     const void* a0, const void* a1, const void* a2, const void* a3,
-    const void* esc_row_base, const void* esc_thread_off, const void* esc_vals,
+    const void* esc_row_base, const void* esc_vals,
     void* o0, void* o1, void* o2, void* o3, int M, int K, void* stream)
 {
     hipLaunchKernelGGL(fixed12_matvec_batch4,
@@ -522,7 +552,7 @@ int launch_fixed12_batch4_async(
         (const uint32_t*)packed, (const int16_t*)codebook,
         (const int16_t*)a0, (const int16_t*)a1,
         (const int16_t*)a2, (const int16_t*)a3,
-        (const int32_t*)esc_row_base, (const uint16_t*)esc_thread_off,
+        (const int32_t*)esc_row_base,
         (const int16_t*)esc_vals,
         (float*)o0, (float*)o1, (float*)o2, (float*)o3, M, K);
     return 0;
