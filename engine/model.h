@@ -29,7 +29,8 @@ struct CompressedWeight {
     int16_t* patch_wrong;         // [num_patches] wrong BF16 values
     int num_patches;
     // Fused escape table (built at load time from CSR)
-    int32_t* escape_offsets;      // [M * 256] per-thread escape pointers
+    int32_t* escape_row_base;     // [M] absolute start of row's escapes
+    uint16_t* escape_thread_off;  // [M * 256] per-thread offset within row (uint16 saves 50% BW)
     int16_t* escape_vals;         // [num_patches] correct BF16 values in thread-stride order
 };
 

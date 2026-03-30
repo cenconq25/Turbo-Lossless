@@ -73,7 +73,8 @@ static bool load_compressed(const std::string& dir, const std::string& prefix, C
     // Build fused escape table from CSR data
     // escape_offsets[row*256+tid] = exclusive prefix sum of escapes for thread tid in row
     // escape_vals = correct BF16 values in (row, tid, encounter_order) order
-    w.escape_offsets = nullptr;
+    w.escape_row_base = nullptr;
+    w.escape_thread_off = nullptr;
     w.escape_vals = nullptr;
     if (w.num_patches > 0 && !ro.empty() && !pc.empty() && !pcv.empty()) {
         const int WG = 256;
@@ -90,18 +91,25 @@ static bool load_compressed(const std::string& dir, const std::string& prefix, C
             }
         }
 
-        // Pass 2: exclusive prefix sum → escape_offsets
-        std::vector<int32_t> esc_off(w.M * WG);
+        // Pass 2: exclusive prefix sum → split into row_base + thread_off
+        std::vector<int32_t> row_base(w.M);
+        std::vector<uint16_t> thread_off(w.M * WG);
+        std::vector<int32_t> abs_off(w.M * WG);
         int total = 0;
-        for (int i = 0; i < w.M * WG; i++) {
-            esc_off[i] = total;
-            total += counts[i];
+        for (int r = 0; r < w.M; r++) {
+            row_base[r] = total;
+            for (int t = 0; t < WG; t++) {
+                int idx = r * WG + t;
+                abs_off[idx] = total;
+                thread_off[idx] = (uint16_t)(total - row_base[r]);
+                total += counts[idx];
+            }
         }
 
         // Pass 3: fill escape_vals in thread-stride order
         std::vector<int16_t> esc_vals(total);
         std::vector<int32_t> fill_ptr(w.M * WG);
-        for (int i = 0; i < w.M * WG; i++) fill_ptr[i] = esc_off[i];
+        for (int i = 0; i < w.M * WG; i++) fill_ptr[i] = abs_off[i];
         for (int r = 0; r < w.M; r++) {
             for (int p = h_row_off[r]; p < h_row_off[r + 1]; p++) {
                 int tid = h_cols[p] % WG;
@@ -110,7 +118,8 @@ static bool load_compressed(const std::string& dir, const std::string& prefix, C
             }
         }
 
-        w.escape_offsets = upload_gpu<int32_t>(esc_off.data(), esc_off.size());
+        w.escape_row_base = upload_gpu<int32_t>(row_base.data(), row_base.size());
+        w.escape_thread_off = upload_gpu<uint16_t>(thread_off.data(), thread_off.size());
         w.escape_vals = upload_gpu<int16_t>(esc_vals.data(), esc_vals.size());
     }
 

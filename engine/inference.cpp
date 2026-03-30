@@ -28,35 +28,24 @@ extern "C" {
     int launch_fixed12_v2_async(const void* packed, const void* codebook, const void* activations, void* output, int M, int K, void* stream);
     int launch_patches_v2_async(const void* row_offsets, const void* patch_cols, const void* correct_vals, const void* wrong_vals, const void* activations, void* output, int M, void* stream);
 
-    // Fused BF16-input kernels (single-pass, O(1) escape)
-    int launch_fixed12_fused_async(const void* packed, const void* codebook, const void* activations, const void* escape_offsets, const void* escape_vals, void* output, int M, int K, void* stream);
-    int launch_fixed12_batch4_async(const void* packed, const void* codebook, const void* a0, const void* a1, const void* a2, const void* a3, const void* esc_off, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, int M, int K, void* stream);
+    // Fused BF16 batch4 (single-pass, O(1) escape with split offset table)
+    int launch_fixed12_batch4_async(const void* packed, const void* codebook, const void* a0, const void* a1, const void* a2, const void* a3, const void* esc_row_base, const void* esc_thread_off, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, int M, int K, void* stream);
 }
 
 #define B 4
 #define SEQ(buf, s, sz) ((buf) + (s) * (sz))
 #define SEQI(buf, s, sz) ((buf) + (s) * (sz))  // int16_t version
 
-// B=1: convert FP32→BF16, then use fused BF16 kernel (max bandwidth)
-static void matvec_b1(const CompressedWeight& w, const float* x, float* out,
-                      int16_t* bf16_buf, hipStream_t stream) {
-    launch_fp32_to_bf16(x, bf16_buf, w.K, stream);
-    launch_fixed12_fused_async(w.packed, w.codebook, bf16_buf,
-        w.escape_offsets, w.escape_vals, out, w.M, w.K, stream);
-}
-
-// B=4: convert FP32→BF16, then use fused BF16 batch4 kernel
-static void matvec_b4(const CompressedWeight& w, float* x, float* out,
-                      int16_t* bf16_buf, int n_in, int n_out, hipStream_t stream) {
-    for (int s = 0; s < B; s++)
-        launch_fp32_to_bf16(SEQ(x,s,n_in), SEQI(bf16_buf,s,n_in), n_in, stream);
-    launch_fixed12_batch4_async(w.packed, w.codebook,
-        SEQI(bf16_buf,0,n_in), SEQI(bf16_buf,1,n_in),
-        SEQI(bf16_buf,2,n_in), SEQI(bf16_buf,3,n_in),
-        w.escape_offsets, w.escape_vals,
-        SEQ(out,0,n_out), SEQ(out,1,n_out), SEQ(out,2,n_out), SEQ(out,3,n_out),
-        w.M, w.K, stream);
-}
+// B=4 batch4 matvec helper: BF16 conversion + fused batch4 kernel
+#define BATCH4_MATVEC(w, bf16_in, out_buf, n_in, n_out, strm) do { \
+    launch_fixed12_batch4_async((w).packed, (w).codebook, \
+        SEQI(bf16_in,0,n_in), SEQI(bf16_in,1,n_in), \
+        SEQI(bf16_in,2,n_in), SEQI(bf16_in,3,n_in), \
+        (w).escape_row_base, (w).escape_thread_off, (w).escape_vals, \
+        SEQ(out_buf,0,n_out), SEQ(out_buf,1,n_out), \
+        SEQ(out_buf,2,n_out), SEQ(out_buf,3,n_out), \
+        (w).M, (w).K, strm); \
+} while(0)
 
 InferenceState* create_inference_state(Model* model, int batch_size, int max_seq_len) {
     auto* s = new InferenceState();
@@ -196,17 +185,17 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
         // Q on stream0, K+V on stream2 (K,V are 4x smaller — can overlap with Q's tail)
         launch_fixed12_batch4_async(L.wq.packed, L.wq.codebook,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
-            L.wq.escape_offsets, L.wq.escape_vals,
+            L.wq.escape_row_base, L.wq.escape_thread_off, L.wq.escape_vals,
             SEQ(state->q_buf,0,n), SEQ(state->q_buf,1,n), SEQ(state->q_buf,2,n), SEQ(state->q_buf,3,n),
             L.wq.M, L.wq.K, stream);
         launch_fixed12_batch4_async(L.wk.packed, L.wk.codebook,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
-            L.wk.escape_offsets, L.wk.escape_vals,
+            L.wk.escape_row_base, L.wk.escape_thread_off, L.wk.escape_vals,
             SEQ(state->k_buf,0,kv_dim), SEQ(state->k_buf,1,kv_dim), SEQ(state->k_buf,2,kv_dim), SEQ(state->k_buf,3,kv_dim),
             L.wk.M, L.wk.K, state->stream2);
         launch_fixed12_batch4_async(L.wv.packed, L.wv.codebook,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
-            L.wv.escape_offsets, L.wv.escape_vals,
+            L.wv.escape_row_base, L.wv.escape_thread_off, L.wv.escape_vals,
             SEQ(state->v_buf,0,kv_dim), SEQ(state->v_buf,1,kv_dim), SEQ(state->v_buf,2,kv_dim), SEQ(state->v_buf,3,kv_dim),
             L.wv.M, L.wv.K, state->stream2);
         hipStreamSynchronize(state->stream2);  // K,V ready for RoPE
@@ -228,7 +217,7 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
         launch_fp32_to_bf16(state->attn_out, bf16_a, B * n, stream);
         launch_fixed12_batch4_async(L.wo.packed, L.wo.codebook,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
-            L.wo.escape_offsets, L.wo.escape_vals,
+            L.wo.escape_row_base, L.wo.escape_thread_off, L.wo.escape_vals,
             SEQ(res,0,n), SEQ(res,1,n), SEQ(res,2,n), SEQ(res,3,n),
             L.wo.M, L.wo.K, stream);
         launch_add_batch(res, cur, n, B, stream);
@@ -238,12 +227,12 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
         // gate on stream0, up on stream2 (concurrent — both read same bf16_a, write different outputs)
         launch_fixed12_batch4_async(L.w_gate.packed, L.w_gate.codebook,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
-            L.w_gate.escape_offsets, L.w_gate.escape_vals,
+            L.w_gate.escape_row_base, L.w_gate.escape_thread_off, L.w_gate.escape_vals,
             SEQ(state->ffn_gate,0,n_ff), SEQ(state->ffn_gate,1,n_ff), SEQ(state->ffn_gate,2,n_ff), SEQ(state->ffn_gate,3,n_ff),
             L.w_gate.M, L.w_gate.K, stream);
         launch_fixed12_batch4_async(L.w_up.packed, L.w_up.codebook,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
-            L.w_up.escape_offsets, L.w_up.escape_vals,
+            L.w_up.escape_row_base, L.w_up.escape_thread_off, L.w_up.escape_vals,
             SEQ(state->ffn_up,0,n_ff), SEQ(state->ffn_up,1,n_ff), SEQ(state->ffn_up,2,n_ff), SEQ(state->ffn_up,3,n_ff),
             L.w_up.M, L.w_up.K, state->stream2);
         hipStreamSynchronize(state->stream2);  // wait for w_up before SiLU
@@ -251,7 +240,7 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
         launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, B, stream);
         launch_fixed12_batch4_async(L.w_down.packed, L.w_down.codebook,
             SEQI(bf16_b,0,n_ff), SEQI(bf16_b,1,n_ff), SEQI(bf16_b,2,n_ff), SEQI(bf16_b,3,n_ff),
-            L.w_down.escape_offsets, L.w_down.escape_vals,
+            L.w_down.escape_row_base, L.w_down.escape_thread_off, L.w_down.escape_vals,
             SEQ(cur,0,n), SEQ(cur,1,n), SEQ(cur,2,n), SEQ(cur,3,n),
             L.w_down.M, L.w_down.K, stream);
         launch_add_batch(cur, res, n, B, stream);
@@ -261,7 +250,7 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
     launch_rms_norm_bf16_batch(cur, m->output_norm, bf16_a, n, cfg.rms_norm_eps, B, stream);
     launch_fixed12_batch4_async(m->output_proj.packed, m->output_proj.codebook,
         SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
-        m->output_proj.escape_offsets, m->output_proj.escape_vals,
+        m->output_proj.escape_row_base, m->output_proj.escape_thread_off, m->output_proj.escape_vals,
         SEQ(state->logits,0,cfg.n_vocab), SEQ(state->logits,1,cfg.n_vocab),
         SEQ(state->logits,2,cfg.n_vocab), SEQ(state->logits,3,cfg.n_vocab),
         m->output_proj.M, m->output_proj.K, stream);

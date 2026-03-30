@@ -235,7 +235,8 @@ __global__ void fixed12_matvec_batch4(
     const int16_t*  __restrict__ codebook,
     const int16_t*  __restrict__ act0, const int16_t* __restrict__ act1,
     const int16_t*  __restrict__ act2, const int16_t* __restrict__ act3,
-    const int32_t*  __restrict__ escape_offsets,
+    const int32_t*  __restrict__ escape_row_base,
+    const uint16_t* __restrict__ escape_thread_off,
     const int16_t*  __restrict__ escape_vals,
     float* __restrict__ out0, float* __restrict__ out1,
     float* __restrict__ out2, float* __restrict__ out3,
@@ -243,7 +244,7 @@ __global__ void fixed12_matvec_batch4(
 {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
-    int esc_ptr = escape_offsets[row * WORKGROUP_SIZE + tid];
+    int esc_ptr = escape_row_base[row] + (int)escape_thread_off[row * WORKGROUP_SIZE + tid];
 
     __shared__ int16_t cb[4096];
     __shared__ float warp_sums[16];  // 4 per output vector
@@ -451,7 +452,7 @@ int launch_fixed12_batch2(
 int launch_fixed12_batch4(
     const void* packed, const void* codebook,
     const void* a0, const void* a1, const void* a2, const void* a3,
-    const void* esc_off, const void* esc_vals,
+    const void* esc_row_base, const void* esc_thread_off, const void* esc_vals,
     void* o0, void* o1, void* o2, void* o3, int M, int K)
 {
     hipLaunchKernelGGL(fixed12_matvec_batch4,
@@ -459,7 +460,8 @@ int launch_fixed12_batch4(
         (const uint32_t*)packed, (const int16_t*)codebook,
         (const int16_t*)a0, (const int16_t*)a1,
         (const int16_t*)a2, (const int16_t*)a3,
-        (const int32_t*)esc_off, (const int16_t*)esc_vals,
+        (const int32_t*)esc_row_base, (const uint16_t*)esc_thread_off,
+        (const int16_t*)esc_vals,
         (float*)o0, (float*)o1, (float*)o2, (float*)o3, M, K);
     return (hipDeviceSynchronize() == hipSuccess) ? 0 : -1;
 }
@@ -512,7 +514,7 @@ int launch_fixed12_fused_async(
 int launch_fixed12_batch4_async(
     const void* packed, const void* codebook,
     const void* a0, const void* a1, const void* a2, const void* a3,
-    const void* esc_off, const void* esc_vals,
+    const void* esc_row_base, const void* esc_thread_off, const void* esc_vals,
     void* o0, void* o1, void* o2, void* o3, int M, int K, void* stream)
 {
     hipLaunchKernelGGL(fixed12_matvec_batch4,
@@ -520,7 +522,8 @@ int launch_fixed12_batch4_async(
         (const uint32_t*)packed, (const int16_t*)codebook,
         (const int16_t*)a0, (const int16_t*)a1,
         (const int16_t*)a2, (const int16_t*)a3,
-        (const int32_t*)esc_off, (const int16_t*)esc_vals,
+        (const int32_t*)esc_row_base, (const uint16_t*)esc_thread_off,
+        (const int16_t*)esc_vals,
         (float*)o0, (float*)o1, (float*)o2, (float*)o3, M, K);
     return 0;
 }
