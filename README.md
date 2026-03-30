@@ -78,14 +78,15 @@ Measured on Llama 3.1 8B weight tensors (100% lossless, bit-perfect verified):
 
 | Tensor | Shape | Ours | BF16 | Speedup |
 |--------|-------|------|------|---------|
-| attn_k | [4096×1024] | 0.116ms | 0.111ms | 0.96x |
-| attn_q | [4096×4096] | 0.313ms | 0.351ms | **1.12x** |
-| attn_output | [4096×4096] | 0.271ms | 0.350ms | **1.29x** |
-| ffn_down | [14336×4096] | 0.719ms | 1.057ms | **1.47x** |
-| ffn_gate | [4096×14336] | 0.663ms | 1.059ms | **1.60x** |
-| ffn_up | [4096×14336] | 0.623ms | 1.054ms | **1.69x** |
-| output | [4096×128256] | 5.121ms | 9.344ms | **1.82x** |
-| **Weighted avg** | | | | **1.81x** |
+| attn_k | [4096×1024] | 0.114ms | 0.110ms | 0.96x |
+| attn_q | [4096×4096] | 0.238ms | 0.356ms | **1.48x** |
+| attn_output | [4096×4096] | 0.238ms | 0.356ms | **1.49x** |
+| ffn_down | [14336×4096] | 0.711ms | 1.079ms | **1.52x** |
+| ffn_gate | [4096×14336] | 0.625ms | 1.095ms | **1.75x** |
+| ffn_up | [4096×14336] | 0.626ms | 1.093ms | **1.74x** |
+| output | [4096×128256] | 5.125ms | 9.375ms | **1.83x** |
+| token_embd | [4096×128256] | 5.333ms | 9.360ms | **1.76x** |
+| **Weighted avg** | | | | **1.73x** |
 
 Larger tensors benefit most. The output head (128K columns) achieves 205 GB/s effective bandwidth — faster than raw BF16 because it reads 25% less data from HBM.
 
@@ -124,10 +125,61 @@ Empirically evaluated on Llama 3.1 8B across all 225 weight tensors:
 - **Lossless**: Every BF16 bit pattern is preserved exactly. Zero quality loss.
 - **BF16 only**: Optimized for the industry standard LLM serving format.
 - **1.33x VRAM / 1.47x disk**: Dual-format — maximum compression on disk (.tlc), fast parallel decode in VRAM (12-bit fixed-width + patches).
-- **1.81x faster inference** (weighted avg): Fixed-width 12-bit GPU kernel with patch corrections. Fully parallel decode, 100% lossless, proven bit-perfect on all 292 Llama 8B tensors.
+- **1.73x faster inference** (weighted avg): Fixed-width 12-bit GPU kernel with wavefront-parallel patch corrections. Fully parallel decode, 100% lossless, proven bit-perfect on all 226 Llama 8B weight tensors.
 - **Scales**: Consistent 1.5x+ across dense models 8B–123B. Large MoE models have higher weight diversity.
 - **Broad validation**: 11 BF16 models + 5 INT4 models, 7 architectures
 - **Multi-GPU**: Tensor parallelism splits compressed data. Each GPU holds its slice + shared codebook (~7 KB).
+
+## Running the Benchmark
+
+### Prerequisites
+
+- BF16 safetensors model (e.g. Llama 3.1 8B) in `models/` directory
+- ROCm (for AMD) or CUDA toolkit (for NVIDIA)
+- Python packages: `torch`, `safetensors`, `numpy`
+
+### Build
+
+```bash
+# Compile C packer
+gcc -O3 -shared -fPIC -o fixed12_pack.so fixed12_pack.c
+
+# Compile HIP kernels (AMD MI50)
+hipcc -O3 --offload-arch=gfx906 -shared -fPIC -o decompress_matmul.so decompress_matmul.hip
+hipcc -O3 --offload-arch=gfx906 -shared -fPIC -o decompress_v2.so decompress_v2.hip
+```
+
+### Run
+
+```bash
+# Full benchmark on Llama 3.1 8B (all 226 weight tensors)
+python3 bench_fixed12.py models/llama-3.1-8b/llama-3.1-8b.safetensors
+
+# Or any BF16 safetensors model
+python3 bench_fixed12.py path/to/model.safetensors
+```
+
+### What it does
+
+1. For each 2D BF16 tensor (>100K params):
+   - **GPU**: Frequency-sort unique values via `torch.unique()`
+   - **CPU**: Build 4096-entry codebook, pack as 12-bit indices, extract row-grouped escape patches (CSR format)
+   - **GPU**: Benchmark fused 12-bit decode + matvec kernel (`decompress_v2.so`) vs raw BF16 matmul
+   - **Verify**: Bit-perfect lossless (max error < 0.01 on matvec output)
+2. Reports per-tensor speedup, effective bandwidth, and weighted average
+
+### Key files
+
+| File | Purpose |
+|------|---------|
+| `bench_fixed12.py` | Benchmark driver — GPU freq sort, C packing, kernel timing |
+| `fixed12_pack.c` | Fast C bit-packer: 12-bit indices + CSR row-grouped patches |
+| `decompress_v2.hip` | V2 cache-optimized matvec kernel + wavefront-parallel patches |
+| `decompress_matmul.hip` | Core kernels: variable-length decode, fixed-width matvec, format conversion |
+| `tlc_encode.py` | .tlc encoder (8-tier variable-length format) |
+| `tlc_decode.py` | .tlc decoder (CPU) |
+| `tlc_format.py` | .tlc binary format definitions |
+| `tlc_runtime.py` | GPU runtime for .tlc models |
 
 ## Target Hardware
 

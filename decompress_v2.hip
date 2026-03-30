@@ -80,23 +80,36 @@ __global__ void fixed12_matvec_v2(
         output[row] = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
 }
 
-// Apply patches (same as V1)
+// Apply patches — row-grouped, wavefront-parallel, no atomics
+// One wavefront (64 threads) per row. Threads cooperatively process patches
+// with warp reduction at the end.
 __global__ void apply_patches(
-    const int32_t*  __restrict__ positions,
+    const int32_t*  __restrict__ row_offsets,
+    const int32_t*  __restrict__ patch_cols,
     const int16_t*  __restrict__ correct_vals,
     const int16_t*  __restrict__ wrong_vals,
     const int16_t*  __restrict__ activations,
     float*          __restrict__ output,
-    int K, int num_patches)
+    int M)
 {
-    int pid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (pid >= num_patches) return;
-    int pos = positions[pid];
-    int row = pos / K;
-    int col = pos % K;
-    float correction = (bf16_to_float(correct_vals[pid]) - bf16_to_float(wrong_vals[pid]))
-                       * bf16_to_float(activations[col]);
-    atomicAdd(&output[row], correction);
+    int row = blockIdx.x;
+    if (row >= M) return;
+    int tid = threadIdx.x;  // 0..63 (one wavefront)
+    int start = row_offsets[row];
+    int end   = row_offsets[row + 1];
+
+    float correction = 0.0f;
+    for (int p = start + tid; p < end; p += WARP_SIZE) {
+        correction += (bf16_to_float(correct_vals[p]) - bf16_to_float(wrong_vals[p]))
+                      * bf16_to_float(activations[patch_cols[p]]);
+    }
+
+    // Wavefront reduction
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+        correction += __shfl_down(correction, off, WARP_SIZE);
+
+    if (tid == 0 && correction != 0.0f)
+        output[row] += correction;
 }
 
 extern "C" {
@@ -113,16 +126,16 @@ int launch_fixed12_v2(
 }
 
 int launch_patches_v2(
-    const void* positions, const void* correct_vals, const void* wrong_vals,
-    const void* activations, void* output, int K, int num_patches)
+    const void* row_offsets, const void* patch_cols,
+    const void* correct_vals, const void* wrong_vals,
+    const void* activations, void* output, int M)
 {
-    if (num_patches == 0) return 0;
-    int grid = (num_patches + 255) / 256;
+    if (M == 0) return 0;
     hipLaunchKernelGGL(apply_patches,
-        dim3(grid), dim3(256), 0, 0,
-        (const int32_t*)positions, (const int16_t*)correct_vals,
-        (const int16_t*)wrong_vals, (const int16_t*)activations,
-        (float*)output, K, num_patches);
+        dim3(M), dim3(WARP_SIZE), 0, 0,
+        (const int32_t*)row_offsets, (const int32_t*)patch_cols,
+        (const int16_t*)correct_vals, (const int16_t*)wrong_vals,
+        (const int16_t*)activations, (float*)output, M);
     return (hipDeviceSynchronize() == hipSuccess) ? 0 : -1;
 }
 
