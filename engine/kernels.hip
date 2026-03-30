@@ -382,6 +382,57 @@ __global__ void memcpy_batch_kernel(
     dst[idx] = src[idx];
 }
 
+// ============================================================
+// Fused RMSNorm → BF16 output (eliminates separate fp32_to_bf16 launch)
+// ============================================================
+__global__ void rms_norm_bf16_batch_kernel(
+    const float* __restrict__ x,      // [batch_size * n] FP32 input
+    const float* __restrict__ weight,  // [n]
+    int16_t* __restrict__ y,          // [batch_size * n] BF16 output
+    int n, float eps, int batch_size)
+{
+    int batch = blockIdx.x;
+    if (batch >= batch_size) return;
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int offset = batch * n;
+
+    float sum_sq = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) {
+        float v = x[offset + i];
+        sum_sq += v * v;
+    }
+    sdata[tid] = sum_sq;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float rms = rsqrtf(sdata[0] / n + eps);
+    __syncthreads();
+
+    for (int i = tid; i < n; i += blockDim.x) {
+        y[offset + i] = float_to_bf16(x[offset + i] * rms * weight[i]);
+    }
+}
+
+// ============================================================
+// Fused SiLU(gate) * up → BF16 output
+// ============================================================
+__global__ void silu_mul_bf16_batch_kernel(
+    const float* __restrict__ gate,
+    const float* __restrict__ up,
+    int16_t* __restrict__ out,       // BF16 output
+    int n, int batch_size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch_size * n;
+    if (idx >= total) return;
+    float g = gate[idx];
+    float silu = g / (1.0f + expf(-g));
+    out[idx] = float_to_bf16(silu * up[idx]);
+}
+
 extern "C" {
 
 void launch_rms_norm_batch(const float* x, const float* weight, float* y,
@@ -391,12 +442,27 @@ void launch_rms_norm_batch(const float* x, const float* weight, float* y,
         x, weight, y, n, eps, batch_size);
 }
 
+void launch_rms_norm_bf16_batch(const float* x, const float* weight, int16_t* y,
+                                int n, float eps, int batch_size, hipStream_t stream) {
+    int threads = 256;
+    rms_norm_bf16_batch_kernel<<<batch_size, threads, threads * sizeof(float), stream>>>(
+        x, weight, y, n, eps, batch_size);
+}
+
 void launch_silu_mul_batch(const float* gate, const float* up, float* out,
                            int n, int batch_size, hipStream_t stream) {
     int threads = 256;
     int total = batch_size * n;
     int blocks = (total + threads - 1) / threads;
     silu_mul_batch_kernel<<<blocks, threads, 0, stream>>>(gate, up, out, n, batch_size);
+}
+
+void launch_silu_mul_bf16_batch(const float* gate, const float* up, int16_t* out,
+                                int n, int batch_size, hipStream_t stream) {
+    int threads = 256;
+    int total = batch_size * n;
+    int blocks = (total + threads - 1) / threads;
+    silu_mul_bf16_batch_kernel<<<blocks, threads, 0, stream>>>(gate, up, out, n, batch_size);
 }
 
 void launch_add_batch(float* y, const float* x, int n, int batch_size, hipStream_t stream) {

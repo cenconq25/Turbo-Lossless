@@ -23,6 +23,7 @@ struct InferenceState {
     int* d_tokens;          // [batch_size] token IDs on GPU
 
     hipStream_t stream;
+    hipStream_t stream2;    // secondary stream for concurrent kernel execution
 
     // BF16 activation buffers for matvec (halves L2 activation bandwidth)
     int16_t* bf16_act;      // [batch_size * max(n_embd, n_ff)] BF16 temp

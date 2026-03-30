@@ -9,7 +9,9 @@ extern "C" {
     void launch_embed_lookup(const int16_t* embd_table, const int* token_ids, float* output, int n_embd, int batch_size, hipStream_t stream);
     // Batched ops
     void launch_rms_norm_batch(const float* x, const float* weight, float* y, int n, float eps, int batch_size, hipStream_t stream);
+    void launch_rms_norm_bf16_batch(const float* x, const float* weight, int16_t* y, int n, float eps, int batch_size, hipStream_t stream);
     void launch_silu_mul_batch(const float* gate, const float* up, float* out, int n, int batch_size, hipStream_t stream);
+    void launch_silu_mul_bf16_batch(const float* gate, const float* up, int16_t* out, int n, int batch_size, hipStream_t stream);
     void launch_add_batch(float* y, const float* x, int n, int batch_size, hipStream_t stream);
     void launch_memcpy_batch(float* dst, const float* src, int n, int batch_size, hipStream_t stream);
     void launch_rope_batch(float* q, float* k, const int* positions, int head_dim, int n_head, int n_head_kv, int q_stride, int k_stride, float theta, int batch_size, hipStream_t stream);
@@ -82,6 +84,7 @@ InferenceState* create_inference_state(Model* model, int batch_size, int max_seq
     hipMalloc(&s->bf16_act,  bs * max_act * sizeof(int16_t));
     hipMalloc(&s->bf16_act2, bs * max_act * sizeof(int16_t));
     s->stream = 0;
+    hipStreamCreateWithFlags(&s->stream2, hipStreamNonBlocking);
     init_sampler();
     return s;
 }
@@ -129,10 +132,8 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
     for (int layer = 0; layer < cfg.n_layer; layer++) {
         auto& L = m->layers[layer];
 
-        launch_rms_norm(cur, L.attn_norm, state->attn_out, n, cfg.rms_norm_eps, stream);
-
-        // Convert attn_out to BF16 once, reuse for Q/K/V
-        launch_fp32_to_bf16(state->attn_out, bf16_a, n, stream);
+        // Fused RMSNorm → BF16 for Q/K/V input (saves 1 launch)
+        launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
         MATVEC_B1(L.wq, bf16_a, state->q_buf);
         MATVEC_B1(L.wk, bf16_a, state->k_buf);
         MATVEC_B1(L.wv, bf16_a, state->v_buf);
@@ -145,27 +146,24 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
         launch_attention_all_heads(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
                                    state->attn_out, cfg.n_head, cfg.n_head_kv, head_dim, pos+1, m->max_seq_len, scale, stream);
 
-        // wo: new attn_out → BF16
+        // wo: attn_out → BF16 (can't fuse — attention outputs FP32)
         launch_fp32_to_bf16(state->attn_out, bf16_a, n, stream);
         MATVEC_B1(L.wo, bf16_a, res);
         launch_add_batch(res, cur, n, 1, stream);
 
-        launch_rms_norm(res, L.ffn_norm, state->attn_out, n, cfg.rms_norm_eps, stream);
-
-        // gate/up: convert once, reuse
-        launch_fp32_to_bf16(state->attn_out, bf16_a, n, stream);
+        // Fused RMSNorm → BF16 for gate/up input (saves 1 launch)
+        launch_rms_norm_bf16_batch(res, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
         MATVEC_B1(L.w_gate, bf16_a, state->ffn_gate);
         MATVEC_B1(L.w_up, bf16_a, state->ffn_up);
-        launch_silu_mul_batch(state->ffn_gate, state->ffn_up, state->ffn_gate, cfg.n_ff, 1, stream);
 
-        // w_down: ffn_gate → BF16
-        launch_fp32_to_bf16(state->ffn_gate, bf16_b, cfg.n_ff, stream);
+        // Fused SiLU*mul → BF16 for w_down input (saves 1 launch)
+        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, cfg.n_ff, 1, stream);
         MATVEC_B1(L.w_down, bf16_b, cur);
         launch_add_batch(cur, res, n, 1, stream);
     }
 
-    launch_rms_norm(cur, m->output_norm, cur, n, cfg.rms_norm_eps, stream);
-    launch_fp32_to_bf16(cur, bf16_a, n, stream);
+    // Fused RMSNorm → BF16 for output projection (saves 1 launch)
+    launch_rms_norm_bf16_batch(cur, m->output_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
     MATVEC_B1(m->output_proj, bf16_a, state->logits);
     state->positions[0] = pos + 1;
     #undef MATVEC_B1
@@ -193,10 +191,9 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
     for (int layer = 0; layer < cfg.n_layer; layer++) {
         auto& L = m->layers[layer];
 
-        launch_rms_norm_batch(cur, L.attn_norm, state->attn_out, n, cfg.rms_norm_eps, B, stream);
-
-        // Convert attn_out to BF16 once for Q/K/V (B*n elements)
-        launch_fp32_to_bf16(state->attn_out, bf16_a, B * n, stream);
+        // Fused RMSNorm → BF16 for Q/K/V (saves 1 launch)
+        launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, B, stream);
+        // Q on stream0, K+V on stream2 (K,V are 4x smaller — can overlap with Q's tail)
         launch_fixed12_batch4_async(L.wq.packed, L.wq.codebook,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.wq.escape_offsets, L.wq.escape_vals,
@@ -206,12 +203,13 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.wk.escape_offsets, L.wk.escape_vals,
             SEQ(state->k_buf,0,kv_dim), SEQ(state->k_buf,1,kv_dim), SEQ(state->k_buf,2,kv_dim), SEQ(state->k_buf,3,kv_dim),
-            L.wk.M, L.wk.K, stream);
+            L.wk.M, L.wk.K, state->stream2);
         launch_fixed12_batch4_async(L.wv.packed, L.wv.codebook,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.wv.escape_offsets, L.wv.escape_vals,
             SEQ(state->v_buf,0,kv_dim), SEQ(state->v_buf,1,kv_dim), SEQ(state->v_buf,2,kv_dim), SEQ(state->v_buf,3,kv_dim),
-            L.wv.M, L.wv.K, stream);
+            L.wv.M, L.wv.K, state->stream2);
+        hipStreamSynchronize(state->stream2);  // K,V ready for RoPE
 
         size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
         launch_rope_batch(state->q_buf, state->k_buf, state->d_positions,
@@ -235,10 +233,9 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
             L.wo.M, L.wo.K, stream);
         launch_add_batch(res, cur, n, B, stream);
 
-        launch_rms_norm_batch(res, L.ffn_norm, state->attn_out, n, cfg.rms_norm_eps, B, stream);
-
-        // gate/up: convert attn_out once for both
-        launch_fp32_to_bf16(state->attn_out, bf16_a, B * n, stream);
+        // Fused RMSNorm → BF16 for gate/up (saves 1 launch)
+        launch_rms_norm_bf16_batch(res, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, B, stream);
+        // gate on stream0, up on stream2 (concurrent — both read same bf16_a, write different outputs)
         launch_fixed12_batch4_async(L.w_gate.packed, L.w_gate.codebook,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.w_gate.escape_offsets, L.w_gate.escape_vals,
@@ -248,11 +245,10 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.w_up.escape_offsets, L.w_up.escape_vals,
             SEQ(state->ffn_up,0,n_ff), SEQ(state->ffn_up,1,n_ff), SEQ(state->ffn_up,2,n_ff), SEQ(state->ffn_up,3,n_ff),
-            L.w_up.M, L.w_up.K, stream);
-        launch_silu_mul_batch(state->ffn_gate, state->ffn_up, state->ffn_gate, n_ff, B, stream);
-
-        // w_down: convert ffn_gate to BF16 (size n_ff)
-        launch_fp32_to_bf16(state->ffn_gate, bf16_b, B * n_ff, stream);
+            L.w_up.M, L.w_up.K, state->stream2);
+        hipStreamSynchronize(state->stream2);  // wait for w_up before SiLU
+        // Fused SiLU*mul → BF16 for w_down (saves 1 launch)
+        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, B, stream);
         launch_fixed12_batch4_async(L.w_down.packed, L.w_down.codebook,
             SEQI(bf16_b,0,n_ff), SEQI(bf16_b,1,n_ff), SEQI(bf16_b,2,n_ff), SEQI(bf16_b,3,n_ff),
             L.w_down.escape_offsets, L.w_down.escape_vals,
@@ -261,8 +257,8 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
         launch_add_batch(cur, res, n, B, stream);
     }
 
-    launch_rms_norm_batch(cur, m->output_norm, cur, n, cfg.rms_norm_eps, B, stream);
-    launch_fp32_to_bf16(cur, bf16_a, B * n, stream);
+    // Fused RMSNorm → BF16 for output projection (saves 1 launch)
+    launch_rms_norm_bf16_batch(cur, m->output_norm, bf16_a, n, cfg.rms_norm_eps, B, stream);
     launch_fixed12_batch4_async(m->output_proj.packed, m->output_proj.codebook,
         SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
         m->output_proj.escape_offsets, m->output_proj.escape_vals,
