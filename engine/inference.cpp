@@ -192,13 +192,12 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.wk.escape_row_base, L.wk.escape_thread_off, L.wk.escape_vals,
             SEQ(state->k_buf,0,kv_dim), SEQ(state->k_buf,1,kv_dim), SEQ(state->k_buf,2,kv_dim), SEQ(state->k_buf,3,kv_dim),
-            L.wk.M, L.wk.K, state->stream2);
+            L.wk.M, L.wk.K, stream);
         launch_fixed12_batch4_async(L.wv.packed, L.wv.codebook,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.wv.escape_row_base, L.wv.escape_thread_off, L.wv.escape_vals,
             SEQ(state->v_buf,0,kv_dim), SEQ(state->v_buf,1,kv_dim), SEQ(state->v_buf,2,kv_dim), SEQ(state->v_buf,3,kv_dim),
-            L.wv.M, L.wv.K, state->stream2);
-        hipStreamSynchronize(state->stream2);  // K,V ready for RoPE
+            L.wv.M, L.wv.K, stream);
 
         size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
         launch_rope_batch(state->q_buf, state->k_buf, state->d_positions,
@@ -234,8 +233,7 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.w_up.escape_row_base, L.w_up.escape_thread_off, L.w_up.escape_vals,
             SEQ(state->ffn_up,0,n_ff), SEQ(state->ffn_up,1,n_ff), SEQ(state->ffn_up,2,n_ff), SEQ(state->ffn_up,3,n_ff),
-            L.w_up.M, L.w_up.K, state->stream2);
-        hipStreamSynchronize(state->stream2);  // wait for w_up before SiLU
+            L.w_up.M, L.w_up.K, stream);
         // Fused SiLU*mul → BF16 for w_down (saves 1 launch)
         launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, B, stream);
         launch_fixed12_batch4_async(L.w_down.packed, L.w_down.codebook,
