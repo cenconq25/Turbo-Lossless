@@ -150,6 +150,85 @@ __global__ void fixed12_matvec_fused(
 }
 
 // ---------------------------------------------------------------------------
+// Batch matvec: Y[M×B] = decode(packed[M×K]) × X[K×B]
+// ---------------------------------------------------------------------------
+// Decode each weight ONCE, multiply by B activation vectors.
+// Amortizes decode cost (read12 + LDS lookup) across batch dimension.
+// B=2: ~1.5x decode amortization (2 FMAs per decode vs 1)
+// B=4: ~2x decode amortization (4 FMAs per decode vs 1)
+__launch_bounds__(WORKGROUP_SIZE)
+__global__ void fixed12_matvec_batch2(
+    const uint32_t* __restrict__ packed,
+    const int16_t*  __restrict__ codebook,
+    const int16_t*  __restrict__ act0,          // activation vector 0 [K]
+    const int16_t*  __restrict__ act1,          // activation vector 1 [K]
+    const int32_t*  __restrict__ escape_offsets,
+    const int16_t*  __restrict__ escape_vals,
+    float*          __restrict__ out0,           // output vector 0 [M]
+    float*          __restrict__ out1,           // output vector 1 [M]
+    int M, int K)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    int esc_ptr = escape_offsets[row * WORKGROUP_SIZE + tid];
+
+    __shared__ int16_t cb[4096];
+    __shared__ float warp_sums[8];  // 4 per output vector
+
+    for (int i = tid; i < 4096; i += WORKGROUP_SIZE)
+        cb[i] = codebook[i];
+    __syncthreads();
+
+    float s0a = 0.0f, s0b = 0.0f;  // sums for output 0 (2x unroll)
+    float s1a = 0.0f, s1b = 0.0f;  // sums for output 1 (2x unroll)
+    int64_t bp = (int64_t)row * K * 12 + (int64_t)tid * 12;
+
+    int col = tid;
+    for (; col + WORKGROUP_SIZE < K; col += WORKGROUP_SIZE * 2) {
+        uint32_t idx0 = read12(packed, bp);
+        uint32_t idx1 = read12(packed, bp + (int64_t)(WORKGROUP_SIZE * 12));
+
+        // Decode once, use twice
+        float w0 = (__builtin_expect(idx0 != 4095, 1))
+            ? bf16_to_float(cb[idx0]) : bf16_to_float(escape_vals[esc_ptr++]);
+        float w1 = (__builtin_expect(idx1 != 4095, 1))
+            ? bf16_to_float(cb[idx1]) : bf16_to_float(escape_vals[esc_ptr++]);
+
+        float a0_0 = bf16_to_float(act0[col]);
+        float a0_1 = bf16_to_float(act0[col + WORKGROUP_SIZE]);
+        float a1_0 = bf16_to_float(act1[col]);
+        float a1_1 = bf16_to_float(act1[col + WORKGROUP_SIZE]);
+
+        s0a += w0 * a0_0;  s0b += w1 * a0_1;
+        s1a += w0 * a1_0;  s1b += w1 * a1_1;
+        bp += (int64_t)(WORKGROUP_SIZE * 2 * 12);
+    }
+    if (col < K) {
+        uint32_t idx = read12(packed, bp);
+        float w = (__builtin_expect(idx != 4095, 1))
+            ? bf16_to_float(cb[idx]) : bf16_to_float(escape_vals[esc_ptr++]);
+        s0a += w * bf16_to_float(act0[col]);
+        s1a += w * bf16_to_float(act1[col]);
+    }
+    float sum0 = s0a + s0b;
+    float sum1 = s1a + s1b;
+
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        sum0 += __shfl_down(sum0, off, WARP_SIZE);
+        sum1 += __shfl_down(sum1, off, WARP_SIZE);
+    }
+    if ((tid & (WARP_SIZE - 1)) == 0) {
+        warp_sums[tid >> 6] = sum0;
+        warp_sums[(tid >> 6) + 4] = sum1;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        out0[row] = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+        out1[row] = warp_sums[4] + warp_sums[5] + warp_sums[6] + warp_sums[7];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Decompress-only: decode all weights to BF16 buffer for bit-exact verification
 // ---------------------------------------------------------------------------
 // Same decode logic as matvec but writes raw BF16 values instead of dot product.
@@ -201,6 +280,21 @@ int launch_fixed12_fused(
         (const int16_t*)activations,
         (const int32_t*)escape_offsets, (const int16_t*)escape_vals,
         (float*)output, M, K);
+    return (hipDeviceSynchronize() == hipSuccess) ? 0 : -1;
+}
+
+int launch_fixed12_batch2(
+    const void* packed, const void* codebook,
+    const void* act0, const void* act1,
+    const void* escape_offsets, const void* escape_vals,
+    void* out0, void* out1, int M, int K)
+{
+    hipLaunchKernelGGL(fixed12_matvec_batch2,
+        dim3(M), dim3(WORKGROUP_SIZE), 0, 0,
+        (const uint32_t*)packed, (const int16_t*)codebook,
+        (const int16_t*)act0, (const int16_t*)act1,
+        (const int32_t*)escape_offsets, (const int16_t*)escape_vals,
+        (float*)out0, (float*)out1, M, K);
     return (hipDeviceSynchronize() == hipSuccess) ? 0 : -1;
 }
 
