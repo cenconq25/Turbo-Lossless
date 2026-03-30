@@ -606,3 +606,117 @@ int launch_patches_v2(const void* row_offsets, const void* patch_cols,
     return (hipDeviceSynchronize() == hipSuccess) ? 0 : -1;
 }
 }
+
+// Batch4 matvec WITHOUT escape handling (two-pass: patch correction after)
+__launch_bounds__(WORKGROUP_SIZE)
+__global__ void fixed12_matvec_batch4_noesc(
+    const uint32_t* __restrict__ packed,
+    const int16_t*  __restrict__ codebook,
+    const int16_t*  __restrict__ act0, const int16_t* __restrict__ act1,
+    const int16_t*  __restrict__ act2, const int16_t* __restrict__ act3,
+    float* __restrict__ out0, float* __restrict__ out1,
+    float* __restrict__ out2, float* __restrict__ out3,
+    int M, int K)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    __shared__ int16_t cb[4096];
+    __shared__ float warp_sums[16];
+
+    for (int i = tid; i < 4096; i += WORKGROUP_SIZE) cb[i] = codebook[i];
+    __syncthreads();
+
+    float s0a=0, s0b=0, s1a=0, s1b=0, s2a=0, s2b=0, s3a=0, s3b=0;
+    int64_t bp = (int64_t)row * K * 12 + (int64_t)tid * 12;
+
+    int col = tid;
+    for (; col + WORKGROUP_SIZE < K; col += WORKGROUP_SIZE * 2) {
+        uint32_t idx0 = read12(packed, bp);
+        uint32_t idx1 = read12(packed, bp + (int64_t)(WORKGROUP_SIZE * 12));
+        float w0 = bf16_to_float(cb[idx0]);
+        float w1 = bf16_to_float(cb[idx1]);
+        s0a += w0 * bf16_to_float(act0[col]); s0b += w1 * bf16_to_float(act0[col+WORKGROUP_SIZE]);
+        s1a += w0 * bf16_to_float(act1[col]); s1b += w1 * bf16_to_float(act1[col+WORKGROUP_SIZE]);
+        s2a += w0 * bf16_to_float(act2[col]); s2b += w1 * bf16_to_float(act2[col+WORKGROUP_SIZE]);
+        s3a += w0 * bf16_to_float(act3[col]); s3b += w1 * bf16_to_float(act3[col+WORKGROUP_SIZE]);
+        bp += (int64_t)(WORKGROUP_SIZE * 2 * 12);
+    }
+    if (col < K) {
+        uint32_t idx = read12(packed, bp);
+        float w = bf16_to_float(cb[idx]);
+        s0a += w * bf16_to_float(act0[col]);
+        s1a += w * bf16_to_float(act1[col]);
+        s2a += w * bf16_to_float(act2[col]);
+        s3a += w * bf16_to_float(act3[col]);
+    }
+    float s0=s0a+s0b, s1=s1a+s1b, s2=s2a+s2b, s3=s3a+s3b;
+
+    for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
+        s0 += __shfl_down(s0, off, WARP_SIZE);
+        s1 += __shfl_down(s1, off, WARP_SIZE);
+        s2 += __shfl_down(s2, off, WARP_SIZE);
+        s3 += __shfl_down(s3, off, WARP_SIZE);
+    }
+    int wid = tid >> 6;
+    if ((tid & (WARP_SIZE-1)) == 0) {
+        warp_sums[wid]    = s0; warp_sums[wid+4]  = s1;
+        warp_sums[wid+8]  = s2; warp_sums[wid+12] = s3;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        out0[row] = warp_sums[0]+warp_sums[1]+warp_sums[2]+warp_sums[3];
+        out1[row] = warp_sums[4]+warp_sums[5]+warp_sums[6]+warp_sums[7];
+        out2[row] = warp_sums[8]+warp_sums[9]+warp_sums[10]+warp_sums[11];
+        out3[row] = warp_sums[12]+warp_sums[13]+warp_sums[14]+warp_sums[15];
+    }
+}
+
+extern "C" {
+int launch_fixed12_batch4_noesc(
+    const void* packed, const void* codebook,
+    const void* a0, const void* a1, const void* a2, const void* a3,
+    void* o0, void* o1, void* o2, void* o3, int M, int K) {
+    hipLaunchKernelGGL(fixed12_matvec_batch4_noesc,
+        dim3(M), dim3(WORKGROUP_SIZE), 0, 0,
+        (const uint32_t*)packed, (const int16_t*)codebook,
+        (const int16_t*)a0, (const int16_t*)a1, (const int16_t*)a2, (const int16_t*)a3,
+        (float*)o0, (float*)o1, (float*)o2, (float*)o3, M, K);
+    return (hipDeviceSynchronize() == hipSuccess) ? 0 : -1;
+}
+}
+
+extern "C" {
+int launch_fixed12_batch4_noesc_async(
+    const void* packed, const void* codebook,
+    const void* a0, const void* a1, const void* a2, const void* a3,
+    void* o0, void* o1, void* o2, void* o3, int M, int K, void* stream) {
+    hipLaunchKernelGGL(fixed12_matvec_batch4_noesc,
+        dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
+        (const uint32_t*)packed, (const int16_t*)codebook,
+        (const int16_t*)a0, (const int16_t*)a1, (const int16_t*)a2, (const int16_t*)a3,
+        (float*)o0, (float*)o1, (float*)o2, (float*)o3, M, K);
+    return 0;
+}
+}
+
+// Async two-pass v2 (no sync)
+extern "C" {
+int launch_fixed12_v2_async(const void* packed, const void* codebook,
+    const void* activations, void* output, int M, int K, void* stream) {
+    hipLaunchKernelGGL(fixed12_matvec_v2, dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
+        (const uint32_t*)packed, (const int16_t*)codebook,
+        (const int16_t*)activations, (float*)output, M, K);
+    return 0;
+}
+int launch_patches_v2_async(const void* row_offsets, const void* patch_cols,
+    const void* correct_vals, const void* wrong_vals,
+    const void* activations, void* output, int M, void* stream) {
+    if (M == 0) return 0;
+    hipLaunchKernelGGL(apply_patches_v2, dim3(M), dim3(WARP_SIZE), 0, (hipStream_t)stream,
+        (const int32_t*)row_offsets, (const int32_t*)patch_cols,
+        (const int16_t*)correct_vals, (const int16_t*)wrong_vals,
+        (const int16_t*)activations, (float*)output, M);
+    return 0;
+}
+}
