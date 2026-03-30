@@ -48,6 +48,7 @@ Validated on 11 BF16 models across 7 architectures (Llama, Mistral, Phi, Qwen, Y
 | Model | Params | Tensors | B=1 Speedup | B=4 Speedup | B=4 Amortize | Lossless |
 |-------|--------|---------|------------|------------|-------------|---------|
 | **Llama 3.1 8B** | 8B | 226 | **2.90x** | **8.12x** | 2.80x | 226/226 |
+| **Mistral Large 123B** | 123B | 49* | **2.87x** | **7.80x** | 2.71x | 49/49 |
 | **Llama 3.1 70B** | 70B | 33* | **2.69x** | **7.35x** | 2.73x | 33/33 |
 | **Phi-4** | 14B | 77 | **2.48x** | **7.10x** | 2.86x | 77/77 |
 | **Mistral 7B** | 7B | 226 | **2.43x** | **7.04x** | 2.89x | 226/226 |
@@ -56,9 +57,9 @@ Validated on 11 BF16 models across 7 architectures (Llama, Mistral, Phi, Qwen, Y
 | **TinyLlama** | 1.1B | 156 | **1.88x** | **5.56x** | 2.95x | 156/156 |
 | **StableLM 1.6B** | 1.6B | 170 | **1.76x** | **5.16x** | 2.93x | 170/170 |
 
-8 models (1.1B–70B), 6 architectures, 1216 tensors — all bit-perfect lossless. Larger models benefit more (bigger tensors = better block amortization). Batch amortization ~2.85x universal.
+9 models (1.1B–123B), 6 architectures, 1265 tensors — all bit-perfect lossless. Larger models benefit more (bigger tensors = better block amortization). Batch amortization ~2.85x universal.
 
-*70B: sampled 33 tensors (2 of 30 shards), per-tensor benchmark on single card.
+*Sampled shards, per-tensor benchmark on single 32 GB card.
 
 ## How It Works
 
