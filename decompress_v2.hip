@@ -68,10 +68,8 @@ __global__ void fixed12_matvec_fused(
     // 2x unrolled with inline O(1) escape
     int col = tid;
     for (; col + stride < K; col += stride * 2) {
-        int64_t bp0 = row_base + (int64_t)col * 12;
-        int64_t bp1 = row_base + (int64_t)(col + stride) * 12;
-        uint32_t idx0 = read12(packed, bp0);
-        uint32_t idx1 = read12(packed, bp1);
+        uint32_t idx0 = read12(packed, row_base + (int64_t)col * 12);
+        uint32_t idx1 = read12(packed, row_base + (int64_t)(col + stride) * 12);
 
         float w0 = (__builtin_expect(idx0 != 4095, 1))
             ? bf16_to_float(codebook[idx0])
@@ -84,8 +82,7 @@ __global__ void fixed12_matvec_fused(
         sum1 += w1 * bf16_to_float(activations[col + stride]);
     }
     if (col < K) {
-        int64_t bp = row_base + (int64_t)col * 12;
-        uint32_t idx = read12(packed, bp);
+        uint32_t idx = read12(packed, row_base + (int64_t)col * 12);
         float w = (__builtin_expect(idx != 4095, 1))
             ? bf16_to_float(codebook[idx])
             : bf16_to_float(escape_vals[esc_ptr++]);
