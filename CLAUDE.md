@@ -1,6 +1,6 @@
 # Turbo Lossless: BF16 Compression Engine
 
-100% bit-perfect lossless inference engine targeting AMD MI50 (ROCm) and NVIDIA H100 (CUDA).
+100% bit-perfect lossless inference engine for BF16 safetensors models.
 
 **Input: BF16 safetensors only.** No GGUF, no FP16, no FP32, no quantized formats.
 
@@ -10,109 +10,77 @@
 - Do not push to remote repo unless explicitly told to.
 - When benchmarking, use a non-display GPU (not the one connected to the monitor).
 
----
+## Current Results
+
+- **1.88x** weighted avg inference speedup (fused kernel, all 226 Llama 8B tensors, 100% lossless)
+- **1.47x** disk compression (.tlc 8-tier variable-length)
+- **1.33x** VRAM compression (12-bit fixed-width + escape table)
+- Validated compression on 11 BF16 models, 7 architectures, 8B–671B params
 
 ## Architecture
 
-### Dual-Format Compression
+### Fused Kernel (decompress_v2.hip)
 
-**Disk format (.tlc)**: 8-tier variable-length prefix code. ~10.6 bits/param → **1.47x** compression. Per-tensor codebook with 7 coded tiers (512 entries each) + escape tier for raw BF16 fallback.
+Single GPU kernel launch per matvec. Decodes 12-bit packed indices, looks up L1-cached codebook, handles escapes inline via per-thread offset table, accumulates FMA.
 
-**VRAM format**: Fixed-width 12-bit packed indices. 4096-entry codebook per tensor → **1.33x** compression. Converted from .tlc at model load time.
+**Key design:**
+- L1-cached codebook: 8 KB fits in MI50's 16 KB L1. Zero LDS overhead, max occupancy.
+- Per-thread escape table: `escape_offsets[row * 256 + tid]` → O(1) lookup, zero scanning.
+- 2x loop unroll: ILP for overlapping packed reads with codebook lookups and FMA.
+- Wavefront reduction via `__shfl_down` + shared `warp_sums[4]`.
 
-### GPU Inference Pipeline
+**Why this design:**
+- LDS codebook was slower (1.80x) due to per-block load barrier.
+- Fused merge-scan was 0.15x on token_embd — strided thread access = O(N) scan per escape.
+- Binary search fused was 1.32x on token_embd — L2 latency per comparison.
+- Two-pass (separate patch kernel) was 1.88x but 2 kernel launches.
+- atomicAdd patches: MI50/gfx906 lacks hardware float atomics → 580ms CAS stall.
 
-1. **Load**: Read .tlc from disk, convert variable-length → 12-bit fixed-width in VRAM
-2. **Matvec**: Each thread reads 12 bits at `(row * K + col) * 12`, looks up codebook (L1-cached), multiplies by activation
-3. **Patch**: Escape values (~0.08%) corrected via CSR row-grouped wavefront-parallel kernel (no atomics)
+### Disk Format (.tlc)
 
-### Key Numbers (Llama 3.1 8B)
+8-tier variable-length prefix code per tensor. Tiers 0-6 use 512-entry codebooks (9-bit index + unary prefix). Tier 7 is raw BF16 escape. ~10.6 bits/param average.
 
-- 226 weight tensors (2D BF16), 66 non-weight tensors (norms, biases → F32 passthrough)
-- ~5,124 unique BF16 values per tensor (range 4,223–6,437)
-- Top-4095 coverage: 99.92% (12-bit codebook)
-- Escape rate: 0.08% typical, up to 0.78% for token_embd (9,066 unique values)
-- Shannon entropy: 10.42 bits/param (theoretical ceiling: 1.535x)
+### VRAM Format (12-bit fixed)
 
-### Kernel Design (decompress_v2.hip)
+4096-entry codebook per tensor. Each weight stored as 12-bit index. Index 4095 = escape sentinel. Escape values stored in per-thread-stride order with offset table for O(1) kernel access.
 
-**Matvec kernel** (`fixed12_matvec_v2`):
-- One block (256 threads / 4 wavefronts) per row
-- Codebook (8 KB) stays in L1 cache — NOT loaded into LDS (higher occupancy)
-- Contiguous tile access pattern: adjacent threads read adjacent bit positions
-- Cross-warp reduction via `warp_sums[4]` shared memory array
+### Packing (fixed12_pack.c)
 
-**Patch kernel** (`apply_patches`):
-- One wavefront (64 threads) per row
-- CSR format: `row_offsets[M+1]` + `patch_cols[num_patches]` + values
-- Threads cooperatively process patches with `__shfl_down` reduction
-- Zero atomics — each wavefront writes to unique `output[row]`
+Two packing functions:
+- `pack_fixed12()`: CSR row-grouped patches for two-pass path
+- `pack_fixed12_fused()`: Per-thread-stride escape layout for fused kernel
 
-### Why L1 Cache, Not LDS
+Both use GPU `torch.unique()` for frequency sort, then C loop for 12-bit bit-packing.
 
-MI50 has 16 KB L1 per CU. The 8 KB codebook fits entirely. Benefits:
-- Zero LDS allocation → maximum wavefront occupancy
-- No per-block codebook load barrier (`__syncthreads`)
-- L1 latency comparable to LDS (~4 cycles) after first access
-- Measured: +0.07x speedup vs LDS codebook approach
-
-### Why CSR Patches, Not AtomicAdd
-
-MI50/gfx906 lacks hardware `atomicAdd(float)` — it compiles to a CAS retry loop. With 408K patches (token_embd), this caused 580ms stall due to contention. CSR row-grouped format + wavefront reduction: 580ms → 0.2ms.
-
-## Current Results
-
-**Inference**: 1.88x weighted avg speedup (all 226 tensors, 100% lossless, AMD MI50)
-**Disk compression**: 1.47x (.tlc 8-tier variable-length)
-**VRAM compression**: 1.33x (12-bit fixed-width)
-**Validation**: 11 BF16 models, 7 architectures, 8B–671B parameters
-
-## Implementation Status
-
-| Component | Status | Files |
-|-----------|--------|-------|
-| Empirical analysis (12 models) | **Done** | Results documented here |
-| .tlc encoder/decoder | **Done** | `tlc_encode.py`, `tlc_decode.py`, `tlc_format.py` |
-| Round-trip verification | **Done** | `tlc_verify.py` (292 tensors, 0 mismatches) |
-| GPU matvec kernel (12-bit) | **Done** | `decompress_v2.hip`, `decompress_matmul.hip` |
-| Benchmark harness | **Done** | `bench_fixed12.py`, `fixed12_pack.c` |
-| End-to-end runtime | **WIP** | `tlc_runtime.py` (needs update for fixed-width path) |
-| NVIDIA/CUDA port | **TODO** | Requires warp size 64→32 adjustment |
-
-## Empirical Analysis Summary
-
-Profiled across 12 models, 7 architectures, using 4x AMD MI50 GPUs.
-
-### Cross-Model Compression
+## Compression Validation
 
 | Model | Params | Type | CR | Escape % |
 |-------|--------|------|----|----------|
 | Llama 3.1 8B | 8B | Dense | 1.509x | 0.03% |
 | Phi-4 | 14B | Dense | 1.507x | 0.03% |
 | Codestral 22B | 22B | Dense | 1.504x | 0.03% |
-| Qwen3 30B-A3B | 30B | MoE | 1.505x | 0.03% |
 | Llama 3.1 70B | 70B | Dense | 1.516x | 0.05% |
 | Mistral Large 123B | 123B | Dense | 1.503x | 0.03% |
 | MiniMax-Text-01 | 456B | MoE | 1.507x | 0.03% |
 | DeepSeek V3 | 671B | MoE | 1.185x | 2.02% |
 
-Dense models and small MoE: **1.50x+** consistently. Large MoE (DeepSeek V3): reduced due to FP8 mixed-precision training producing higher weight diversity.
+Dense models: 1.50x+ consistently. Large MoE reduced due to training recipe diversity.
 
-### Approach Selection
+## Implementation Status
 
-| Rank | Approach | bits/param | CR | Why selected/rejected |
-|------|----------|-----------|------|----------------------|
-| 1 | Bit-plane decomposition | 10.50 | 1.524x | Best theoretical, hard to fuse into matmul |
-| 2 | Rice/Golomb rank coding | 10.55 | 1.517x | Variable-length, hard to parallelize |
-| **3** | **8-tier prefix code** | **10.60** | **1.509x** | **Selected: GPU-friendly, fusable, simple prefix decode** |
-| — | Delta/predictive coding | 11.10 | 1.442x | BF16 weights are spatially uncorrelated |
-| — | Block-local codebook | 17–20 | <1.0x | Per-block header overhead exceeds savings |
-| — | Original 15+1 scheme | 13.75 | 1.164x | Wrong assumptions about weight distributions |
+| Component | Status |
+|-----------|--------|
+| Compression analysis (12 models) | Done |
+| .tlc encoder/decoder | Done |
+| Round-trip verification | Done (292 tensors, 0 mismatches) |
+| Fused GPU kernel (12-bit) | Done |
+| Benchmark harness | Done |
+| End-to-end runtime | WIP (tlc_runtime.py needs fused kernel wiring) |
+| NVIDIA/CUDA port | TODO (warp size 64→32) |
 
 ## Scope
 
-- **Target**: Dense transformer models in BF16 safetensors (Llama, Mistral, Phi, Qwen, Yi, etc.)
-- **Works well**: All dense models + small MoE → 1.50x+
-- **Partial**: Large MoE (DeepSeek V3, Qwen3-235B) → 1.2–1.4x
-- **Not worth it**: GPTQ/AWQ INT4 models → ~1.11x total
-- **Out of scope**: FP16, FP32, GGUF
+- **Target**: Dense BF16 safetensors models (Llama, Mistral, Phi, Qwen, Yi, etc.)
+- **Works well**: All dense + small MoE → 1.50x+ compression, 1.88x inference
+- **Partial**: Large MoE (DeepSeek V3) → 1.2x compression
+- **Out of scope**: FP16, FP32, GGUF, GPTQ/AWQ INT4

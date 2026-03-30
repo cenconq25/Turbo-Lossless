@@ -35,19 +35,17 @@ uint32_t read12(const uint32_t* __restrict__ p, int64_t bp) {
 }
 
 // ---------------------------------------------------------------------------
-// Fused kernel: single launch, inline escape handling
+// Fused kernel: single launch, O(1) escape via per-thread offset table
 // ---------------------------------------------------------------------------
-// Each thread keeps a cursor into the row's CSR patches. When idx==4095,
-// it advances the cursor (merge-scan) to find the matching column.
-// Patches are sorted by column within each row, and each thread processes
-// columns in ascending order — so the cursor only moves forward. O(1) amortized.
+// escape_offsets[row * 256 + tid] = index into escape_vals where this
+// thread's escapes begin. Thread just increments a pointer on each escape.
+// Zero scanning, zero divergent loops, zero atomics.
 __global__ void fixed12_matvec_fused(
     const uint32_t* __restrict__ packed,
     const int16_t*  __restrict__ codebook,
     const int16_t*  __restrict__ activations,
-    const int32_t*  __restrict__ row_offsets,
-    const int32_t*  __restrict__ patch_cols,
-    const int16_t*  __restrict__ patch_vals,
+    const int32_t*  __restrict__ escape_offsets,  // M * 256
+    const int16_t*  __restrict__ escape_vals,
     float*          __restrict__ output,
     int M, int K)
 {
@@ -55,8 +53,8 @@ __global__ void fixed12_matvec_fused(
     if (row >= M) return;
     int tid = threadIdx.x;
 
-    int patch_start = row_offsets[row];
-    int patch_end   = row_offsets[row + 1];
+    // O(1) lookup: where this thread's escapes start
+    int esc_ptr = escape_offsets[row * WORKGROUP_SIZE + tid];
 
     __shared__ float warp_sums[4];
     if (tid < 4) warp_sums[tid] = 0.0f;
@@ -67,12 +65,7 @@ __global__ void fixed12_matvec_fused(
     int64_t row_base = (int64_t)row * K * 12;
     int stride = WORKGROUP_SIZE;
 
-    // Each thread keeps a cursor into the row's sorted patches.
-    // When idx==4095, advance cursor to find matching column.
-    // Patches are sorted by column, so cursor only moves forward.
-    int esc_pos = patch_start;
-
-    // 2x unrolled main loop with inline escape handling
+    // 2x unrolled with inline O(1) escape
     int col = tid;
     for (; col + stride < K; col += stride * 2) {
         int64_t bp0 = row_base + (int64_t)col * 12;
@@ -80,43 +73,26 @@ __global__ void fixed12_matvec_fused(
         uint32_t idx0 = read12(packed, bp0);
         uint32_t idx1 = read12(packed, bp1);
 
-        float w0, w1;
-        if (__builtin_expect(idx0 != 4095, 1)) {
-            w0 = bf16_to_float(codebook[idx0]);
-        } else {
-            // Advance cursor to col (skip patches for other threads' columns)
-            while (esc_pos < patch_end && patch_cols[esc_pos] < col)
-                esc_pos++;
-            w0 = bf16_to_float(patch_vals[esc_pos++]);
-        }
-        if (__builtin_expect(idx1 != 4095, 1)) {
-            w1 = bf16_to_float(codebook[idx1]);
-        } else {
-            while (esc_pos < patch_end && patch_cols[esc_pos] < (col + stride))
-                esc_pos++;
-            w1 = bf16_to_float(patch_vals[esc_pos++]);
-        }
+        float w0 = (__builtin_expect(idx0 != 4095, 1))
+            ? bf16_to_float(codebook[idx0])
+            : bf16_to_float(escape_vals[esc_ptr++]);
+        float w1 = (__builtin_expect(idx1 != 4095, 1))
+            ? bf16_to_float(codebook[idx1])
+            : bf16_to_float(escape_vals[esc_ptr++]);
 
         sum0 += w0 * bf16_to_float(activations[col]);
         sum1 += w1 * bf16_to_float(activations[col + stride]);
     }
-    // Remainder
     if (col < K) {
         int64_t bp = row_base + (int64_t)col * 12;
         uint32_t idx = read12(packed, bp);
-        float w;
-        if (__builtin_expect(idx != 4095, 1)) {
-            w = bf16_to_float(codebook[idx]);
-        } else {
-            while (esc_pos < patch_end && patch_cols[esc_pos] < col)
-                esc_pos++;
-            w = bf16_to_float(patch_vals[esc_pos++]);
-        }
+        float w = (__builtin_expect(idx != 4095, 1))
+            ? bf16_to_float(codebook[idx])
+            : bf16_to_float(escape_vals[esc_ptr++]);
         sum0 += w * bf16_to_float(activations[col]);
     }
     float sum = sum0 + sum1;
 
-    // Wavefront reduction
     for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
         sum += __shfl_down(sum, off, WARP_SIZE);
 
@@ -128,8 +104,57 @@ __global__ void fixed12_matvec_fused(
 }
 
 // ---------------------------------------------------------------------------
-// Two-pass kernel: matvec (ignores escapes) + separate patch correction
+// Two-pass matvec: multi-row blocks for small K, single-row for large K
 // ---------------------------------------------------------------------------
+// For K <= 16384: 4 rows per block (one wavefront per row, 64 threads each)
+//   - Each thread does K/64 columns with 2x unroll
+//   - L1 codebook shared across 4 rows
+// For K > 16384: 1 row per block (4 wavefronts, 256 threads)
+//   - Each thread does K/256 columns with 2x unroll
+
+// Multi-row: 4 rows per block, one wavefront per row
+__global__ void fixed12_matvec_multirow(
+    const uint32_t* __restrict__ packed,
+    const int16_t*  __restrict__ codebook,
+    const int16_t*  __restrict__ activations,
+    float*          __restrict__ output,
+    int M, int K)
+{
+    int base_row = blockIdx.x * 4;
+    int warp_id  = threadIdx.x / WARP_SIZE;   // 0..3
+    int lane     = threadIdx.x % WARP_SIZE;   // 0..63
+    int row      = base_row + warp_id;
+    if (row >= M) return;
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    int64_t row_base = (int64_t)row * K * 12;
+
+    int col = lane;
+    for (; col + WARP_SIZE < K; col += WARP_SIZE * 2) {
+        int64_t bp0 = row_base + (int64_t)col * 12;
+        int64_t bp1 = row_base + (int64_t)(col + WARP_SIZE) * 12;
+        uint32_t idx0 = read12(packed, bp0);
+        uint32_t idx1 = read12(packed, bp1);
+        sum0 += bf16_to_float(codebook[idx0]) * bf16_to_float(activations[col]);
+        sum1 += bf16_to_float(codebook[idx1]) * bf16_to_float(activations[col + WARP_SIZE]);
+    }
+    if (col < K) {
+        int64_t bp = row_base + (int64_t)col * 12;
+        uint32_t idx = read12(packed, bp);
+        sum0 += bf16_to_float(codebook[idx]) * bf16_to_float(activations[col]);
+    }
+    float sum = sum0 + sum1;
+
+    // Wavefront reduction (within each warp independently)
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+        sum += __shfl_down(sum, off, WARP_SIZE);
+
+    if (lane == 0)
+        output[row] = sum;
+}
+
+// Single-row: 1 row per block, 256 threads (4 wavefronts cooperate)
 __global__ void fixed12_matvec_v2(
     const uint32_t* __restrict__ packed,
     const int16_t*  __restrict__ codebook,
@@ -211,15 +236,14 @@ extern "C" {
 
 int launch_fixed12_fused(
     const void* packed, const void* codebook, const void* activations,
-    const void* row_offsets, const void* patch_cols, const void* patch_vals,
+    const void* escape_offsets, const void* escape_vals,
     void* output, int M, int K)
 {
     hipLaunchKernelGGL(fixed12_matvec_fused,
         dim3(M), dim3(WORKGROUP_SIZE), 0, 0,
         (const uint32_t*)packed, (const int16_t*)codebook,
         (const int16_t*)activations,
-        (const int32_t*)row_offsets, (const int32_t*)patch_cols,
-        (const int16_t*)patch_vals,
+        (const int32_t*)escape_offsets, (const int16_t*)escape_vals,
         (float*)output, M, K);
     return (hipDeviceSynchronize() == hipSuccess) ? 0 : -1;
 }

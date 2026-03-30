@@ -130,3 +130,78 @@ int64_t pack_fixed12(
     free(tmp_offsets);
     return num_patches;
 }
+
+/*
+ * Pack with per-thread-stride escape layout for fused kernel.
+ *
+ * escape_offsets_out[M * workgroup_size]: per-thread offset into escape_vals
+ * escape_vals_out[num_patches]: correct BF16 values, ordered by (row, tid, col_order)
+ *
+ * Thread tid processes columns tid, tid+ws, tid+2*ws, ... so its escapes
+ * appear in encounter order in escape_vals.
+ */
+int64_t pack_fixed12_fused(
+    const uint16_t* raw_uint16,
+    int64_t num_values,
+    const uint32_t* reverse_map,
+    uint32_t* packed_out,
+    int32_t* escape_offsets_out,
+    int16_t* escape_vals_out,
+    int32_t M,
+    int32_t K,
+    int32_t workgroup_size)
+{
+    int64_t num_patches = 0;
+    int64_t table_size = (int64_t)M * workgroup_size;
+
+    /* Zero the per-thread count table (reuse escape_offsets as counts first) */
+    for (int64_t i = 0; i < table_size; i++)
+        escape_offsets_out[i] = 0;
+
+    /* First pass: pack 12-bit + count escapes per (row, tid) */
+    for (int64_t i = 0; i < num_values; i++) {
+        uint32_t idx = reverse_map[raw_uint16[i]];
+
+        int64_t bit_pos = i * 12;
+        int word = (int)(bit_pos >> 5);
+        int shift = (int)(bit_pos & 31);
+        packed_out[word] |= (idx & 0xFFF) << shift;
+        if (shift + 12 > 32)
+            packed_out[word + 1] |= (idx & 0xFFF) >> (32 - shift);
+
+        if (idx == 4095) {
+            int32_t row = (int32_t)(i / K);
+            int32_t col = (int32_t)(i % K);
+            int32_t tid = col % workgroup_size;
+            escape_offsets_out[(int64_t)row * workgroup_size + tid]++;
+            num_patches++;
+        }
+    }
+
+    /* Convert counts to exclusive prefix sums (offsets) */
+    int64_t running = 0;
+    for (int64_t i = 0; i < table_size; i++) {
+        int32_t count = escape_offsets_out[i];
+        escape_offsets_out[i] = (int32_t)running;
+        running += count;
+    }
+
+    /* Second pass: fill escape_vals in (row, tid, col_order) */
+    int32_t* tmp_pos = (int32_t*)malloc(table_size * sizeof(int32_t));
+    for (int64_t i = 0; i < table_size; i++)
+        tmp_pos[i] = escape_offsets_out[i];
+
+    for (int64_t i = 0; i < num_values; i++) {
+        uint32_t idx = reverse_map[raw_uint16[i]];
+        if (idx == 4095) {
+            int32_t row = (int32_t)(i / K);
+            int32_t col = (int32_t)(i % K);
+            int32_t tid = col % workgroup_size;
+            int64_t slot = (int64_t)row * workgroup_size + tid;
+            escape_vals_out[tmp_pos[slot]++] = (int16_t)raw_uint16[i];
+        }
+    }
+
+    free(tmp_pos);
+    return num_patches;
+}
