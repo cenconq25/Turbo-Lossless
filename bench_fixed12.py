@@ -30,7 +30,7 @@ _pack_lib.pack_fixed12.argtypes = [
 ]
 _pack_lib.pack_fixed12.restype = ctypes.c_int64
 
-# Load HIP kernel (V2 cache-optimized)
+# Load HIP kernel (V2)
 _hip_lib = ctypes.CDLL(os.path.join(os.path.dirname(__file__), "decompress_v2.so"))
 _hip_lib.launch_fixed12_v2.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 2
 _hip_lib.launch_fixed12_v2.restype = ctypes.c_int

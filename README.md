@@ -1,6 +1,6 @@
 # Turbo Lossless: BF16 Compression Engine
 
-100% bit-perfect lossless compression for LLM weights. BF16 in, BF16 out — no precision loss, 1.5x smaller, 1.8x faster inference.
+100% bit-perfect lossless compression for LLM weights. BF16 in, BF16 out — no precision loss, 1.5x smaller, 1.88x faster inference.
 
 ## Results
 
@@ -10,17 +10,17 @@ Measured on Llama 3.1 8B — all 226 weight tensors, 100% lossless:
 
 | Tensor | Shape | Ours | BF16 | Speedup |
 |--------|-------|------|------|---------|
-| attn_k | [4096x1024] | 0.092ms | 0.110ms | 1.20x |
-| attn_q | [4096x4096] | 0.206ms | 0.357ms | **1.73x** |
-| attn_output | [4096x4096] | 0.222ms | 0.354ms | **1.59x** |
-| ffn_down | [14336x4096] | 0.637ms | 1.078ms | **1.69x** |
-| ffn_gate | [4096x14336] | 0.600ms | 1.091ms | **1.82x** |
-| ffn_up | [4096x14336] | 0.599ms | 1.091ms | **1.82x** |
-| output | [4096x128256] | 5.055ms | 9.419ms | **1.86x** |
-| token_embd | [4096x128256] | 5.255ms | 9.374ms | **1.78x** |
-| **Weighted avg** | **(all 226 tensors)** | | | **1.80x** |
+| attn_k | [4096x1024] | 0.090ms | 0.110ms | 1.23x |
+| attn_q | [4096x4096] | 0.201ms | 0.357ms | **1.78x** |
+| attn_output | [4096x4096] | 0.209ms | 0.356ms | **1.70x** |
+| ffn_down | [14336x4096] | 0.623ms | 1.078ms | **1.73x** |
+| ffn_gate | [4096x14336] | 0.574ms | 1.097ms | **1.91x** |
+| ffn_up | [4096x14336] | 0.573ms | 1.094ms | **1.91x** |
+| output | [4096x128256] | 4.817ms | 9.394ms | **1.95x** |
+| token_embd | [4096x128256] | 5.016ms | 9.381ms | **1.87x** |
+| **Weighted avg** | **(all 226 tensors)** | | | **1.88x** |
 
-Larger tensors benefit most — output head achieves 208 GB/s effective bandwidth.
+Larger tensors benefit most — output head achieves 218 GB/s effective bandwidth.
 
 ### Compression Ratios
 
@@ -51,7 +51,9 @@ Validated on 11 BF16 models across 7 architectures:
 
 1. **12-bit fixed-width in VRAM** (not variable-length): Every value's bit position is deterministic — `col * 12`. Zero serial dependencies. Maximum GPU parallelism.
 
-2. **L1-cached codebook** (not LDS): The 8 KB codebook fits in MI50's 16 KB L1 cache. Skipping LDS load eliminates the per-block overhead and maximizes occupancy. Measured +0.07x improvement over LDS approach.
+2. **L1-cached codebook** (not LDS): The 8 KB codebook fits in MI50's 16 KB L1 cache. Skipping LDS load eliminates the per-block overhead and maximizes occupancy.
+
+3. **2x loop unroll**: Two columns decoded and accumulated per iteration for instruction-level parallelism. Overlaps packed data reads with codebook lookups and FMA. 4x unroll tested but register pressure reduced occupancy.
 
 3. **CSR row-grouped patches** (not per-element atomicAdd): MI50/gfx906 lacks hardware float atomics — `atomicAdd(float)` compiles to a CAS retry loop. 408K patches caused 580ms stall. Row-grouped CSR format + wavefront reduction eliminated all atomics. Measured: 580ms → 0.2ms.
 

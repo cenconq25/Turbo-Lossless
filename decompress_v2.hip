@@ -1,12 +1,10 @@
 /**
- * Turbo Lossless — V2 Optimized 12-bit Matvec Kernel
- * Maximizes L1/L2 cache utilization on MI50
+ * Turbo Lossless — V2 Fused 12-bit Matvec Kernel
+ * L1-cached codebook + inline escape handling via CSR patches
  *
- * Key optimizations over V1:
- *   1. Process columns sequentially (not strided) for cache-friendly packed data reads
- *   2. Pre-load activation tiles into LDS alongside codebook
- *   3. Use 4-wide vectorized uint32 loads where possible
- *   4. Reduce codebook LDS to 4 KB (2048 hot entries), rest in L2
+ * Single kernel launch: decode 12-bit indices, lookup codebook,
+ * handle escapes inline (binary search CSR patches), FMA accumulate.
+ * No separate patch kernel. No atomics.
  */
 
 #include <hip/hip_runtime.h>
@@ -32,10 +30,76 @@ uint32_t read12(const uint32_t* __restrict__ p, int64_t bp) {
     return v & 0xFFF;
 }
 
-// V2: Cache-optimized 12-bit matvec
-// - Codebook in L1 cache (8 KB fits in MI50's 16 KB L1 per CU)
-// - Zero LDS for codebook → maximum occupancy
-// - Contiguous tile access for packed data (adjacent threads read adjacent bits)
+// Binary search for col in sorted patch_cols[start..end)
+__device__ __forceinline__
+int binary_search(const int32_t* __restrict__ patch_cols, int start, int end, int col) {
+    while (start < end) {
+        int mid = (start + end) >> 1;
+        if (patch_cols[mid] < col)
+            start = mid + 1;
+        else
+            end = mid;
+    }
+    return start;
+}
+
+// Fused 12-bit matvec with inline escape correction
+// - L1-cached codebook (8 KB, zero LDS)
+// - When idx == 4095 (escape), binary search CSR patches for correct value
+// - Single kernel launch, no atomics, no separate patch pass
+__global__ void fixed12_matvec_fused(
+    const uint32_t* __restrict__ packed,
+    const int16_t*  __restrict__ codebook,
+    const int16_t*  __restrict__ activations,
+    const int32_t*  __restrict__ row_offsets,   // CSR: M+1 entries
+    const int32_t*  __restrict__ patch_cols,    // sorted column indices per row
+    const int16_t*  __restrict__ patch_vals,    // correct BF16 values
+    float*          __restrict__ output,
+    int M, int K)
+{
+    int row = blockIdx.x;
+    if (row >= M) return;
+    int tid = threadIdx.x;
+
+    // Load this row's patch range once (L1-cached after first wavefront reads it)
+    int patch_start = row_offsets[row];
+    int patch_end   = row_offsets[row + 1];
+
+    __shared__ float warp_sums[4];
+    if (tid < 4) warp_sums[tid] = 0.0f;
+    __syncthreads();
+
+    float sum = 0.0f;
+    int64_t row_base = (int64_t)row * K * 12;
+
+    for (int col = tid; col < K; col += WORKGROUP_SIZE) {
+        int64_t bp = row_base + (int64_t)col * 12;
+        uint32_t idx = read12(packed, bp);
+
+        float w_val;
+        if (__builtin_expect(idx != 4095, 1)) {
+            w_val = bf16_to_float(codebook[idx]);
+        } else {
+            // Escape: binary search this row's patches for col
+            int pos = binary_search(patch_cols, patch_start, patch_end, col);
+            w_val = bf16_to_float(patch_vals[pos]);
+        }
+
+        sum += w_val * bf16_to_float(activations[col]);
+    }
+
+    // Wavefront reduction
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+        sum += __shfl_down(sum, off, WARP_SIZE);
+
+    if ((tid % WARP_SIZE) == 0) warp_sums[tid / WARP_SIZE] = sum;
+    __syncthreads();
+
+    if (tid == 0)
+        output[row] = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+}
+
+// Two-pass matvec kernel: L1-cached codebook, 2x unrolled inner loop
 __global__ void fixed12_matvec_v2(
     const uint32_t* __restrict__ packed,
     const int16_t*  __restrict__ codebook,
@@ -51,14 +115,28 @@ __global__ void fixed12_matvec_v2(
     if (tid < 4) warp_sums[tid] = 0.0f;
     __syncthreads();
 
-    float sum = 0.0f;
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
     int64_t row_base = (int64_t)row * K * 12;
+    int stride = WORKGROUP_SIZE;
 
-    for (int col = tid; col < K; col += WORKGROUP_SIZE) {
+    // 2x unrolled: process two columns per iteration for ILP
+    int col = tid;
+    for (; col + stride < K; col += stride * 2) {
+        int64_t bp0 = row_base + (int64_t)col * 12;
+        int64_t bp1 = row_base + (int64_t)(col + stride) * 12;
+        uint32_t idx0 = read12(packed, bp0);
+        uint32_t idx1 = read12(packed, bp1);
+        sum0 += bf16_to_float(codebook[idx0]) * bf16_to_float(activations[col]);
+        sum1 += bf16_to_float(codebook[idx1]) * bf16_to_float(activations[col + stride]);
+    }
+    // Handle remainder
+    if (col < K) {
         int64_t bp = row_base + (int64_t)col * 12;
         uint32_t idx = read12(packed, bp);
-        sum += bf16_to_float(codebook[idx]) * bf16_to_float(activations[col]);
+        sum0 += bf16_to_float(codebook[idx]) * bf16_to_float(activations[col]);
     }
+    float sum = sum0 + sum1;
 
     // Wavefront reduction
     for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
@@ -71,9 +149,6 @@ __global__ void fixed12_matvec_v2(
         output[row] = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
 }
 
-// Apply patches — row-grouped, wavefront-parallel, no atomics
-// One wavefront (64 threads) per row. Threads cooperatively process patches
-// with warp reduction at the end.
 __global__ void apply_patches(
     const int32_t*  __restrict__ row_offsets,
     const int32_t*  __restrict__ patch_cols,
@@ -85,7 +160,7 @@ __global__ void apply_patches(
 {
     int row = blockIdx.x;
     if (row >= M) return;
-    int tid = threadIdx.x;  // 0..63 (one wavefront)
+    int tid = threadIdx.x;
     int start = row_offsets[row];
     int end   = row_offsets[row + 1];
 
@@ -95,7 +170,6 @@ __global__ void apply_patches(
                       * bf16_to_float(activations[patch_cols[p]]);
     }
 
-    // Wavefront reduction
     for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
         correction += __shfl_down(correction, off, WARP_SIZE);
 
@@ -105,6 +179,23 @@ __global__ void apply_patches(
 
 extern "C" {
 
+// Fused kernel — single launch, handles escapes inline
+int launch_fixed12_fused(
+    const void* packed, const void* codebook, const void* activations,
+    const void* row_offsets, const void* patch_cols, const void* patch_vals,
+    void* output, int M, int K)
+{
+    hipLaunchKernelGGL(fixed12_matvec_fused,
+        dim3(M), dim3(WORKGROUP_SIZE), 0, 0,
+        (const uint32_t*)packed, (const int16_t*)codebook,
+        (const int16_t*)activations,
+        (const int32_t*)row_offsets, (const int32_t*)patch_cols,
+        (const int16_t*)patch_vals,
+        (float*)output, M, K);
+    return (hipDeviceSynchronize() == hipSuccess) ? 0 : -1;
+}
+
+// Legacy two-pass interface
 int launch_fixed12_v2(
     const void* packed, const void* codebook,
     const void* activations, void* output, int M, int K)

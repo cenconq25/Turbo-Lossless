@@ -62,7 +62,7 @@ MI50/gfx906 lacks hardware `atomicAdd(float)` — it compiles to a CAS retry loo
 
 ## Current Results
 
-**Inference**: 1.80x weighted avg speedup (all 226 tensors, 100% lossless, AMD MI50)
+**Inference**: 1.88x weighted avg speedup (all 226 tensors, 100% lossless, AMD MI50)
 **Disk compression**: 1.47x (.tlc 8-tier variable-length)
 **VRAM compression**: 1.33x (12-bit fixed-width)
 **Validation**: 11 BF16 models, 7 architectures, 8B–671B parameters
