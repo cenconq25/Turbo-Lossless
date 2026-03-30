@@ -50,8 +50,12 @@ Validated on 11 BF16 models across 7 architectures (Llama, Mistral, Phi, Qwen, Y
 | **Llama 3.1 8B** | 8B | 226 | **2.90x** | **8.12x** | 2.80x | 226/226 |
 | **Phi-4** | 14B | 77 | **2.48x** | **7.10x** | 2.86x | 77/77 |
 | **Mistral 7B** | 7B | 226 | **2.43x** | **7.04x** | 2.89x | 226/226 |
+| **Qwen2.5 7B** | 7B | 198 | **2.26x** | **6.60x** | 2.93x | 198/198 |
+| **Phi-3 Mini** | 3.8B | 130 | **2.17x** | **6.31x** | 2.91x | 130/130 |
+| **TinyLlama** | 1.1B | 156 | **1.88x** | **5.56x** | 2.95x | 156/156 |
+| **StableLM 1.6B** | 1.6B | 170 | **1.76x** | **5.16x** | 2.93x | 170/170 |
 
-Consistent ~7-8x vs BF16 at batch=4 across all architectures. All bit-perfect verified.
+7 models, 5 architectures, 1183 tensors total — all bit-perfect lossless. Larger models benefit more (bigger tensors = better block amortization). Batch amortization is consistently ~2.9x across all models.
 
 ## How It Works
 
