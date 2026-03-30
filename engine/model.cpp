@@ -74,6 +74,7 @@ static bool load_compressed(const std::string& dir, const std::string& prefix, C
     // escape_offsets[row*256+tid] = exclusive prefix sum of escapes for thread tid in row
     // escape_vals = correct BF16 values in (row, tid, encounter_order) order
     w.escape_row_base = nullptr;
+    w.escape_thread_off = nullptr;
     w.escape_vals = nullptr;
     if (w.num_patches > 0 && !ro.empty() && !pc.empty() && !pcv.empty()) {
         const int WG = 256;
@@ -117,6 +118,23 @@ static bool load_compressed(const std::string& dir, const std::string& prefix, C
         }
 
         w.escape_row_base = upload_gpu<int32_t>(row_base.data(), row_base.size());
+
+        // Optional: pre-compute thread_off for fast path (costs M*256*2 bytes VRAM)
+        static int s_fast_mode = -1;
+        if (s_fast_mode < 0) {
+            const char* env = getenv("TURBO_FAST");
+            s_fast_mode = (env && env[0] == '1') ? 1 : 0;
+            if (s_fast_mode) printf("  TURBO_FAST=1: pre-computing escape offsets (uses ~721 MB extra VRAM)\n");
+            else printf("  TURBO_FAST=0: on-the-fly escape scan (saves ~721 MB VRAM)\n");
+        }
+        if (s_fast_mode) {
+            std::vector<uint16_t> thread_off(w.M * WG);
+            for (int r = 0; r < w.M; r++)
+                for (int t = 0; t < WG; t++)
+                    thread_off[r * WG + t] = (uint16_t)(abs_off[r * WG + t] - row_base[r]);
+            w.escape_thread_off = upload_gpu<uint16_t>(thread_off.data(), thread_off.size());
+        }
+
         w.escape_vals = upload_gpu<int16_t>(esc_vals.data(), esc_vals.size());
     }
 

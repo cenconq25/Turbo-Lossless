@@ -139,6 +139,81 @@ _hip.launch_fixed12_batch4(
 | `bitpack_fast.c` | C packer for .tlc variable-length format |
 | `bitunpack_fast.c` | C unpacker for .tlc variable-length format |
 
+## Inference Engine
+
+Standalone C++ engine for end-to-end LLM text generation using compressed weights.
+
+### Engine Benchmark — Mistral 7B Instruct v0.2 on MI50 32GB
+
+| Engine | Mode | tok/s | VRAM (net) | vs llama.cpp |
+|--------|------|------:|----------:|:-------------|
+| llama.cpp BF16 | B=1 | 32.2 | 13.64 GB | baseline |
+| **Turbo Lossless** | **B=4 FAST=1** | **48.0** | **10.69 GB** | **1.49x faster, 1.27x less VRAM** |
+| **Turbo Lossless** | **B=4 FAST=0** | **33.5** | **9.93 GB** | **1.04x faster, 1.37x less VRAM** |
+| Turbo Lossless | B=1 | 18.7 | — | 0.58x (single-user) |
+
+All outputs verified identical between B=1 and B=4 (100% bit-perfect lossless).
+
+### Build Engine
+
+```bash
+cd engine
+/opt/rocm/bin/hipcc -O3 --offload-arch=gfx906 -o turbo-engine \
+  main.cpp model.cpp inference.cpp tokenizer.cpp sampler.cpp \
+  kernels.hip ../decompress_v2.hip -lhipblas -lsentencepiece -std=c++17
+```
+
+### Convert Model
+
+```bash
+python3 engine/convert_model.py models/mistral-7b-instruct   # creates models/mistral-7b-instruct-turbo/
+```
+
+Requires: BF16 safetensors model with `config.json` and `tokenizer.model` (sentencepiece).
+
+### Run Engine
+
+```bash
+# Basic usage
+./turbo-engine <model-turbo-dir> <prompt> [max_tokens] [batch_size]
+
+# B=1 — single user, 18.7 tok/s
+HIP_VISIBLE_DEVICES=1 ./turbo-engine models/mistral-7b-instruct-turbo "What is 1+1?" 50 1
+
+# B=4 — 4 concurrent users, 48 tok/s total (recommended)
+HIP_VISIBLE_DEVICES=1 ./turbo-engine models/mistral-7b-instruct-turbo "Write a poem:" 200 4
+```
+
+### Environment Variables
+
+| Variable | Values | Effect |
+|----------|--------|--------|
+| `HIP_VISIBLE_DEVICES` | `0`, `1`, `2`, `3` | Select GPU (use non-display GPU) |
+| `TURBO_FAST` | `1` (default `0`) | **Speed vs VRAM tradeoff** |
+
+**`TURBO_FAST` explained:**
+
+- **`TURBO_FAST=0`** (default): On-the-fly escape scan. Saves ~0.76 GB VRAM by computing escape offsets at runtime via prefix scan. Uses 9.93 GB. Best when VRAM is tight or running larger models.
+- **`TURBO_FAST=1`**: Pre-computed escape offset table. Uses ~0.76 GB extra VRAM for a per-thread lookup table that eliminates the runtime scan. Uses 10.69 GB. **~43% faster** — use this when you have VRAM headroom.
+
+**Batch size (`B`):**
+
+- **`B=1`**: Single-user decode. 18.7 tok/s. Each weight decoded and multiplied by 1 vector.
+- **`B=4`**: 4 concurrent users sharing the same prompt. 48.0 tok/s total (12.0/user). Weights decoded once, multiplied by 4 vectors. **Recommended for production** — 1.49x faster than llama.cpp BF16.
+
+### VRAM Breakdown (Mistral 7B, TURBO_FAST=1)
+
+| Component | Size |
+|-----------|-----:|
+| Compressed weights (12-bit packed) | 10.0 GB |
+| Escape offset table (TURBO_FAST=1 only) | 0.76 GB |
+| Escape row_base + vals | 0.01 GB |
+| Token embeddings (BF16) | 0.26 GB |
+| KV cache (2048 ctx, BF16) | 0.27 GB |
+| Scratch buffers | 0.01 GB |
+| HIP runtime overhead | ~0.3 GB |
+| **Total** | **~10.7 GB** |
+
 ## Use Case
 
 **Accelerates autoregressive decoding** (token generation) where each step does matrix × vector. Memory-bandwidth bound — our 12-bit format reads 25% less data with negligible decode overhead. Batch matvec further amortizes decode cost for concurrent request serving (vLLM, TGI).

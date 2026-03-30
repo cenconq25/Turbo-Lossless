@@ -229,8 +229,85 @@ __global__ void fixed12_matvec_batch2(
 }
 
 // Batch4: decode once, multiply by 4 activation vectors
+// Macro for the batch4 FMA loop body (shared between fast and scan kernels)
+#define BATCH4_FMA_BODY() \
+    int col = tid; \
+    for (; col + WORKGROUP_SIZE < K; col += WORKGROUP_SIZE * 2) { \
+        uint32_t idx0 = read12(packed, bp); \
+        uint32_t idx1 = read12(packed, bp + (int64_t)(WORKGROUP_SIZE * 12)); \
+        float w0 = (__builtin_expect(idx0 != 4095, 1)) \
+            ? bf16_to_float(cb[idx0]) : bf16_to_float(escape_vals[esc_ptr++]); \
+        float w1 = (__builtin_expect(idx1 != 4095, 1)) \
+            ? bf16_to_float(cb[idx1]) : bf16_to_float(escape_vals[esc_ptr++]); \
+        s0a += w0 * bf16_to_float(act0[col]);  s0b += w1 * bf16_to_float(act0[col + WORKGROUP_SIZE]); \
+        s1a += w0 * bf16_to_float(act1[col]);  s1b += w1 * bf16_to_float(act1[col + WORKGROUP_SIZE]); \
+        s2a += w0 * bf16_to_float(act2[col]);  s2b += w1 * bf16_to_float(act2[col + WORKGROUP_SIZE]); \
+        s3a += w0 * bf16_to_float(act3[col]);  s3b += w1 * bf16_to_float(act3[col + WORKGROUP_SIZE]); \
+        bp += (int64_t)(WORKGROUP_SIZE * 2 * 12); \
+    } \
+    if (col < K) { \
+        uint32_t idx = read12(packed, bp); \
+        float w = (__builtin_expect(idx != 4095, 1)) \
+            ? bf16_to_float(cb[idx]) : bf16_to_float(escape_vals[esc_ptr++]); \
+        s0a += w * bf16_to_float(act0[col]); \
+        s1a += w * bf16_to_float(act1[col]); \
+        s2a += w * bf16_to_float(act2[col]); \
+        s3a += w * bf16_to_float(act3[col]); \
+    }
+
+#define BATCH4_REDUCE_BODY() \
+    float s0 = s0a + s0b, s1 = s1a + s1b, s2 = s2a + s2b, s3 = s3a + s3b; \
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) { \
+        s0 += __shfl_down(s0, off, WARP_SIZE); \
+        s1 += __shfl_down(s1, off, WARP_SIZE); \
+        s2 += __shfl_down(s2, off, WARP_SIZE); \
+        s3 += __shfl_down(s3, off, WARP_SIZE); \
+    } \
+    int wid = tid >> 6; \
+    if ((tid & (WARP_SIZE - 1)) == 0) { \
+        warp_sums[wid]      = s0; \
+        warp_sums[wid + 4]  = s1; \
+        warp_sums[wid + 8]  = s2; \
+        warp_sums[wid + 12] = s3; \
+    } \
+    __syncthreads(); \
+    if (tid == 0) { \
+        out0[row] = warp_sums[0]+warp_sums[1]+warp_sums[2]+warp_sums[3]; \
+        out1[row] = warp_sums[4]+warp_sums[5]+warp_sums[6]+warp_sums[7]; \
+        out2[row] = warp_sums[8]+warp_sums[9]+warp_sums[10]+warp_sums[11]; \
+        out3[row] = warp_sums[12]+warp_sums[13]+warp_sums[14]+warp_sums[15]; \
+    }
+
+// Fast batch4: uses pre-computed escape_thread_off table (8KB LDS, max occupancy)
 __launch_bounds__(WORKGROUP_SIZE)
 __global__ void fixed12_matvec_batch4(
+    const uint32_t* __restrict__ packed,
+    const int16_t*  __restrict__ codebook,
+    const int16_t*  __restrict__ act0, const int16_t* __restrict__ act1,
+    const int16_t*  __restrict__ act2, const int16_t* __restrict__ act3,
+    const int32_t*  __restrict__ escape_row_base,
+    const uint16_t* __restrict__ escape_thread_off,
+    const int16_t*  __restrict__ escape_vals,
+    float* __restrict__ out0, float* __restrict__ out1,
+    float* __restrict__ out2, float* __restrict__ out3,
+    int M, int K)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    __shared__ int16_t cb[4096];
+    __shared__ float warp_sums[16];
+    for (int i = tid; i < 4096; i += WORKGROUP_SIZE) cb[i] = codebook[i];
+    __syncthreads();
+    int esc_ptr = escape_row_base[row] + (int)escape_thread_off[row * WORKGROUP_SIZE + tid];
+    int64_t bp = (int64_t)row * K * 12 + (int64_t)tid * 12;
+    float s0a=0,s0b=0,s1a=0,s1b=0,s2a=0,s2b=0,s3a=0,s3b=0;
+    BATCH4_FMA_BODY()
+    BATCH4_REDUCE_BODY()
+}
+
+// Scan batch4: computes escape offsets on-the-fly (saves 721 MB VRAM, 9KB LDS)
+__launch_bounds__(WORKGROUP_SIZE)
+__global__ void fixed12_matvec_batch4_scan(
     const uint32_t* __restrict__ packed,
     const int16_t*  __restrict__ codebook,
     const int16_t*  __restrict__ act0, const int16_t* __restrict__ act1,
@@ -243,100 +320,34 @@ __global__ void fixed12_matvec_batch4(
 {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
-
     __shared__ int16_t cb[4096];
     __shared__ float warp_sums[16];
-    __shared__ int esc_offsets[WORKGROUP_SIZE];  // 1 KB for prefix sum
-
-    for (int i = tid; i < 4096; i += WORKGROUP_SIZE)
-        cb[i] = codebook[i];
+    __shared__ int esc_scan[WORKGROUP_SIZE];
+    for (int i = tid; i < 4096; i += WORKGROUP_SIZE) cb[i] = codebook[i];
     __syncthreads();
 
-    // Phase 1: count escapes by scanning packed data for sentinel 4095
-    // Must exactly mirror the main loop's access pattern
+    // Phase 1: count escapes
     int64_t bp_start = (int64_t)row * K * 12 + (int64_t)tid * 12;
-    int my_esc_count = 0;
-    {
-        int64_t bp_s = bp_start;
-        int c = tid;
-        for (; c + WORKGROUP_SIZE < K; c += WORKGROUP_SIZE * 2) {
-            if (read12(packed, bp_s) == 4095) my_esc_count++;
-            if (read12(packed, bp_s + (int64_t)(WORKGROUP_SIZE * 12)) == 4095) my_esc_count++;
-            bp_s += (int64_t)(WORKGROUP_SIZE * 2 * 12);
-        }
-        if (c < K) {
-            if (read12(packed, bp_s) == 4095) my_esc_count++;
-        }
+    int my_esc = 0;
+    { int64_t bp_s = bp_start; int c = tid;
+      for (; c + WORKGROUP_SIZE < K; c += WORKGROUP_SIZE * 2) {
+          if (read12(packed, bp_s) == 4095) my_esc++;
+          if (read12(packed, bp_s + (int64_t)(WORKGROUP_SIZE * 12)) == 4095) my_esc++;
+          bp_s += (int64_t)(WORKGROUP_SIZE * 2 * 12);
+      }
+      if (c < K) { if (read12(packed, bp_s) == 4095) my_esc++; }
     }
-
-    // Phase 2: exclusive prefix sum via shared memory (thread 0 scans, ~256 cycles)
-    esc_offsets[tid] = my_esc_count;
+    esc_scan[tid] = my_esc;
     __syncthreads();
-    if (tid == 0) {
-        int sum = 0;
-        for (int i = 0; i < WORKGROUP_SIZE; i++) {
-            int c = esc_offsets[i];
-            esc_offsets[i] = sum;
-            sum += c;
-        }
-    }
+    if (tid == 0) { int s=0; for (int i=0;i<WORKGROUP_SIZE;i++) { int c=esc_scan[i]; esc_scan[i]=s; s+=c; } }
     __syncthreads();
-    int esc_ptr = escape_row_base[row] + esc_offsets[tid];
+    int esc_ptr = escape_row_base[row] + esc_scan[tid];
 
-    // Phase 3: main FMA loop (identical to original)
-    float s0a = 0.0f, s0b = 0.0f;
-    float s1a = 0.0f, s1b = 0.0f;
-    float s2a = 0.0f, s2b = 0.0f;
-    float s3a = 0.0f, s3b = 0.0f;
-    int64_t bp = (int64_t)row * K * 12 + (int64_t)tid * 12;
-
-    int col = tid;
-    for (; col + WORKGROUP_SIZE < K; col += WORKGROUP_SIZE * 2) {
-        uint32_t idx0 = read12(packed, bp);
-        uint32_t idx1 = read12(packed, bp + (int64_t)(WORKGROUP_SIZE * 12));
-
-        float w0 = (__builtin_expect(idx0 != 4095, 1))
-            ? bf16_to_float(cb[idx0]) : bf16_to_float(escape_vals[esc_ptr++]);
-        float w1 = (__builtin_expect(idx1 != 4095, 1))
-            ? bf16_to_float(cb[idx1]) : bf16_to_float(escape_vals[esc_ptr++]);
-
-        s0a += w0 * bf16_to_float(act0[col]);  s0b += w1 * bf16_to_float(act0[col + WORKGROUP_SIZE]);
-        s1a += w0 * bf16_to_float(act1[col]);  s1b += w1 * bf16_to_float(act1[col + WORKGROUP_SIZE]);
-        s2a += w0 * bf16_to_float(act2[col]);  s2b += w1 * bf16_to_float(act2[col + WORKGROUP_SIZE]);
-        s3a += w0 * bf16_to_float(act3[col]);  s3b += w1 * bf16_to_float(act3[col + WORKGROUP_SIZE]);
-        bp += (int64_t)(WORKGROUP_SIZE * 2 * 12);
-    }
-    if (col < K) {
-        uint32_t idx = read12(packed, bp);
-        float w = (__builtin_expect(idx != 4095, 1))
-            ? bf16_to_float(cb[idx]) : bf16_to_float(escape_vals[esc_ptr++]);
-        s0a += w * bf16_to_float(act0[col]);
-        s1a += w * bf16_to_float(act1[col]);
-        s2a += w * bf16_to_float(act2[col]);
-        s3a += w * bf16_to_float(act3[col]);
-    }
-    float s0 = s0a + s0b, s1 = s1a + s1b, s2 = s2a + s2b, s3 = s3a + s3b;
-
-    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
-        s0 += __shfl_down(s0, off, WARP_SIZE);
-        s1 += __shfl_down(s1, off, WARP_SIZE);
-        s2 += __shfl_down(s2, off, WARP_SIZE);
-        s3 += __shfl_down(s3, off, WARP_SIZE);
-    }
-    int wid = tid >> 6;
-    if ((tid & (WARP_SIZE - 1)) == 0) {
-        warp_sums[wid]      = s0;
-        warp_sums[wid + 4]  = s1;
-        warp_sums[wid + 8]  = s2;
-        warp_sums[wid + 12] = s3;
-    }
-    __syncthreads();
-    if (tid == 0) {
-        out0[row] = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
-        out1[row] = warp_sums[4] + warp_sums[5] + warp_sums[6] + warp_sums[7];
-        out2[row] = warp_sums[8] + warp_sums[9] + warp_sums[10] + warp_sums[11];
-        out3[row] = warp_sums[12] + warp_sums[13] + warp_sums[14] + warp_sums[15];
-    }
+    // Phase 2: FMA
+    int64_t bp = bp_start;
+    float s0a=0,s0b=0,s1a=0,s1b=0,s2a=0,s2b=0,s3a=0,s3b=0;
+    BATCH4_FMA_BODY()
+    BATCH4_REDUCE_BODY()
 }
 
 // Batch8: decode once, multiply by 8 activation vectors
@@ -482,7 +493,7 @@ int launch_fixed12_batch2(
 int launch_fixed12_batch4(
     const void* packed, const void* codebook,
     const void* a0, const void* a1, const void* a2, const void* a3,
-    const void* esc_row_base, const void* esc_vals,
+    const void* esc_row_base, const void* esc_thread_off, const void* esc_vals,
     void* o0, void* o1, void* o2, void* o3, int M, int K)
 {
     hipLaunchKernelGGL(fixed12_matvec_batch4,
@@ -490,7 +501,7 @@ int launch_fixed12_batch4(
         (const uint32_t*)packed, (const int16_t*)codebook,
         (const int16_t*)a0, (const int16_t*)a1,
         (const int16_t*)a2, (const int16_t*)a3,
-        (const int32_t*)esc_row_base,
+        (const int32_t*)esc_row_base, (const uint16_t*)esc_thread_off,
         (const int16_t*)esc_vals,
         (float*)o0, (float*)o1, (float*)o2, (float*)o3, M, K);
     return (hipDeviceSynchronize() == hipSuccess) ? 0 : -1;
@@ -544,17 +555,30 @@ int launch_fixed12_fused_async(
 int launch_fixed12_batch4_async(
     const void* packed, const void* codebook,
     const void* a0, const void* a1, const void* a2, const void* a3,
-    const void* esc_row_base, const void* esc_vals,
+    const void* esc_row_base, const void* esc_thread_off, const void* esc_vals,
     void* o0, void* o1, void* o2, void* o3, int M, int K, void* stream)
 {
-    hipLaunchKernelGGL(fixed12_matvec_batch4,
-        dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
-        (const uint32_t*)packed, (const int16_t*)codebook,
-        (const int16_t*)a0, (const int16_t*)a1,
-        (const int16_t*)a2, (const int16_t*)a3,
-        (const int32_t*)esc_row_base,
-        (const int16_t*)esc_vals,
-        (float*)o0, (float*)o1, (float*)o2, (float*)o3, M, K);
+    if (esc_thread_off) {
+        // Fast path: pre-computed offset table
+        hipLaunchKernelGGL(fixed12_matvec_batch4,
+            dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
+            (const uint32_t*)packed, (const int16_t*)codebook,
+            (const int16_t*)a0, (const int16_t*)a1,
+            (const int16_t*)a2, (const int16_t*)a3,
+            (const int32_t*)esc_row_base, (const uint16_t*)esc_thread_off,
+            (const int16_t*)esc_vals,
+            (float*)o0, (float*)o1, (float*)o2, (float*)o3, M, K);
+    } else {
+        // VRAM-saving path: on-the-fly scan
+        hipLaunchKernelGGL(fixed12_matvec_batch4_scan,
+            dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
+            (const uint32_t*)packed, (const int16_t*)codebook,
+            (const int16_t*)a0, (const int16_t*)a1,
+            (const int16_t*)a2, (const int16_t*)a3,
+            (const int32_t*)esc_row_base,
+            (const int16_t*)esc_vals,
+            (float*)o0, (float*)o1, (float*)o2, (float*)o3, M, K);
+    }
     return 0;
 }
 }
