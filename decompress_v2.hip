@@ -32,8 +32,10 @@ uint32_t read12(const uint32_t* __restrict__ p, int64_t bp) {
     return v & 0xFFF;
 }
 
-// V2: Process columns in contiguous tiles for better cache behavior
-// Each wavefront processes a tile of consecutive columns
+// V2: Cache-optimized 12-bit matvec
+// - Codebook in L1 cache (8 KB fits in MI50's 16 KB L1 per CU)
+// - Zero LDS for codebook → maximum occupancy
+// - Contiguous tile access for packed data (adjacent threads read adjacent bits)
 __global__ void fixed12_matvec_v2(
     const uint32_t* __restrict__ packed,
     const int16_t*  __restrict__ codebook,
@@ -45,28 +47,17 @@ __global__ void fixed12_matvec_v2(
     if (row >= M) return;
     int tid = threadIdx.x;
 
-    // Load full 4096-entry codebook into LDS
-    __shared__ int16_t cb[4096];
     __shared__ float warp_sums[4];
-
-    for (int i = tid; i < 4096; i += WORKGROUP_SIZE)
-        cb[i] = codebook[i];
     if (tid < 4) warp_sums[tid] = 0.0f;
     __syncthreads();
 
     float sum = 0.0f;
     int64_t row_base = (int64_t)row * K * 12;
 
-    // Process K columns in tiles of WORKGROUP_SIZE
-    // Within each tile, thread tid handles column (tile_start + tid)
-    // This means adjacent threads read adjacent bit positions — cache friendly!
-    for (int tile = 0; tile < K; tile += WORKGROUP_SIZE) {
-        int col = tile + tid;
-        if (col < K) {
-            int64_t bp = row_base + (int64_t)col * 12;
-            uint32_t idx = read12(packed, bp);
-            sum += bf16_to_float(cb[idx]) * bf16_to_float(activations[col]);
-        }
+    for (int col = tid; col < K; col += WORKGROUP_SIZE) {
+        int64_t bp = row_base + (int64_t)col * 12;
+        uint32_t idx = read12(packed, bp);
+        sum += bf16_to_float(codebook[idx]) * bf16_to_float(activations[col]);
     }
 
     // Wavefront reduction
