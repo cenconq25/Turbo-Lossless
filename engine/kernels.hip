@@ -65,13 +65,19 @@ __global__ void rms_norm_kernel(
 }
 
 // ============================================================
-// RoPE: Rotary Position Embeddings
+// RoPE: Rotary Position Embeddings (with precomputed frequencies)
 // ============================================================
+
+// Precomputed frequency table on GPU (set once during init)
+static float* d_rope_freqs = nullptr;
+static int d_rope_freqs_dim = 0;
+
 __global__ void rope_kernel(
     float* __restrict__ q,   // [n_head, head_dim]
     float* __restrict__ k,   // [n_head_kv, head_dim]
+    const float* __restrict__ freqs,  // [half_dim] precomputed
     int head_dim, int n_head, int n_head_kv,
-    int position, float theta_base)
+    int position)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int half_dim = head_dim / 2;
@@ -80,10 +86,9 @@ __global__ void rope_kernel(
     if (idx < n_head * half_dim) {
         int head = idx / half_dim;
         int d = idx % half_dim;
-        float freq = 1.0f / powf(theta_base, (float)(2 * d) / head_dim);
-        float angle = position * freq;
-        float cos_a = cosf(angle);
-        float sin_a = sinf(angle);
+        float angle = position * freqs[d];
+        float cos_a, sin_a;
+        __sincosf(angle, &sin_a, &cos_a);
 
         int base = head * head_dim;
         float x0 = q[base + d];
@@ -96,10 +101,9 @@ __global__ void rope_kernel(
     if (idx < n_head_kv * half_dim) {
         int head = idx / half_dim;
         int d = idx % half_dim;
-        float freq = 1.0f / powf(theta_base, (float)(2 * d) / head_dim);
-        float angle = position * freq;
-        float cos_a = cosf(angle);
-        float sin_a = sinf(angle);
+        float angle = position * freqs[d];
+        float cos_a, sin_a;
+        __sincosf(angle, &sin_a, &cos_a);
 
         int base = head * head_dim;
         float x0 = k[base + d];
@@ -155,49 +159,6 @@ __global__ void add_kernel(
 }
 
 // ============================================================
-// Softmax over attention scores
-// ============================================================
-__global__ void softmax_kernel(
-    float* __restrict__ x,  // [seq_len] — one row of attention scores
-    int n)
-{
-    extern __shared__ float sdata[];
-    int tid = threadIdx.x;
-
-    // Find max
-    float max_val = -INFINITY;
-    for (int i = tid; i < n; i += blockDim.x) {
-        max_val = fmaxf(max_val, x[i]);
-    }
-    sdata[tid] = max_val;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
-        __syncthreads();
-    }
-    max_val = sdata[0];
-
-    // Exp and sum
-    float sum = 0.0f;
-    for (int i = tid; i < n; i += blockDim.x) {
-        x[i] = expf(x[i] - max_val);
-        sum += x[i];
-    }
-    sdata[tid] = sum;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        __syncthreads();
-    }
-    sum = sdata[0];
-
-    // Normalize
-    for (int i = tid; i < n; i += blockDim.x) {
-        x[i] /= sum;
-    }
-}
-
-// ============================================================
 // Argmax: find token with highest logit
 // ============================================================
 __global__ void argmax_kernel(
@@ -243,20 +204,27 @@ void launch_rms_norm(const float* x, const float* weight, float* y,
     rms_norm_kernel<<<1, threads, threads * sizeof(float), stream>>>(x, weight, y, n, eps);
 }
 
+void launch_rope_init(int head_dim, float theta_base) {
+    if (d_rope_freqs && d_rope_freqs_dim == head_dim) return;
+    int half_dim = head_dim / 2;
+    float* h_freqs = new float[half_dim];
+    for (int d = 0; d < half_dim; d++)
+        h_freqs[d] = 1.0f / powf(theta_base, (float)(2 * d) / head_dim);
+    if (d_rope_freqs) hipFree(d_rope_freqs);
+    hipMalloc(&d_rope_freqs, half_dim * sizeof(float));
+    hipMemcpy(d_rope_freqs, h_freqs, half_dim * sizeof(float), hipMemcpyHostToDevice);
+    d_rope_freqs_dim = head_dim;
+    delete[] h_freqs;
+}
+
 void launch_rope(float* q, float* k, int head_dim, int n_head, int n_head_kv,
                  int position, float theta, hipStream_t stream) {
+    launch_rope_init(head_dim, theta);
     int half_dim = head_dim / 2;
     int max_threads = max(n_head, n_head_kv) * half_dim;
     int threads = 256;
     int blocks = (max_threads + threads - 1) / threads;
-    rope_kernel<<<blocks, threads, 0, stream>>>(q, k, head_dim, n_head, n_head_kv, position, theta);
-}
-
-void launch_silu_mul(const float* gate, const float* up, float* out,
-                     int n, hipStream_t stream) {
-    int threads = 256;
-    int blocks = (n + threads - 1) / threads;
-    silu_mul_kernel<<<blocks, threads, 0, stream>>>(gate, up, out, n);
+    rope_kernel<<<blocks, threads, 0, stream>>>(q, k, d_rope_freqs, head_dim, n_head, n_head_kv, position);
 }
 
 void launch_embed_lookup(const int16_t* embd_table, const int* token_ids,
@@ -264,17 +232,6 @@ void launch_embed_lookup(const int16_t* embd_table, const int* token_ids,
     dim3 threads(256);
     dim3 blocks((n_embd + 255) / 256, batch_size);
     embed_lookup_kernel<<<blocks, threads, 0, stream>>>(embd_table, token_ids, output, n_embd, batch_size);
-}
-
-void launch_add(float* y, const float* x, int n, hipStream_t stream) {
-    int threads = 256;
-    int blocks = (n + threads - 1) / threads;
-    add_kernel<<<blocks, threads, 0, stream>>>(y, x, n);
-}
-
-void launch_softmax(float* x, int n, hipStream_t stream) {
-    int threads = 256;
-    softmax_kernel<<<1, threads, threads * sizeof(float), stream>>>(x, n);
 }
 
 void launch_argmax(const float* logits, int* result, int n, hipStream_t stream) {
@@ -305,46 +262,6 @@ __global__ void store_kv_kernel(
     kv_cache_v[cache_idx] = float_to_bf16(v_in[idx]);
 }
 
-// Single-head attention: compute scores for one query head against cached keys
-// With GQA: multiple Q heads share one KV head
-__global__ void attention_scores_kernel(
-    const float* __restrict__ q,           // [head_dim] for one Q head
-    const int16_t* __restrict__ k_cache,   // [max_seq, n_head_kv, head_dim]
-    float* __restrict__ scores,            // [seq_len] output attention scores
-    int kv_head_idx, int head_dim, int n_head_kv,
-    int seq_len, int max_seq, float scale)
-{
-    int pos = blockIdx.x * blockDim.x + threadIdx.x;
-    if (pos >= seq_len) return;
-
-    // Dot product: q · k[pos]
-    float dot = 0.0f;
-    int base = pos * n_head_kv * head_dim + kv_head_idx * head_dim;
-    for (int d = 0; d < head_dim; d++) {
-        dot += q[d] * bf16_to_float(k_cache[base + d]);
-    }
-    scores[pos] = dot * scale;
-}
-
-// Weighted sum of V vectors using attention weights
-__global__ void attention_value_kernel(
-    const float* __restrict__ weights,     // [seq_len] softmax attention weights
-    const int16_t* __restrict__ v_cache,   // [max_seq, n_head_kv, head_dim]
-    float* __restrict__ output,            // [head_dim] output
-    int kv_head_idx, int head_dim, int n_head_kv,
-    int seq_len, int max_seq)
-{
-    int d = blockIdx.x * blockDim.x + threadIdx.x;
-    if (d >= head_dim) return;
-
-    float sum = 0.0f;
-    for (int pos = 0; pos < seq_len; pos++) {
-        int base = pos * n_head_kv * head_dim + kv_head_idx * head_dim;
-        sum += weights[pos] * bf16_to_float(v_cache[base + d]);
-    }
-    output[d] = sum;
-}
-
 extern "C" {
 
 void launch_store_kv(const float* k, const float* v,
@@ -355,25 +272,6 @@ void launch_store_kv(const float* k, const float* v,
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
     store_kv_kernel<<<blocks, threads, 0, stream>>>(k, v, kv_k, kv_v, pos, n_head_kv, head_dim, max_seq);
-}
-
-void launch_attn_scores(const float* q, const int16_t* k_cache, float* scores,
-                        int kv_head, int head_dim, int n_head_kv,
-                        int seq_len, int max_seq, float scale,
-                        hipStream_t stream) {
-    int threads = 256;
-    int blocks = (seq_len + threads - 1) / threads;
-    attention_scores_kernel<<<blocks, threads, 0, stream>>>(
-        q, k_cache, scores, kv_head, head_dim, n_head_kv, seq_len, max_seq, scale);
-}
-
-void launch_attn_value(const float* weights, const int16_t* v_cache, float* output,
-                       int kv_head, int head_dim, int n_head_kv,
-                       int seq_len, int max_seq, hipStream_t stream) {
-    int threads = min(head_dim, 256);
-    int blocks = (head_dim + threads - 1) / threads;
-    attention_value_kernel<<<blocks, threads, 0, stream>>>(
-        weights, v_cache, output, kv_head, head_dim, n_head_kv, seq_len, max_seq);
 }
 
 }
@@ -711,10 +609,8 @@ void launch_attention_all_heads_batch(
 {
     int gqa_ratio = n_head / n_head_kv;
     int threads = 128;
-    // Find max seq_len for shared memory allocation
-    // For simplicity, use max_seq as upper bound (wastes some smem)
-    int max_pos = 64;  // reasonable default for decode, will be updated
-    int smem = (max_pos + head_dim) * sizeof(float) + 16 * sizeof(float);
+    // max_seq is passed as the actual max position+1 needed for smem allocation
+    int smem = (max_seq + head_dim) * sizeof(float) + 16 * sizeof(float);
     dim3 grid(n_head, batch_size);
     attention_all_heads_batch_kernel<<<grid, threads, smem, stream>>>(
         q, kv_k, kv_v, output, positions, n_head, n_head_kv, head_dim,
@@ -729,9 +625,9 @@ __global__ void rope_batch_kernel(
     float* __restrict__ q,   // [batch_size * n_head * head_dim]
     float* __restrict__ k,   // [batch_size * n_head_kv * head_dim]
     const int* __restrict__ positions,  // [batch_size]
+    const float* __restrict__ freqs,    // [half_dim] precomputed
     int head_dim, int n_head, int n_head_kv,
-    int q_stride, int k_stride,  // stride per sequence
-    float theta_base)
+    int q_stride, int k_stride)
 {
     int seq = blockIdx.y;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -742,9 +638,9 @@ __global__ void rope_batch_kernel(
     if (idx < n_head * half_dim) {
         int head = idx / half_dim;
         int d = idx % half_dim;
-        float freq = 1.0f / powf(theta_base, (float)(2*d) / head_dim);
-        float angle = position * freq;
-        float cos_a = cosf(angle), sin_a = sinf(angle);
+        float angle = position * freqs[d];
+        float cos_a, sin_a;
+        __sincosf(angle, &sin_a, &cos_a);
         int base = seq * q_stride + head * head_dim;
         float x0 = q[base + d], x1 = q[base + d + half_dim];
         q[base + d]            = x0 * cos_a - x1 * sin_a;
@@ -754,9 +650,9 @@ __global__ void rope_batch_kernel(
     if (idx < n_head_kv * half_dim) {
         int head = idx / half_dim;
         int d = idx % half_dim;
-        float freq = 1.0f / powf(theta_base, (float)(2*d) / head_dim);
-        float angle = position * freq;
-        float cos_a = cosf(angle), sin_a = sinf(angle);
+        float angle = position * freqs[d];
+        float cos_a, sin_a;
+        __sincosf(angle, &sin_a, &cos_a);
         int base = seq * k_stride + head * head_dim;
         float x0 = k[base + d], x1 = k[base + d + half_dim];
         k[base + d]            = x0 * cos_a - x1 * sin_a;
@@ -788,11 +684,12 @@ void launch_rope_batch(float* q, float* k, const int* positions,
     int head_dim, int n_head, int n_head_kv,
     int q_stride, int k_stride,
     float theta, int batch_size, hipStream_t stream) {
+    launch_rope_init(head_dim, theta);
     int half_dim = head_dim / 2;
     int max_threads = max(n_head, n_head_kv) * half_dim;
     dim3 grid((max_threads + 255) / 256, batch_size);
     rope_batch_kernel<<<grid, 256, 0, stream>>>(
-        q, k, positions, head_dim, n_head, n_head_kv, q_stride, k_stride, theta);
+        q, k, positions, d_rope_freqs, head_dim, n_head, n_head_kv, q_stride, k_stride);
 }
 
 void launch_store_kv_batch(const float* k, const float* v,
