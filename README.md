@@ -155,11 +155,25 @@ python3 bench_fixed12.py models/llama-3.1-8b/llama-3.1-8b.safetensors
 | `bitpack_fast.c` | C packer for .tlc variable-length format |
 | `bitunpack_fast.c` | C unpacker for .tlc variable-length format |
 
+## Batch Matvec (Concurrent Request Serving)
+
+Decode each weight once, multiply by B activation vectors. Amortizes decode cost across batch:
+
+| Batch | output [4096x128256] per-vec | vs BF16 batch | Amortization |
+|-------|------------------------------|--------------|-------------|
+| B=1 | 2.979ms | 3.14x | — |
+| B=2 | 1.645ms | 9.78x | 1.81x |
+| B=4 | 1.258ms | 5.34x | 2.38x |
+
+B=4 per-vector cost is **58% cheaper** than single matvec. Production-relevant for vLLM batched serving (2-8 concurrent requests).
+
 ## Use Case
 
 This engine accelerates **autoregressive decoding** (token generation) where inference is memory-bandwidth bound. Each decoding step does matrix × vector (weight × single token activation), reading the entire weight matrix. Our 12-bit format reads 25% less data with negligible decode overhead.
 
-Not beneficial for **prefill** (prompt processing) which is compute-bound — weights are reused across the token batch and the codebook lookup overhead would hurt.
+Batch matvec further amortizes decode cost when serving multiple concurrent requests — common in production LLM serving with vLLM, TGI, etc.
+
+Not beneficial for **prefill** (prompt processing) which is compute-bound — weights are reused across the token batch.
 
 ## Target Hardware
 

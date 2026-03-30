@@ -94,7 +94,7 @@ Bit-exact verification using decompress kernel (`fixed12_decompress_fused`):
 | Round-trip verification | Done — tlc_verify.py |
 | End-to-end runtime | WIP — tlc_runtime.py needs fused kernel wiring |
 | NVIDIA/CUDA port | TODO — warp size 64→32 |
-| Batch matvec (small batch decode) | TODO — reuse weight reads across batch |
+| Batch matvec (B=2, B=4) | Done — 2.38x amortization at B=4 |
 
 ## Scope
 
