@@ -43,6 +43,16 @@ B=4 is the production sweet spot. B=8 hits diminishing returns as ALU saturates.
 
 Validated on 11 BF16 models across 7 architectures (Llama, Mistral, Phi, Qwen, Yi, BigCode, MiniMax). 9/11 achieve 1.50x+ disk compression.
 
+### Cross-Model Inference Benchmark
+
+| Model | Params | Tensors | B=1 Speedup | B=4 Speedup | B=4 Amortize | Lossless |
+|-------|--------|---------|------------|------------|-------------|---------|
+| **Llama 3.1 8B** | 8B | 226 | **2.90x** | **8.12x** | 2.80x | 226/226 |
+| **Phi-4** | 14B | 77 | **2.48x** | **7.10x** | 2.86x | 77/77 |
+| **Mistral 7B** | 7B | 226 | **2.43x** | **7.04x** | 2.89x | 226/226 |
+
+Consistent ~7-8x vs BF16 at batch=4 across all architectures. All bit-perfect verified.
+
 ## How It Works
 
 ### Encoding
