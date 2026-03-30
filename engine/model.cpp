@@ -45,18 +45,30 @@ static bool load_compressed(const std::string& dir, const std::string& prefix, C
     if (cb.empty()) return false;
     w.codebook = upload_gpu<int16_t>(cb.data(), cb.size() / sizeof(int16_t));
 
-    // Escape offsets
-    auto eo = read_file(dir + "/" + prefix + ".esc_off.bin");
-    if (eo.empty()) return false;
-    w.escape_offsets = upload_gpu<int32_t>(eo.data(), eo.size() / sizeof(int32_t));
+    // CSR escape data
+    auto ro = read_file(dir + "/" + prefix + ".row_off.bin");
+    if (!ro.empty())
+        w.row_offsets = upload_gpu<int32_t>(ro.data(), ro.size() / sizeof(int32_t));
+    else
+        w.row_offsets = nullptr;
 
-    // Escape values
-    auto ev = read_file(dir + "/" + prefix + ".esc_val.bin");
-    if (!ev.empty()) {
-        w.escape_vals = upload_gpu<int16_t>(ev.data(), ev.size() / sizeof(int16_t));
-    } else {
-        w.escape_vals = nullptr;
-    }
+    auto pc = read_file(dir + "/" + prefix + ".patch_cols.bin");
+    if (!pc.empty())
+        w.patch_cols = upload_gpu<int32_t>(pc.data(), pc.size() / sizeof(int32_t));
+    else
+        w.patch_cols = nullptr;
+
+    auto pcv = read_file(dir + "/" + prefix + ".patch_correct.bin");
+    if (!pcv.empty())
+        w.patch_correct = upload_gpu<int16_t>(pcv.data(), pcv.size() / sizeof(int16_t));
+    else
+        w.patch_correct = nullptr;
+
+    auto pw = read_file(dir + "/" + prefix + ".patch_wrong.bin");
+    if (!pw.empty())
+        w.patch_wrong = upload_gpu<int16_t>(pw.data(), pw.size() / sizeof(int16_t));
+    else
+        w.patch_wrong = nullptr;
 
     return true;
 }

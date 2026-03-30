@@ -43,6 +43,71 @@ int build_codebook_12bit(
 }
 
 /*
+ * Pack with CSR row-grouped patches for two-pass kernel.
+ * Minimal overhead: ~15 MB for entire model vs 1.44 GB for per-thread offsets.
+ */
+int64_t pack_fixed12_csr(
+    const uint16_t* raw_uint16,
+    int64_t num_values,
+    const uint32_t* reverse_map,
+    uint32_t* packed_out,
+    int32_t* row_offsets_out,
+    int32_t* patch_cols_out,
+    int16_t* patch_correct_out,
+    int16_t* patch_wrong_out,
+    int16_t wrong_value,
+    int32_t M,
+    int32_t K)
+{
+    int64_t num_patches = 0;
+
+    for (int32_t r = 0; r <= M; r++)
+        row_offsets_out[r] = 0;
+
+    /* First pass: pack bits + count patches per row */
+    for (int64_t i = 0; i < num_values; i++) {
+        uint32_t idx = reverse_map[raw_uint16[i]];
+
+        int64_t bit_pos = i * 12;
+        int word = (int)(bit_pos >> 5);
+        int shift = (int)(bit_pos & 31);
+        packed_out[word] |= (idx & 0xFFF) << shift;
+        if (shift + 12 > 32)
+            packed_out[word + 1] |= (idx & 0xFFF) >> (32 - shift);
+
+        if (idx == 4095) {
+            int32_t row = (int32_t)(i / K);
+            row_offsets_out[row + 1]++;
+            num_patches++;
+        }
+    }
+
+    /* Prefix sum */
+    for (int32_t r = 0; r < M; r++)
+        row_offsets_out[r + 1] += row_offsets_out[r];
+
+    /* Second pass: fill patch data */
+    int32_t* tmp = (int32_t*)malloc((size_t)M * sizeof(int32_t));
+    for (int32_t r = 0; r < M; r++)
+        tmp[r] = row_offsets_out[r];
+
+    for (int64_t i = 0; i < num_values; i++) {
+        uint32_t idx = reverse_map[raw_uint16[i]];
+        if (idx == 4095) {
+            int32_t row = (int32_t)(i / K);
+            int32_t col = (int32_t)(i % K);
+            int32_t pos = tmp[row]++;
+            patch_cols_out[pos] = col;
+            patch_correct_out[pos] = (int16_t)raw_uint16[i];
+            patch_wrong_out[pos] = wrong_value;
+        }
+    }
+
+    free(tmp);
+    return num_patches;
+}
+
+/*
  * Pack with per-thread-stride escape layout for fused kernel.
  *
  * escape_offsets_out[M * workgroup_size]: per-thread offset into escape_vals

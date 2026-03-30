@@ -525,3 +525,84 @@ int launch_fixed12_batch4_async(
     return 0;
 }
 }
+
+// ---------------------------------------------------------------------------
+// Two-pass kernels: matvec (no escape) + wavefront-parallel patch correction
+// ---------------------------------------------------------------------------
+__launch_bounds__(WORKGROUP_SIZE)
+__global__ void fixed12_matvec_v2(
+    const uint32_t* __restrict__ packed,
+    const int16_t*  __restrict__ codebook,
+    const int16_t*  __restrict__ activations,
+    float*          __restrict__ output,
+    int M, int K)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    __shared__ int16_t cb[4096];
+    __shared__ float warp_sums[4];
+    for (int i = tid; i < 4096; i += WORKGROUP_SIZE) cb[i] = codebook[i];
+    __syncthreads();
+    float sum0 = 0.0f, sum1 = 0.0f;
+    int64_t bp = (int64_t)row * K * 12 + (int64_t)tid * 12;
+    int col = tid;
+    for (; col + WORKGROUP_SIZE < K; col += WORKGROUP_SIZE * 2) {
+        uint32_t idx0 = read12(packed, bp);
+        uint32_t idx1 = read12(packed, bp + (int64_t)(WORKGROUP_SIZE * 12));
+        sum0 += bf16_to_float(cb[idx0]) * bf16_to_float(activations[col]);
+        sum1 += bf16_to_float(cb[idx1]) * bf16_to_float(activations[col + WORKGROUP_SIZE]);
+        bp += (int64_t)(WORKGROUP_SIZE * 2 * 12);
+    }
+    if (col < K) {
+        uint32_t idx = read12(packed, bp);
+        sum0 += bf16_to_float(cb[idx]) * bf16_to_float(activations[col]);
+    }
+    float sum = sum0 + sum1;
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) sum += __shfl_down(sum, off, WARP_SIZE);
+    if ((tid & (WARP_SIZE-1)) == 0) warp_sums[tid >> 6] = sum;
+    __syncthreads();
+    if (tid == 0) output[row] = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+}
+
+__global__ void apply_patches_v2(
+    const int32_t* __restrict__ row_offsets,
+    const int32_t* __restrict__ patch_cols,
+    const int16_t* __restrict__ correct_vals,
+    const int16_t* __restrict__ wrong_vals,
+    const int16_t* __restrict__ activations,
+    float*         __restrict__ output,
+    int M)
+{
+    int row = blockIdx.x;
+    if (row >= M) return;
+    int tid = threadIdx.x;
+    int start = row_offsets[row];
+    int end   = row_offsets[row + 1];
+    float correction = 0.0f;
+    for (int p = start + tid; p < end; p += WARP_SIZE)
+        correction += (bf16_to_float(correct_vals[p]) - bf16_to_float(wrong_vals[p]))
+                      * bf16_to_float(activations[patch_cols[p]]);
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+        correction += __shfl_down(correction, off, WARP_SIZE);
+    if (tid == 0 && correction != 0.0f) output[row] += correction;
+}
+
+extern "C" {
+int launch_fixed12_v2(const void* packed, const void* codebook,
+    const void* activations, void* output, int M, int K) {
+    hipLaunchKernelGGL(fixed12_matvec_v2, dim3(M), dim3(WORKGROUP_SIZE), 0, 0,
+        (const uint32_t*)packed, (const int16_t*)codebook,
+        (const int16_t*)activations, (float*)output, M, K);
+    return (hipDeviceSynchronize() == hipSuccess) ? 0 : -1;
+}
+int launch_patches_v2(const void* row_offsets, const void* patch_cols,
+    const void* correct_vals, const void* wrong_vals,
+    const void* activations, void* output, int M) {
+    if (M == 0) return 0;
+    hipLaunchKernelGGL(apply_patches_v2, dim3(M), dim3(WARP_SIZE), 0, 0,
+        (const int32_t*)row_offsets, (const int32_t*)patch_cols,
+        (const int16_t*)correct_vals, (const int16_t*)wrong_vals,
+        (const int16_t*)activations, (float*)output, M);
+    return (hipDeviceSynchronize() == hipSuccess) ? 0 : -1;
+}
+}

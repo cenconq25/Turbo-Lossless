@@ -17,12 +17,12 @@ extern "C" {
     void launch_attention_all_heads(const float* q, const int16_t* k_cache, const int16_t* v_cache,
         float* output, int n_head, int n_head_kv, int head_dim, int seq_len, int max_seq,
         float scale, hipStream_t stream);
-    int launch_fixed12_fused_async(const void* packed, const void* codebook, const void* activations,
-        const void* escape_offsets, const void* escape_vals, void* output, int M, int K, void* stream);
-    int launch_fixed12_batch4_async(const void* packed, const void* codebook,
-        const void* a0, const void* a1, const void* a2, const void* a3,
-        const void* esc_off, const void* esc_vals,
-        void* o0, void* o1, void* o2, void* o3, int M, int K, void* stream);
+    // Two-pass: matvec (ignores escapes) then patch correction
+    int launch_fixed12_v2(const void* packed, const void* codebook,
+        const void* activations, void* output, int M, int K);
+    int launch_patches_v2(const void* row_offsets, const void* patch_cols,
+        const void* correct_vals, const void* wrong_vals,
+        const void* activations, void* output, int M);
 }
 
 // BF16 conversion buffers — one per batch slot
@@ -39,27 +39,28 @@ static void ensure_bf16_bufs(int K, int batch_size) {
     }
 }
 
-// B=1 matvec
+// B=1 two-pass matvec: decode + patch correction
 static void compressed_matvec_b1(const CompressedWeight& w, const float* x, float* out, hipStream_t stream) {
     ensure_bf16_bufs(w.K, 1);
     launch_fp32_to_bf16(x, s_bf16_bufs[0], w.K, stream);
-    launch_fixed12_fused_async(w.packed, w.codebook, s_bf16_bufs[0],
-        w.escape_offsets, w.escape_vals, out, w.M, w.K, stream);
+    // Pass 1: matvec (escapes get codebook[4095] = wrong value)
+    launch_fixed12_v2(w.packed, w.codebook, s_bf16_bufs[0], out, w.M, w.K);
+    // Pass 2: correct escapes via CSR patches
+    if (w.num_patches > 0 && w.row_offsets) {
+        launch_patches_v2(w.row_offsets, w.patch_cols, w.patch_correct, w.patch_wrong,
+                          s_bf16_bufs[0], out, w.M);
+    }
 }
 
-// B=4 batched matvec — decode weight once, multiply by 4 activations
+// B=4: for now, run 4x B=1 (batch kernel needs fused escape which we removed)
+// TODO: add two-pass batch4 kernel
 static void compressed_matvec_b4(const CompressedWeight& w,
     const float* x0, const float* x1, const float* x2, const float* x3,
     float* o0, float* o1, float* o2, float* o3, hipStream_t stream) {
-    ensure_bf16_bufs(w.K, 4);
-    launch_fp32_to_bf16(x0, s_bf16_bufs[0], w.K, stream);
-    launch_fp32_to_bf16(x1, s_bf16_bufs[1], w.K, stream);
-    launch_fp32_to_bf16(x2, s_bf16_bufs[2], w.K, stream);
-    launch_fp32_to_bf16(x3, s_bf16_bufs[3], w.K, stream);
-    launch_fixed12_batch4_async(w.packed, w.codebook,
-        s_bf16_bufs[0], s_bf16_bufs[1], s_bf16_bufs[2], s_bf16_bufs[3],
-        w.escape_offsets, w.escape_vals,
-        o0, o1, o2, o3, w.M, w.K, stream);
+    compressed_matvec_b1(w, x0, o0, stream);
+    compressed_matvec_b1(w, x1, o1, stream);
+    compressed_matvec_b1(w, x2, o2, stream);
+    compressed_matvec_b1(w, x3, o3, stream);
 }
 
 // Per-sequence buffers for B=4

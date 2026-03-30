@@ -17,14 +17,17 @@ struct ModelConfig {
     float rms_norm_eps; // RMSNorm epsilon
 };
 
-// Compressed weight tensor on GPU
+// Compressed weight tensor on GPU (CSR escape format)
 struct CompressedWeight {
     int M, K;                     // weight dimensions [M, K]
     int32_t* packed;              // 12-bit packed indices on GPU
     int16_t* codebook;            // 4096-entry codebook on GPU
-    int32_t* escape_offsets;      // per-thread escape table on GPU [M * 256]
-    int16_t* escape_vals;         // escape values on GPU
-    int num_patches;              // number of escape values
+    // CSR escape patches (tiny — ~few KB per tensor)
+    int32_t* row_offsets;         // [M+1] CSR row pointers
+    int32_t* patch_cols;          // [num_patches] column indices
+    int16_t* patch_correct;       // [num_patches] correct BF16 values
+    int16_t* patch_wrong;         // [num_patches] wrong BF16 values
+    int num_patches;
 };
 
 // One transformer layer
