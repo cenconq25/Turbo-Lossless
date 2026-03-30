@@ -24,16 +24,23 @@ extern "C" {
     void launch_attention_all_heads_batch(const float* q, const int16_t* kv_k, const int16_t* kv_v,
         float* output, const int* positions, int n_head, int n_head_kv, int head_dim,
         int max_seq, float scale, int batch_size, int kv_stride, hipStream_t stream);
+    void launch_rope_batch(float* q, float* k, const int* positions,
+        int head_dim, int n_head, int n_head_kv, int q_stride, int k_stride,
+        float theta, int batch_size, hipStream_t stream);
+    void launch_store_kv_batch(const float* k, const float* v,
+        int16_t* kv_k, int16_t* kv_v, const int* positions,
+        int kv_dim, int max_seq, int batch_size, hipStream_t stream);
 
-    // Async two-pass weight matvec
-    int launch_fixed12_v2_async(const void* packed, const void* codebook,
+    // FP32 direct input kernels (no BF16 conversion needed)
+    int launch_fixed12_v2_f32(const void* packed, const void* codebook,
         const void* activations, void* output, int M, int K, void* stream);
+    int launch_fixed12_batch4_f32(const void* packed, const void* codebook,
+        const void* a0, const void* a1, const void* a2, const void* a3,
+        void* o0, void* o1, void* o2, void* o3, int M, int K, void* stream);
+    // Patch correction (still needs BF16 activations for now — TODO: make FP32)
     int launch_patches_v2_async(const void* row_offsets, const void* patch_cols,
         const void* correct_vals, const void* wrong_vals,
         const void* activations, void* output, int M, void* stream);
-    int launch_fixed12_batch4_noesc_async(const void* packed, const void* codebook,
-        const void* a0, const void* a1, const void* a2, const void* a3,
-        void* o0, void* o1, void* o2, void* o3, int M, int K, void* stream);
 }
 
 static int16_t* s_bf16_bufs[4] = {};
@@ -51,30 +58,33 @@ static void ensure_bf16_bufs(int K, int batch_size) {
 #define B 4
 #define SEQ(buf, s, sz) ((buf) + (s) * (sz))
 
-// B=1 two-pass matvec
+// B=1 FP32 direct matvec (no BF16 conversion launch!)
 static void matvec_b1(const CompressedWeight& w, const float* x, float* out, hipStream_t stream) {
-    ensure_bf16_bufs(w.K, 1);
-    launch_fp32_to_bf16(x, s_bf16_bufs[0], w.K, stream);
-    launch_fixed12_v2_async(w.packed, w.codebook, s_bf16_bufs[0], out, w.M, w.K, stream);
-    if (w.num_patches > 0 && w.row_offsets)
+    launch_fixed12_v2_f32(w.packed, w.codebook, x, out, w.M, w.K, stream);
+    if (w.num_patches > 0 && w.row_offsets) {
+        // Patch kernel still needs BF16 activations — convert just for patches
+        ensure_bf16_bufs(w.K, 1);
+        launch_fp32_to_bf16(x, s_bf16_bufs[0], w.K, stream);
         launch_patches_v2_async(w.row_offsets, w.patch_cols, w.patch_correct, w.patch_wrong,
                                 s_bf16_bufs[0], out, w.M, stream);
+    }
 }
 
-// B=4 batch matvec + 4× patch correction
+// B=4 FP32 direct batch matvec (no BF16 conversion for main kernel!)
 static void matvec_b4(const CompressedWeight& w,
     float* x, float* out, int n_in, int n_out, hipStream_t stream) {
-    ensure_bf16_bufs(w.K, 4);
-    for (int s = 0; s < B; s++)
-        launch_fp32_to_bf16(SEQ(x, s, n_in), s_bf16_bufs[s], w.K, stream);
-    launch_fixed12_batch4_noesc_async(w.packed, w.codebook,
-        s_bf16_bufs[0], s_bf16_bufs[1], s_bf16_bufs[2], s_bf16_bufs[3],
+    launch_fixed12_batch4_f32(w.packed, w.codebook,
+        SEQ(x,0,n_in), SEQ(x,1,n_in), SEQ(x,2,n_in), SEQ(x,3,n_in),
         SEQ(out,0,n_out), SEQ(out,1,n_out), SEQ(out,2,n_out), SEQ(out,3,n_out),
         w.M, w.K, stream);
-    if (w.num_patches > 0 && w.row_offsets)
-        for (int s = 0; s < B; s++)
+    if (w.num_patches > 0 && w.row_offsets) {
+        ensure_bf16_bufs(w.K, 4);
+        for (int s = 0; s < B; s++) {
+            launch_fp32_to_bf16(SEQ(x,s,n_in), s_bf16_bufs[s], w.K, stream);
             launch_patches_v2_async(w.row_offsets, w.patch_cols, w.patch_correct, w.patch_wrong,
                                     s_bf16_bufs[s], SEQ(out,s,n_out), w.M, stream);
+        }
+    }
 }
 
 InferenceState* create_inference_state(Model* model, int batch_size, int max_seq_len) {
@@ -188,15 +198,16 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
         matvec_b4(L.wk, state->hidden, state->k_buf, n, kv_dim, stream);
         matvec_b4(L.wv, state->hidden, state->v_buf, n, kv_dim, stream);
 
-        // RoPE + KV store per sequence (different positions)
+        // 1 launch: batched RoPE for all B sequences
         size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
-        for (int s = 0; s < B; s++) {
-            launch_rope(SEQ(state->q_buf,s,n), SEQ(state->k_buf,s,kv_dim),
-                        head_dim, cfg.n_head, cfg.n_head_kv, state->positions[s], cfg.rope_theta, stream);
-            launch_store_kv(SEQ(state->k_buf,s,kv_dim), SEQ(state->v_buf,s,kv_dim),
-                            m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
-                            state->positions[s], cfg.n_head_kv, head_dim, m->max_seq_len, stream);
-        }
+        launch_rope_batch(state->q_buf, state->k_buf, state->d_positions,
+                          head_dim, cfg.n_head, cfg.n_head_kv, n, kv_dim,
+                          cfg.rope_theta, B, stream);
+
+        // 1 launch: batched KV store for all B sequences
+        launch_store_kv_batch(state->k_buf, state->v_buf,
+                              m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+                              state->d_positions, kv_dim, m->max_seq_len, B, stream);
 
         // 1 launch: batched attention (B×n_head blocks)
         float scale = 1.0f / sqrtf((float)head_dim);

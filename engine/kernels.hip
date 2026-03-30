@@ -721,3 +721,85 @@ void launch_attention_all_heads_batch(
         max_seq, gqa_ratio, scale, kv_stride);
 }
 }
+
+// ============================================================================
+// Batched RoPE: process B sequences in one launch
+// ============================================================================
+__global__ void rope_batch_kernel(
+    float* __restrict__ q,   // [batch_size * n_head * head_dim]
+    float* __restrict__ k,   // [batch_size * n_head_kv * head_dim]
+    const int* __restrict__ positions,  // [batch_size]
+    int head_dim, int n_head, int n_head_kv,
+    int q_stride, int k_stride,  // stride per sequence
+    float theta_base)
+{
+    int seq = blockIdx.y;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int half_dim = head_dim / 2;
+    int position = positions[seq];
+
+    // Q heads
+    if (idx < n_head * half_dim) {
+        int head = idx / half_dim;
+        int d = idx % half_dim;
+        float freq = 1.0f / powf(theta_base, (float)(2*d) / head_dim);
+        float angle = position * freq;
+        float cos_a = cosf(angle), sin_a = sinf(angle);
+        int base = seq * q_stride + head * head_dim;
+        float x0 = q[base + d], x1 = q[base + d + half_dim];
+        q[base + d]            = x0 * cos_a - x1 * sin_a;
+        q[base + d + half_dim] = x0 * sin_a + x1 * cos_a;
+    }
+    // K heads
+    if (idx < n_head_kv * half_dim) {
+        int head = idx / half_dim;
+        int d = idx % half_dim;
+        float freq = 1.0f / powf(theta_base, (float)(2*d) / head_dim);
+        float angle = position * freq;
+        float cos_a = cosf(angle), sin_a = sinf(angle);
+        int base = seq * k_stride + head * head_dim;
+        float x0 = k[base + d], x1 = k[base + d + half_dim];
+        k[base + d]            = x0 * cos_a - x1 * sin_a;
+        k[base + d + half_dim] = x0 * sin_a + x1 * cos_a;
+    }
+}
+
+// Batched KV store: store B sequences' K,V into cache
+__global__ void store_kv_batch_kernel(
+    const float* __restrict__ k_in,    // [batch_size * kv_dim]
+    const float* __restrict__ v_in,
+    int16_t* __restrict__ kv_k,        // [max_seq * kv_dim]
+    int16_t* __restrict__ kv_v,
+    const int* __restrict__ positions,
+    int kv_dim, int max_seq, int batch_size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int seq = blockIdx.y;
+    if (seq >= batch_size || idx >= kv_dim) return;
+    int pos = positions[seq];
+    int cache_idx = pos * kv_dim + idx;
+    int src_idx = seq * kv_dim + idx;
+    kv_k[cache_idx] = float_to_bf16(k_in[src_idx]);
+    kv_v[cache_idx] = float_to_bf16(v_in[src_idx]);
+}
+
+extern "C" {
+void launch_rope_batch(float* q, float* k, const int* positions,
+    int head_dim, int n_head, int n_head_kv,
+    int q_stride, int k_stride,
+    float theta, int batch_size, hipStream_t stream) {
+    int half_dim = head_dim / 2;
+    int max_threads = max(n_head, n_head_kv) * half_dim;
+    dim3 grid((max_threads + 255) / 256, batch_size);
+    rope_batch_kernel<<<grid, 256, 0, stream>>>(
+        q, k, positions, head_dim, n_head, n_head_kv, q_stride, k_stride, theta);
+}
+
+void launch_store_kv_batch(const float* k, const float* v,
+    int16_t* kv_k, int16_t* kv_v, const int* positions,
+    int kv_dim, int max_seq, int batch_size, hipStream_t stream) {
+    dim3 grid((kv_dim + 255) / 256, batch_size);
+    store_kv_batch_kernel<<<grid, 256, 0, stream>>>(
+        k, v, kv_k, kv_v, positions, kv_dim, max_seq, batch_size);
+}
+}
