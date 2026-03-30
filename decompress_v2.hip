@@ -56,7 +56,13 @@ __global__ void fixed12_matvec_fused(
     // O(1) lookup: where this thread's escapes start
     int esc_ptr = escape_offsets[row * WORKGROUP_SIZE + tid];
 
+    // Load codebook into LDS (1-cycle access vs ~10-cycle L1)
+    // 8 KB LDS, worthwhile since we're compute-bound at 19% of 1 TB/s HBM
+    __shared__ int16_t cb[4096];
     __shared__ float warp_sums[4];
+
+    for (int i = tid; i < 4096; i += WORKGROUP_SIZE)
+        cb[i] = codebook[i];
     if (tid < 4) warp_sums[tid] = 0.0f;
     __syncthreads();
 
@@ -65,17 +71,17 @@ __global__ void fixed12_matvec_fused(
     int64_t row_base = (int64_t)row * K * 12;
     int stride = WORKGROUP_SIZE;
 
-    // 2x unrolled with inline O(1) escape
+    // 2x unrolled with inline O(1) escape, LDS codebook
     int col = tid;
     for (; col + stride < K; col += stride * 2) {
         uint32_t idx0 = read12(packed, row_base + (int64_t)col * 12);
         uint32_t idx1 = read12(packed, row_base + (int64_t)(col + stride) * 12);
 
         float w0 = (__builtin_expect(idx0 != 4095, 1))
-            ? bf16_to_float(codebook[idx0])
+            ? bf16_to_float(cb[idx0])
             : bf16_to_float(escape_vals[esc_ptr++]);
         float w1 = (__builtin_expect(idx1 != 4095, 1))
-            ? bf16_to_float(codebook[idx1])
+            ? bf16_to_float(cb[idx1])
             : bf16_to_float(escape_vals[esc_ptr++]);
 
         sum0 += w0 * bf16_to_float(activations[col]);
@@ -84,7 +90,7 @@ __global__ void fixed12_matvec_fused(
     if (col < K) {
         uint32_t idx = read12(packed, row_base + (int64_t)col * 12);
         float w = (__builtin_expect(idx != 4095, 1))
-            ? bf16_to_float(codebook[idx])
+            ? bf16_to_float(cb[idx])
             : bf16_to_float(escape_vals[esc_ptr++]);
         sum0 += w * bf16_to_float(activations[col]);
     }
