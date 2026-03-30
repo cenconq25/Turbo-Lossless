@@ -12,7 +12,8 @@
 
 ## Current Results
 
-- **1.88x** weighted avg inference speedup (fused kernel, all 226 Llama 8B tensors, 100% lossless)
+- **2.29x** weighted avg inference speedup (fused kernel, all 226 Llama 8B tensors, 100% lossless)
+- **257 GB/s** effective bandwidth on large tensors (~51% of MI50 theoretical peak)
 - **1.47x** disk compression (.tlc 8-tier variable-length)
 - **1.33x** VRAM compression (12-bit fixed-width + escape table)
 - Validated compression on 11 BF16 models, 7 architectures, 8B–671B params
@@ -24,17 +25,21 @@
 Single GPU kernel launch per matvec. Decodes 12-bit packed indices, looks up L1-cached codebook, handles escapes inline via per-thread offset table, accumulates FMA.
 
 **Key design:**
+- Branchless 64-bit read: 12-bit index straddles word boundary 37% of the time. Original conditional branch caused warp divergence. Fix: always load two uint32 as one uint64 and shift. This alone improved 1.88x → 2.29x.
 - L1-cached codebook: 8 KB fits in MI50's 16 KB L1. Zero LDS overhead, max occupancy.
 - Per-thread escape table: `escape_offsets[row * 256 + tid]` → O(1) lookup, zero scanning.
 - 2x loop unroll: ILP for overlapping packed reads with codebook lookups and FMA.
 - Wavefront reduction via `__shfl_down` + shared `warp_sums[4]`.
 
-**Why this design:**
-- LDS codebook was slower (1.80x) due to per-block load barrier.
-- Fused merge-scan was 0.15x on token_embd — strided thread access = O(N) scan per escape.
-- Binary search fused was 1.32x on token_embd — L2 latency per comparison.
-- Two-pass (separate patch kernel) was 1.88x but 2 kernel launches.
-- atomicAdd patches: MI50/gfx906 lacks hardware float atomics → 580ms CAS stall.
+**Optimization history:**
+- atomicAdd patches: 0.02x on token_embd — MI50 lacks hardware float atomics → 580ms CAS stall.
+- CSR wavefront-parallel patches (two-pass): 1.73x — fast but two kernel launches.
+- LDS codebook: 1.80x — per-block load barrier reduces occupancy.
+- L1-cached codebook + 2x unroll (two-pass): 1.88x.
+- Fused merge-scan: 0.15x on token_embd — O(N) scan per escape.
+- Fused binary search: 1.32x on token_embd — L2 latency per comparison.
+- Per-thread escape offset table (fused): 1.88x — O(1) escape, single kernel.
+- Branchless 64-bit read (fused): **2.29x** — eliminated 37% warp divergence.
 
 ### Disk Format (.tlc)
 
