@@ -28,6 +28,7 @@ struct CompressedWeight {
     int16_t* patch_correct;       // [num_patches] correct BF16 values
     int16_t* patch_wrong;         // [num_patches] wrong BF16 values
     int num_patches;
+    int base_exp;                     // BaseExp for structured 12-bit decode
     // Fused escape table (built at load time from CSR)
     int32_t* escape_row_base;     // [M] absolute start of row's escapes (5.6 MB total)
     uint8_t* escape_counts;       // [M*256] optional: per-thread escape count (361 MB, max val 12)

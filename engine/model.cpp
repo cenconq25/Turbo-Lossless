@@ -33,6 +33,11 @@ static bool load_compressed(const std::string& dir, const std::string& prefix, C
     std::ifstream df(dims_path);
     if (!df) { fprintf(stderr, "Missing: %s\n", dims_path.c_str()); return false; }
     df >> w.M >> w.K >> w.num_patches;
+    // Read base_exp for structured 12-bit (4th field, optional for backward compat)
+    w.base_exp = 0;
+    if (df >> w.base_exp) {
+        // structured 12-bit mode
+    }
     df.close();
 
     // Read and upload packed data
@@ -40,10 +45,12 @@ static bool load_compressed(const std::string& dir, const std::string& prefix, C
     if (packed.empty()) return false;
     w.packed = upload_gpu<int32_t>(packed.data(), packed.size() / sizeof(int32_t));
 
-    // Codebook
+    // Codebook (not needed for structured 12-bit, but load if present for backward compat)
     auto cb = read_file(dir + "/" + prefix + ".codebook.bin");
-    if (cb.empty()) return false;
-    w.codebook = upload_gpu<int16_t>(cb.data(), cb.size() / sizeof(int16_t));
+    if (!cb.empty())
+        w.codebook = upload_gpu<int16_t>(cb.data(), cb.size() / sizeof(int16_t));
+    else
+        w.codebook = nullptr;
 
     // CSR escape data
     auto ro = read_file(dir + "/" + prefix + ".row_off.bin");

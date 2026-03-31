@@ -36,15 +36,20 @@ extern "C" {
 
     // Fused BF16 batch8 (single-pass, O(1) escape with split offset table)
     int launch_fixed12_batch8_v2_async(const void* packed, const void* codebook, const void* a0, const void* a1, const void* a2, const void* a3, const void* a4, const void* a5, const void* a6, const void* a7, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, void* o4, void* o5, void* o6, void* o7, int M, int K, void* stream);
+
+    // Structured 12-bit: arithmetic decode (no LDS codebook)
+    int launch_structured12_v2_async(const void* packed, int base_exp, const void* activations, void* output, int M, int K, void* stream);
+    int launch_structured12_batch4_async(const void* packed, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, int M, int K, void* stream);
+    int launch_structured12_batch8_async(const void* packed, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* a4, const void* a5, const void* a6, const void* a7, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, void* o4, void* o5, void* o6, void* o7, int M, int K, void* stream);
 }
 
 #define B 4
 #define SEQ(buf, s, sz) ((buf) + (s) * (sz))
 #define SEQI(buf, s, sz) ((buf) + (s) * (sz))  // int16_t version
 
-// B=4 batch4 matvec helper: BF16 conversion + fused batch4 kernel
+// B=4 batch4 matvec helper: structured 12-bit (no LDS codebook)
 #define BATCH4_MATVEC(w, bf16_in, out_buf, n_in, n_out, strm) do { \
-    launch_fixed12_batch4_async((w).packed, (w).codebook, \
+    launch_structured12_batch4_async((w).packed, (w).base_exp, \
         SEQI(bf16_in,0,n_in), SEQI(bf16_in,1,n_in), \
         SEQI(bf16_in,2,n_in), SEQI(bf16_in,3,n_in), \
         (w).escape_row_base, (w).escape_counts, (w).escape_vals, \
@@ -118,9 +123,9 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
     int16_t* bf16_a = state->bf16_act;   // BF16 activation buffer
     int16_t* bf16_b = state->bf16_act2;  // second BF16 buffer
 
-    // Two-pass BF16 matvec: v2 (no escape) + patch correction — avoids escape_offsets read
+    // Two-pass BF16 matvec: structured 12-bit v2 (no escape) + patch correction
     #define MATVEC_B1(w, bf16_in, fp32_out) do { \
-        launch_fixed12_v2_async((w).packed, (w).codebook, bf16_in, fp32_out, (w).M, (w).K, stream); \
+        launch_structured12_v2_async((w).packed, (w).base_exp, bf16_in, fp32_out, (w).M, (w).K, stream); \
         if ((w).num_patches > 0 && (w).row_offsets) \
             launch_patches_v2_async((w).row_offsets, (w).patch_cols, (w).patch_correct, (w).patch_wrong, \
                                     bf16_in, fp32_out, (w).M, stream); \
@@ -170,9 +175,9 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
     #undef MATVEC_B1
 }
 
-// B=8 batch8 matvec helper: BF16 conversion + fused batch8 kernel
+// B=8 batch8 matvec helper: structured 12-bit (no LDS codebook)
 #define BATCH8_MATVEC(w, bf16_in, out_buf, n_in, n_out, strm) do { \
-    launch_fixed12_batch8_v2_async((w).packed, (w).codebook, \
+    launch_structured12_batch8_async((w).packed, (w).base_exp, \
         SEQI(bf16_in,0,n_in), SEQI(bf16_in,1,n_in), \
         SEQI(bf16_in,2,n_in), SEQI(bf16_in,3,n_in), \
         SEQI(bf16_in,4,n_in), SEQI(bf16_in,5,n_in), \
@@ -210,17 +215,17 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
         // Fused RMSNorm → BF16 for Q/K/V (saves 1 launch)
         launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, B, stream);
         // Q on stream0, K+V on stream2 (K,V are 4x smaller — can overlap with Q's tail)
-        launch_fixed12_batch4_async(L.wq.packed, L.wq.codebook,
+        launch_structured12_batch4_async(L.wq.packed, L.wq.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.wq.escape_row_base, L.wq.escape_counts, L.wq.escape_vals,
             SEQ(state->q_buf,0,n), SEQ(state->q_buf,1,n), SEQ(state->q_buf,2,n), SEQ(state->q_buf,3,n),
             L.wq.M, L.wq.K, stream);
-        launch_fixed12_batch4_async(L.wk.packed, L.wk.codebook,
+        launch_structured12_batch4_async(L.wk.packed, L.wk.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.wk.escape_row_base, L.wk.escape_counts, L.wk.escape_vals,
             SEQ(state->k_buf,0,kv_dim), SEQ(state->k_buf,1,kv_dim), SEQ(state->k_buf,2,kv_dim), SEQ(state->k_buf,3,kv_dim),
             L.wk.M, L.wk.K, stream);
-        launch_fixed12_batch4_async(L.wv.packed, L.wv.codebook,
+        launch_structured12_batch4_async(L.wv.packed, L.wv.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.wv.escape_row_base, L.wv.escape_counts, L.wv.escape_vals,
             SEQ(state->v_buf,0,kv_dim), SEQ(state->v_buf,1,kv_dim), SEQ(state->v_buf,2,kv_dim), SEQ(state->v_buf,3,kv_dim),
@@ -246,26 +251,26 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
 
         // wo: convert attn_out to BF16
         launch_fp32_to_bf16(state->attn_out, bf16_a, B * n, stream);
-        launch_fixed12_batch4_async(L.wo.packed, L.wo.codebook,
+        launch_structured12_batch4_async(L.wo.packed, L.wo.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.wo.escape_row_base, L.wo.escape_counts, L.wo.escape_vals,
             SEQ(res,0,n), SEQ(res,1,n), SEQ(res,2,n), SEQ(res,3,n),
             L.wo.M, L.wo.K, stream);
         // Fused add + RMSNorm → BF16 (res += cur, then bf16_a = norm(res))
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, B, stream);
-        launch_fixed12_batch4_async(L.w_gate.packed, L.w_gate.codebook,
+        launch_structured12_batch4_async(L.w_gate.packed, L.w_gate.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.w_gate.escape_row_base, L.w_gate.escape_counts, L.w_gate.escape_vals,
             SEQ(state->ffn_gate,0,n_ff), SEQ(state->ffn_gate,1,n_ff), SEQ(state->ffn_gate,2,n_ff), SEQ(state->ffn_gate,3,n_ff),
             L.w_gate.M, L.w_gate.K, stream);
-        launch_fixed12_batch4_async(L.w_up.packed, L.w_up.codebook,
+        launch_structured12_batch4_async(L.w_up.packed, L.w_up.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.w_up.escape_row_base, L.w_up.escape_counts, L.w_up.escape_vals,
             SEQ(state->ffn_up,0,n_ff), SEQ(state->ffn_up,1,n_ff), SEQ(state->ffn_up,2,n_ff), SEQ(state->ffn_up,3,n_ff),
             L.w_up.M, L.w_up.K, stream);
         // Fused SiLU*mul → BF16 for w_down (saves 1 launch)
         launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, B, stream);
-        launch_fixed12_batch4_async(L.w_down.packed, L.w_down.codebook,
+        launch_structured12_batch4_async(L.w_down.packed, L.w_down.base_exp,
             SEQI(bf16_b,0,n_ff), SEQI(bf16_b,1,n_ff), SEQI(bf16_b,2,n_ff), SEQI(bf16_b,3,n_ff),
             L.w_down.escape_row_base, L.w_down.escape_counts, L.w_down.escape_vals,
             SEQ(cur,0,n), SEQ(cur,1,n), SEQ(cur,2,n), SEQ(cur,3,n),
@@ -275,7 +280,7 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
 
     // Fused RMSNorm → BF16 for output projection (saves 1 launch)
     launch_rms_norm_bf16_batch(cur, m->output_norm, bf16_a, n, cfg.rms_norm_eps, B, stream);
-    launch_fixed12_batch4_async(m->output_proj.packed, m->output_proj.codebook,
+    launch_structured12_batch4_async(m->output_proj.packed, m->output_proj.base_exp,
         SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
         m->output_proj.escape_row_base, m->output_proj.escape_counts, m->output_proj.escape_vals,
         SEQ(state->logits,0,cfg.n_vocab), SEQ(state->logits,1,cfg.n_vocab),
@@ -309,21 +314,21 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
 
         // Fused RMSNorm -> BF16 for Q/K/V
         launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
-        launch_fixed12_batch8_v2_async(L.wq.packed, L.wq.codebook,
+        launch_structured12_batch8_async(L.wq.packed, L.wq.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             SEQI(bf16_a,4,n), SEQI(bf16_a,5,n), SEQI(bf16_a,6,n), SEQI(bf16_a,7,n),
             L.wq.escape_row_base, L.wq.escape_counts, L.wq.escape_vals,
             SEQ(state->q_buf,0,n), SEQ(state->q_buf,1,n), SEQ(state->q_buf,2,n), SEQ(state->q_buf,3,n),
             SEQ(state->q_buf,4,n), SEQ(state->q_buf,5,n), SEQ(state->q_buf,6,n), SEQ(state->q_buf,7,n),
             L.wq.M, L.wq.K, stream);
-        launch_fixed12_batch8_v2_async(L.wk.packed, L.wk.codebook,
+        launch_structured12_batch8_async(L.wk.packed, L.wk.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             SEQI(bf16_a,4,n), SEQI(bf16_a,5,n), SEQI(bf16_a,6,n), SEQI(bf16_a,7,n),
             L.wk.escape_row_base, L.wk.escape_counts, L.wk.escape_vals,
             SEQ(state->k_buf,0,kv_dim), SEQ(state->k_buf,1,kv_dim), SEQ(state->k_buf,2,kv_dim), SEQ(state->k_buf,3,kv_dim),
             SEQ(state->k_buf,4,kv_dim), SEQ(state->k_buf,5,kv_dim), SEQ(state->k_buf,6,kv_dim), SEQ(state->k_buf,7,kv_dim),
             L.wk.M, L.wk.K, stream);
-        launch_fixed12_batch8_v2_async(L.wv.packed, L.wv.codebook,
+        launch_structured12_batch8_async(L.wv.packed, L.wv.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             SEQI(bf16_a,4,n), SEQI(bf16_a,5,n), SEQI(bf16_a,6,n), SEQI(bf16_a,7,n),
             L.wv.escape_row_base, L.wv.escape_counts, L.wv.escape_vals,
@@ -351,7 +356,7 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
 
         // wo: convert attn_out to BF16
         launch_fp32_to_bf16(state->attn_out, bf16_a, BS * n, stream);
-        launch_fixed12_batch8_v2_async(L.wo.packed, L.wo.codebook,
+        launch_structured12_batch8_async(L.wo.packed, L.wo.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             SEQI(bf16_a,4,n), SEQI(bf16_a,5,n), SEQI(bf16_a,6,n), SEQI(bf16_a,7,n),
             L.wo.escape_row_base, L.wo.escape_counts, L.wo.escape_vals,
@@ -360,14 +365,14 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
             L.wo.M, L.wo.K, stream);
         // Fused add + RMSNorm -> BF16
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
-        launch_fixed12_batch8_v2_async(L.w_gate.packed, L.w_gate.codebook,
+        launch_structured12_batch8_async(L.w_gate.packed, L.w_gate.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             SEQI(bf16_a,4,n), SEQI(bf16_a,5,n), SEQI(bf16_a,6,n), SEQI(bf16_a,7,n),
             L.w_gate.escape_row_base, L.w_gate.escape_counts, L.w_gate.escape_vals,
             SEQ(state->ffn_gate,0,n_ff), SEQ(state->ffn_gate,1,n_ff), SEQ(state->ffn_gate,2,n_ff), SEQ(state->ffn_gate,3,n_ff),
             SEQ(state->ffn_gate,4,n_ff), SEQ(state->ffn_gate,5,n_ff), SEQ(state->ffn_gate,6,n_ff), SEQ(state->ffn_gate,7,n_ff),
             L.w_gate.M, L.w_gate.K, stream);
-        launch_fixed12_batch8_v2_async(L.w_up.packed, L.w_up.codebook,
+        launch_structured12_batch8_async(L.w_up.packed, L.w_up.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             SEQI(bf16_a,4,n), SEQI(bf16_a,5,n), SEQI(bf16_a,6,n), SEQI(bf16_a,7,n),
             L.w_up.escape_row_base, L.w_up.escape_counts, L.w_up.escape_vals,
@@ -376,7 +381,7 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
             L.w_up.M, L.w_up.K, stream);
         // Fused SiLU*mul -> BF16 for w_down
         launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, BS, stream);
-        launch_fixed12_batch8_v2_async(L.w_down.packed, L.w_down.codebook,
+        launch_structured12_batch8_async(L.w_down.packed, L.w_down.base_exp,
             SEQI(bf16_b,0,n_ff), SEQI(bf16_b,1,n_ff), SEQI(bf16_b,2,n_ff), SEQI(bf16_b,3,n_ff),
             SEQI(bf16_b,4,n_ff), SEQI(bf16_b,5,n_ff), SEQI(bf16_b,6,n_ff), SEQI(bf16_b,7,n_ff),
             L.w_down.escape_row_base, L.w_down.escape_counts, L.w_down.escape_vals,
@@ -388,7 +393,7 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
 
     // Fused RMSNorm -> BF16 for output projection
     launch_rms_norm_bf16_batch(cur, m->output_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
-    launch_fixed12_batch8_v2_async(m->output_proj.packed, m->output_proj.codebook,
+    launch_structured12_batch8_async(m->output_proj.packed, m->output_proj.base_exp,
         SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
         SEQI(bf16_a,4,n), SEQI(bf16_a,5,n), SEQI(bf16_a,6,n), SEQI(bf16_a,7,n),
         m->output_proj.escape_row_base, m->output_proj.escape_counts, m->output_proj.escape_vals,
