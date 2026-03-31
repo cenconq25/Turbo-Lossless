@@ -16,8 +16,8 @@ extern "C" {
     void launch_memcpy_batch(float* dst, const float* src, int n, int batch_size, hipStream_t stream);
     void launch_rope_batch(float* q, float* k, const int* positions, int head_dim, int n_head, int n_head_kv, int q_stride, int k_stride, float theta, int batch_size, hipStream_t stream);
     void launch_store_kv_batch(const float* k, const float* v, int16_t* kv_k, int16_t* kv_v, const int* positions, int kv_dim, int max_seq, int batch_size, hipStream_t stream);
-    void launch_attention_all_heads(const float* q, const int16_t* k_cache, const int16_t* v_cache, float* output, int n_head, int n_head_kv, int head_dim, int seq_len, int max_seq, float scale, hipStream_t stream);
-    void launch_attention_all_heads_batch(const float* q, const int16_t* kv_k, const int16_t* kv_v, float* output, const int* positions, int n_head, int n_head_kv, int head_dim, int max_seq, float scale, int batch_size, int kv_stride, hipStream_t stream);
+    void launch_flash_attention(const float* q, const int16_t* k_cache, const int16_t* v_cache, float* output, int n_head, int n_head_kv, int head_dim, int seq_len, int max_seq, float scale, hipStream_t stream);
+    void launch_flash_attention_batch(const float* q, const int16_t* kv_k, const int16_t* kv_v, float* output, const int* positions, int n_head, int n_head_kv, int head_dim, int max_seq, float scale, int batch_size, int kv_stride, hipStream_t stream);
     void launch_rope(float* q, float* k, int head_dim, int n_head, int n_head_kv, int position, float theta, hipStream_t stream);
     void launch_store_kv(const float* k, const float* v, int16_t* kv_k, int16_t* kv_v, int pos, int n_head_kv, int head_dim, int max_seq, hipStream_t stream);
 
@@ -134,7 +134,7 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
         size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
         launch_store_kv(state->k_buf, state->v_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
                         pos, cfg.n_head_kv, head_dim, m->max_seq_len, stream);
-        launch_attention_all_heads(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+        launch_flash_attention(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
                                    state->attn_out, cfg.n_head, cfg.n_head_kv, head_dim, pos+1, m->max_seq_len, scale, stream);
 
         // wo: attn_out → BF16 (can't fuse — attention outputs FP32)
@@ -210,7 +210,7 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
 
         int max_pos = 0;
         for (int s = 0; s < B; s++) max_pos = std::max(max_pos, state->positions[s]);
-        launch_attention_all_heads_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+        launch_flash_attention_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
             state->attn_out, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
             max_pos + 1, scale, B, 0, stream);
 

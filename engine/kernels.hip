@@ -766,3 +766,249 @@ void launch_store_kv_batch(const float* k, const float* v,
         k, v, kv_k, kv_v, positions, kv_dim, max_seq, batch_size);
 }
 }
+
+// ============================================================================
+// Flash Attention v2 — tiled KV, O(1) shared memory, BF16 KV cache
+// Tc=128 tile, 128 threads = head_dim, ~34 KB LDS (constant, no seq_len dep)
+// ============================================================================
+#define FA_TC 128  // KV tile size
+
+__global__ void flash_attention_kernel(
+    const float* __restrict__ q,
+    const int16_t* __restrict__ k_cache,
+    const int16_t* __restrict__ v_cache,
+    float* __restrict__ output,
+    int seq_len, int n_head_kv, int head_dim,
+    int gqa_ratio, float scale)
+{
+    const int head = blockIdx.x;
+    const int kv_head = head / gqa_ratio;
+    const int tid = threadIdx.x;  // 0..head_dim-1 (128)
+    const int kv_stride = n_head_kv * head_dim;
+
+    extern __shared__ float smem_fa_raw[];
+    char* smem = (char*)smem_fa_raw;
+    float*   q_s     = (float*)smem;                                     // [head_dim]
+    int16_t* kv_tile = (int16_t*)(smem + head_dim * sizeof(float));      // [FA_TC][head_dim]
+    float*   scores  = (float*)(smem + head_dim * 4 + FA_TC * head_dim * 2); // [FA_TC]
+    float*   warp_r  = scores + FA_TC;                                    // [4]
+
+    // Load Q once
+    q_s[tid] = q[head * head_dim + tid];
+    __syncthreads();
+
+    // Online softmax accumulators (per-thread, in registers)
+    float O_acc = 0.0f;
+    float m_prev = -1e30f;
+    float l_prev = 0.0f;
+
+    int n_tiles = (seq_len + FA_TC - 1) / FA_TC;
+
+    for (int tile = 0; tile < n_tiles; tile++) {
+        int t_start = tile * FA_TC;
+        int t_len = min(FA_TC, seq_len - t_start);
+
+        // Phase A: Load K tile [t_len][head_dim] as BF16 into LDS
+        int total = t_len * head_dim;
+        for (int i = tid; i < total; i += blockDim.x) {
+            int row = i / head_dim, col = i % head_dim;
+            kv_tile[i] = k_cache[(t_start + row) * kv_stride + kv_head * head_dim + col];
+        }
+        __syncthreads();
+
+        // Phase A: Compute Q·K^T scores — 1 thread per KV position
+        float s = -1e30f;
+        if (tid < t_len) {
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++)
+                dot += q_s[d] * bf16_to_float(kv_tile[tid * head_dim + d]);
+            s = dot * scale;
+        }
+        scores[tid] = s;
+
+        // Tile max via warp shuffle (2 wavefronts of 64)
+        float t_max = s;
+        int lane = tid & 63, wid = tid >> 6;
+        for (int off = 32; off > 0; off >>= 1)
+            t_max = fmaxf(t_max, __shfl_xor(t_max, off, 64));
+        if (lane == 0) warp_r[wid] = t_max;
+        __syncthreads();
+        if (tid == 0) warp_r[0] = fmaxf(warp_r[0], warp_r[1]);
+        __syncthreads();
+        t_max = warp_r[0];
+
+        float m_new = fmaxf(m_prev, t_max);
+
+        // Exp + sum
+        float p = (tid < t_len) ? expf(scores[tid] - m_new) : 0.0f;
+        scores[tid] = p;  // store for V accumulation
+
+        float p_sum = p;
+        for (int off = 32; off > 0; off >>= 1)
+            p_sum += __shfl_xor(p_sum, off, 64);
+        if (lane == 0) warp_r[wid] = p_sum;
+        __syncthreads();
+        if (tid == 0) warp_r[0] += warp_r[1];
+        __syncthreads();
+        p_sum = warp_r[0];
+
+        // Rescale previous accumulator
+        float correction = expf(m_prev - m_new);
+        O_acc *= correction;
+        float l_new = correction * l_prev + p_sum;
+
+        __syncthreads();
+
+        // Phase B: Load V tile (reuses kv_tile LDS region)
+        for (int i = tid; i < total; i += blockDim.x) {
+            int row = i / head_dim, col = i % head_dim;
+            kv_tile[i] = v_cache[(t_start + row) * kv_stride + kv_head * head_dim + col];
+        }
+        __syncthreads();
+
+        // Phase B: Accumulate P·V — thread tid handles output dim tid
+        float pv = 0.0f;
+        for (int t = 0; t < t_len; t++)
+            pv += scores[t] * bf16_to_float(kv_tile[t * head_dim + tid]);
+        O_acc += pv;
+
+        m_prev = m_new;
+        l_prev = l_new;
+        __syncthreads();
+    }
+
+    // Final normalization
+    output[head * head_dim + tid] = O_acc / l_prev;
+}
+
+// Flash Attention Batch — B sequences × N heads
+__global__ void flash_attention_batch_kernel(
+    const float* __restrict__ q,
+    const int16_t* __restrict__ kv_cache_k,
+    const int16_t* __restrict__ kv_cache_v,
+    float* __restrict__ output,
+    const int* __restrict__ positions,
+    int n_head, int n_head_kv, int head_dim,
+    int max_seq, int gqa_ratio, float scale,
+    int kv_stride_batch)
+{
+    const int head = blockIdx.x;
+    const int seq = blockIdx.y;
+    const int kv_head = head / gqa_ratio;
+    const int tid = threadIdx.x;
+    const int kv_stride = n_head_kv * head_dim;
+    const int seq_len = positions[seq] + 1;
+    const int n_total = n_head * head_dim;
+
+    extern __shared__ float smem_fa_raw[];
+    char* smem = (char*)smem_fa_raw;
+    float*   q_s     = (float*)smem;
+    int16_t* kv_tile = (int16_t*)(smem + head_dim * sizeof(float));
+    float*   scores  = (float*)(smem + head_dim * 4 + FA_TC * head_dim * 2);
+    float*   warp_r  = scores + FA_TC;
+
+    // KV cache offset for this sequence
+    const int16_t* k_base = kv_cache_k + (size_t)seq * kv_stride_batch;
+    const int16_t* v_base = kv_cache_v + (size_t)seq * kv_stride_batch;
+
+    q_s[tid] = q[seq * n_total + head * head_dim + tid];
+    __syncthreads();
+
+    float O_acc = 0.0f, m_prev = -1e30f, l_prev = 0.0f;
+    int n_tiles = (seq_len + FA_TC - 1) / FA_TC;
+
+    for (int tile = 0; tile < n_tiles; tile++) {
+        int t_start = tile * FA_TC;
+        int t_len = min(FA_TC, seq_len - t_start);
+        int total = t_len * head_dim;
+
+        // Load K tile
+        for (int i = tid; i < total; i += blockDim.x) {
+            int row = i / head_dim, col = i % head_dim;
+            kv_tile[i] = k_base[(t_start + row) * kv_stride + kv_head * head_dim + col];
+        }
+        __syncthreads();
+
+        float s = -1e30f;
+        if (tid < t_len) {
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++)
+                dot += q_s[d] * bf16_to_float(kv_tile[tid * head_dim + d]);
+            s = dot * scale;
+        }
+        scores[tid] = s;
+
+        float t_max = s;
+        int lane = tid & 63, wid = tid >> 6;
+        for (int off = 32; off > 0; off >>= 1)
+            t_max = fmaxf(t_max, __shfl_xor(t_max, off, 64));
+        if (lane == 0) warp_r[wid] = t_max;
+        __syncthreads();
+        if (tid == 0) warp_r[0] = fmaxf(warp_r[0], warp_r[1]);
+        __syncthreads();
+        t_max = warp_r[0];
+        float m_new = fmaxf(m_prev, t_max);
+
+        float p = (tid < t_len) ? expf(scores[tid] - m_new) : 0.0f;
+        scores[tid] = p;
+        float p_sum = p;
+        for (int off = 32; off > 0; off >>= 1)
+            p_sum += __shfl_xor(p_sum, off, 64);
+        if (lane == 0) warp_r[wid] = p_sum;
+        __syncthreads();
+        if (tid == 0) warp_r[0] += warp_r[1];
+        __syncthreads();
+        p_sum = warp_r[0];
+
+        float correction = expf(m_prev - m_new);
+        O_acc *= correction;
+        float l_new = correction * l_prev + p_sum;
+        __syncthreads();
+
+        // Load V tile
+        for (int i = tid; i < total; i += blockDim.x) {
+            int row = i / head_dim, col = i % head_dim;
+            kv_tile[i] = v_base[(t_start + row) * kv_stride + kv_head * head_dim + col];
+        }
+        __syncthreads();
+
+        float pv = 0.0f;
+        for (int t = 0; t < t_len; t++)
+            pv += scores[t] * bf16_to_float(kv_tile[t * head_dim + tid]);
+        O_acc += pv;
+
+        m_prev = m_new;
+        l_prev = l_new;
+        __syncthreads();
+    }
+
+    output[seq * n_total + head * head_dim + tid] = O_acc / l_prev;
+}
+
+extern "C" {
+void launch_flash_attention(const float* q, const int16_t* k_cache, const int16_t* v_cache,
+    float* output, int n_head, int n_head_kv, int head_dim, int seq_len, int max_seq,
+    float scale, hipStream_t stream)
+{
+    int gqa_ratio = n_head / n_head_kv;
+    int threads = head_dim;  // 128 for Mistral
+    int smem = head_dim * 4 + FA_TC * head_dim * 2 + FA_TC * 4 + 16;
+    flash_attention_kernel<<<n_head, threads, smem, stream>>>(
+        q, k_cache, v_cache, output, seq_len, n_head_kv, head_dim, gqa_ratio, scale);
+}
+
+void launch_flash_attention_batch(const float* q, const int16_t* kv_k, const int16_t* kv_v,
+    float* output, const int* positions,
+    int n_head, int n_head_kv, int head_dim,
+    int max_seq, float scale, int batch_size, int kv_stride,
+    hipStream_t stream)
+{
+    int gqa_ratio = n_head / n_head_kv;
+    int threads = head_dim;
+    int smem = head_dim * 4 + FA_TC * head_dim * 2 + FA_TC * 4 + 16;
+    dim3 grid(n_head, batch_size);
+    flash_attention_batch_kernel<<<grid, threads, smem, stream>>>(
+        q, kv_k, kv_v, output, positions, n_head, n_head_kv, head_dim,
+        max_seq, gqa_ratio, scale, kv_stride);
+}
+}

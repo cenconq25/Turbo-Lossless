@@ -34,7 +34,7 @@ int main(int argc, char** argv) {
     printf("Prompt tokens: %zu\n", prompt_tokens.size());
 
     // Create inference state
-    InferenceState* state = create_inference_state(model, batch_size, 2048);
+    InferenceState* state = create_inference_state(model, batch_size, model->max_seq_len);
     if (batch_size > 1) printf("Batch size: %d\n", batch_size);
     if (!state) { fprintf(stderr, "Failed to create inference state\n"); return 1; }
 

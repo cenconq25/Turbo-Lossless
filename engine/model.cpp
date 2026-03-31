@@ -225,7 +225,11 @@ Model* load_model(const std::string& model_path, int device_id) {
 
     // Allocate KV cache
     int head_dim = cfg.n_embd / cfg.n_head;
-    m->max_seq_len = 2048;  // default, can be changed
+    // Max context length — configurable via TURBO_CTX env var (default 2048)
+    const char* ctx_env = getenv("TURBO_CTX");
+    m->max_seq_len = ctx_env ? atoi(ctx_env) : 2048;
+    if (m->max_seq_len < 128) m->max_seq_len = 128;
+    printf("  Context length: %d\n", m->max_seq_len);
     size_t kv_size = (size_t)cfg.n_layer * m->max_seq_len * cfg.n_head_kv * head_dim;
     hipMalloc(&m->kv_cache_k, kv_size * sizeof(int16_t));
     hipMalloc(&m->kv_cache_v, kv_size * sizeof(int16_t));
