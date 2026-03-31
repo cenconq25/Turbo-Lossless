@@ -345,15 +345,24 @@ __global__ void structured12_matvec_batch4_scan(
     __shared__ int esc_scan[WORKGROUP_SIZE];
 
     // Phase 1: count escapes (group==0 in structured12 format)
-    int64_t bp_start = (int64_t)row * K * 12 + (int64_t)tid * 12;
+    // 32-bit bp to avoid int64 overhead in hot loop
+    const uint32_t* row_packed = packed + (int64_t)row * K * 12 / 32;
+    int bp_start = (int)((int64_t)row * K * 12 % 32) + tid * 12;
+    const int stride = WORKGROUP_SIZE * 12;
     int my_esc = 0;
-    { int64_t bp_s = bp_start; int c = tid;
+    { int bp_s = bp_start; int c = tid;
       for (; c + WORKGROUP_SIZE < K; c += WORKGROUP_SIZE * 2) {
-          if ((read12(packed, bp_s) >> 8) == 0) my_esc++;
-          if ((read12(packed, bp_s + (int64_t)(WORKGROUP_SIZE * 12)) >> 8) == 0) my_esc++;
-          bp_s += (int64_t)(WORKGROUP_SIZE * 2 * 12);
+          int w0 = bp_s >> 5; int s0 = bp_s & 31;
+          uint32_t r0 = (uint32_t)(((uint64_t)row_packed[w0] | ((uint64_t)row_packed[w0+1] << 32)) >> s0) & 0xFFF;
+          int w1 = (bp_s+stride) >> 5; int s1 = (bp_s+stride) & 31;
+          uint32_t r1 = (uint32_t)(((uint64_t)row_packed[w1] | ((uint64_t)row_packed[w1+1] << 32)) >> s1) & 0xFFF;
+          if ((r0 >> 8) == 0) my_esc++;
+          if ((r1 >> 8) == 0) my_esc++;
+          bp_s += stride * 2;
       }
-      if (c < K) { if ((read12(packed, bp_s) >> 8) == 0) my_esc++; }
+      if (c < K) { int w0 = bp_s >> 5; int s0 = bp_s & 31;
+          uint32_t r0 = (uint32_t)(((uint64_t)row_packed[w0] | ((uint64_t)row_packed[w0+1] << 32)) >> s0) & 0xFFF;
+          if ((r0 >> 8) == 0) my_esc++; }
     }
     esc_scan[tid] = my_esc;
     __syncthreads();
@@ -361,34 +370,37 @@ __global__ void structured12_matvec_batch4_scan(
     __syncthreads();
     int esc_ptr = escape_row_base[row] + esc_scan[tid];
 
-    // Phase 2: FMA with structured12 decode
-    int64_t bp = bp_start;
+    // Phase 2: FMA with structured12 decode — 32-bit bp
+    int bp = bp_start;
     float s0a=0,s0b=0,s1a=0,s1b=0,s2a=0,s2b=0,s3a=0,s3b=0;
 
     int col = tid;
     for (; col + WORKGROUP_SIZE < K; col += WORKGROUP_SIZE * 2) {
-        uint32_t raw0 = read12(packed, bp);
-        uint32_t raw1 = read12(packed, bp + (int64_t)(WORKGROUP_SIZE * 12));
+        int w0i = bp >> 5; int s0i = bp & 31;
+        int w1i = (bp+stride) >> 5; int s1i = (bp+stride) & 31;
+        uint32_t raw0 = (uint32_t)(((uint64_t)row_packed[w0i] | ((uint64_t)row_packed[w0i+1] << 32)) >> s0i) & 0xFFF;
+        uint32_t raw1 = (uint32_t)(((uint64_t)row_packed[w1i] | ((uint64_t)row_packed[w1i+1] << 32)) >> s1i) & 0xFFF;
         uint32_t g0 = raw0 >> 8, g1 = raw1 >> 8;
-        float w0 = (__builtin_expect(g0 != 0, 1))
+        float wt0 = (__builtin_expect(g0 != 0, 1))
             ? structured12_decode(raw0, base_exp) : bf16_to_float(escape_vals[esc_ptr++]);
-        float w1 = (__builtin_expect(g1 != 0, 1))
+        float wt1 = (__builtin_expect(g1 != 0, 1))
             ? structured12_decode(raw1, base_exp) : bf16_to_float(escape_vals[esc_ptr++]);
-        s0a += w0 * bf16_to_float(act0[col]);  s0b += w1 * bf16_to_float(act0[col + WORKGROUP_SIZE]);
-        s1a += w0 * bf16_to_float(act1[col]);  s1b += w1 * bf16_to_float(act1[col + WORKGROUP_SIZE]);
-        s2a += w0 * bf16_to_float(act2[col]);  s2b += w1 * bf16_to_float(act2[col + WORKGROUP_SIZE]);
-        s3a += w0 * bf16_to_float(act3[col]);  s3b += w1 * bf16_to_float(act3[col + WORKGROUP_SIZE]);
-        bp += (int64_t)(WORKGROUP_SIZE * 2 * 12);
+        s0a += wt0 * bf16_to_float(act0[col]);  s0b += wt1 * bf16_to_float(act0[col + WORKGROUP_SIZE]);
+        s1a += wt0 * bf16_to_float(act1[col]);  s1b += wt1 * bf16_to_float(act1[col + WORKGROUP_SIZE]);
+        s2a += wt0 * bf16_to_float(act2[col]);  s2b += wt1 * bf16_to_float(act2[col + WORKGROUP_SIZE]);
+        s3a += wt0 * bf16_to_float(act3[col]);  s3b += wt1 * bf16_to_float(act3[col + WORKGROUP_SIZE]);
+        bp += stride * 2;
     }
     if (col < K) {
-        uint32_t raw = read12(packed, bp);
+        int wi = bp >> 5; int si = bp & 31;
+        uint32_t raw = (uint32_t)(((uint64_t)row_packed[wi] | ((uint64_t)row_packed[wi+1] << 32)) >> si) & 0xFFF;
         uint32_t g = raw >> 8;
-        float w = (__builtin_expect(g != 0, 1))
+        float wt = (__builtin_expect(g != 0, 1))
             ? structured12_decode(raw, base_exp) : bf16_to_float(escape_vals[esc_ptr++]);
-        s0a += w * bf16_to_float(act0[col]);
-        s1a += w * bf16_to_float(act1[col]);
-        s2a += w * bf16_to_float(act2[col]);
-        s3a += w * bf16_to_float(act3[col]);
+        s0a += wt * bf16_to_float(act0[col]);
+        s1a += wt * bf16_to_float(act1[col]);
+        s2a += wt * bf16_to_float(act2[col]);
+        s3a += wt * bf16_to_float(act3[col]);
     }
 
     BATCH4_REDUCE_BODY()
@@ -1501,48 +1513,53 @@ __global__ void structured12_matvec_batch8(
     for (int w = 0; w < warp_id; w++) cross += warp_esc_totals[w];
     int esc_ptr = escape_row_base[row] + cross + prefix;
 
-    // Main FMA loop — NO LDS codebook, pure arithmetic decode
-    int64_t bp = (int64_t)row * K * 12 + (int64_t)tid * 12;
+    // Main FMA loop — 32-bit bp to avoid int64 overhead in hot loop
+    const uint32_t* row_packed = packed + (int64_t)row * K * 12 / 32;
+    int bp = (int)((int64_t)row * K * 12 % 32) + tid * 12;
+    const int stride = WORKGROUP_SIZE * 12;
     float s0a=0,s0b=0,s1a=0,s1b=0,s2a=0,s2b=0,s3a=0,s3b=0;
     float s4a=0,s4b=0,s5a=0,s5b=0,s6a=0,s6b=0,s7a=0,s7b=0;
 
     int col = tid;
     for (; col + WORKGROUP_SIZE < K; col += WORKGROUP_SIZE * 2) {
-        uint32_t raw0 = read12(packed, bp);
-        uint32_t raw1 = read12(packed, bp + (int64_t)(WORKGROUP_SIZE * 12));
+        int w0i = bp >> 5; int s0i = bp & 31;
+        int w1i = (bp+stride) >> 5; int s1i = (bp+stride) & 31;
+        uint32_t raw0 = (uint32_t)(((uint64_t)row_packed[w0i] | ((uint64_t)row_packed[w0i+1] << 32)) >> s0i) & 0xFFF;
+        uint32_t raw1 = (uint32_t)(((uint64_t)row_packed[w1i] | ((uint64_t)row_packed[w1i+1] << 32)) >> s1i) & 0xFFF;
 
         uint32_t g0 = raw0 >> 8, g1 = raw1 >> 8;
-        float w0 = (__builtin_expect(g0 != 0, 1))
+        float wt0 = (__builtin_expect(g0 != 0, 1))
             ? structured12_decode(raw0, base_exp)
             : bf16_to_float(escape_vals[esc_ptr++]);
-        float w1 = (__builtin_expect(g1 != 0, 1))
+        float wt1 = (__builtin_expect(g1 != 0, 1))
             ? structured12_decode(raw1, base_exp)
             : bf16_to_float(escape_vals[esc_ptr++]);
 
-        s0a += w0 * bf16_to_float(act0[col]);  s0b += w1 * bf16_to_float(act0[col + WORKGROUP_SIZE]);
-        s1a += w0 * bf16_to_float(act1[col]);  s1b += w1 * bf16_to_float(act1[col + WORKGROUP_SIZE]);
-        s2a += w0 * bf16_to_float(act2[col]);  s2b += w1 * bf16_to_float(act2[col + WORKGROUP_SIZE]);
-        s3a += w0 * bf16_to_float(act3[col]);  s3b += w1 * bf16_to_float(act3[col + WORKGROUP_SIZE]);
-        s4a += w0 * bf16_to_float(act4[col]);  s4b += w1 * bf16_to_float(act4[col + WORKGROUP_SIZE]);
-        s5a += w0 * bf16_to_float(act5[col]);  s5b += w1 * bf16_to_float(act5[col + WORKGROUP_SIZE]);
-        s6a += w0 * bf16_to_float(act6[col]);  s6b += w1 * bf16_to_float(act6[col + WORKGROUP_SIZE]);
-        s7a += w0 * bf16_to_float(act7[col]);  s7b += w1 * bf16_to_float(act7[col + WORKGROUP_SIZE]);
-        bp += (int64_t)(WORKGROUP_SIZE * 2 * 12);
+        s0a += wt0 * bf16_to_float(act0[col]);  s0b += wt1 * bf16_to_float(act0[col + WORKGROUP_SIZE]);
+        s1a += wt0 * bf16_to_float(act1[col]);  s1b += wt1 * bf16_to_float(act1[col + WORKGROUP_SIZE]);
+        s2a += wt0 * bf16_to_float(act2[col]);  s2b += wt1 * bf16_to_float(act2[col + WORKGROUP_SIZE]);
+        s3a += wt0 * bf16_to_float(act3[col]);  s3b += wt1 * bf16_to_float(act3[col + WORKGROUP_SIZE]);
+        s4a += wt0 * bf16_to_float(act4[col]);  s4b += wt1 * bf16_to_float(act4[col + WORKGROUP_SIZE]);
+        s5a += wt0 * bf16_to_float(act5[col]);  s5b += wt1 * bf16_to_float(act5[col + WORKGROUP_SIZE]);
+        s6a += wt0 * bf16_to_float(act6[col]);  s6b += wt1 * bf16_to_float(act6[col + WORKGROUP_SIZE]);
+        s7a += wt0 * bf16_to_float(act7[col]);  s7b += wt1 * bf16_to_float(act7[col + WORKGROUP_SIZE]);
+        bp += stride * 2;
     }
     if (col < K) {
-        uint32_t raw = read12(packed, bp);
+        int wi = bp >> 5; int si = bp & 31;
+        uint32_t raw = (uint32_t)(((uint64_t)row_packed[wi] | ((uint64_t)row_packed[wi+1] << 32)) >> si) & 0xFFF;
         uint32_t g = raw >> 8;
-        float w = (__builtin_expect(g != 0, 1))
+        float wt = (__builtin_expect(g != 0, 1))
             ? structured12_decode(raw, base_exp)
             : bf16_to_float(escape_vals[esc_ptr++]);
-        s0a += w * bf16_to_float(act0[col]);
-        s1a += w * bf16_to_float(act1[col]);
-        s2a += w * bf16_to_float(act2[col]);
-        s3a += w * bf16_to_float(act3[col]);
-        s4a += w * bf16_to_float(act4[col]);
-        s5a += w * bf16_to_float(act5[col]);
-        s6a += w * bf16_to_float(act6[col]);
-        s7a += w * bf16_to_float(act7[col]);
+        s0a += wt * bf16_to_float(act0[col]);
+        s1a += wt * bf16_to_float(act1[col]);
+        s2a += wt * bf16_to_float(act2[col]);
+        s3a += wt * bf16_to_float(act3[col]);
+        s4a += wt * bf16_to_float(act4[col]);
+        s5a += wt * bf16_to_float(act5[col]);
+        s6a += wt * bf16_to_float(act6[col]);
+        s7a += wt * bf16_to_float(act7[col]);
     }
 
     // Warp reduction + output
