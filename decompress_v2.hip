@@ -278,8 +278,7 @@ __global__ void fixed12_matvec_batch2(
         out3[row] = warp_sums[12]+warp_sums[13]+warp_sums[14]+warp_sums[15]; \
     }
 
-// Fast batch4: uses uint8 escape counts + shared-memory prefix sum (9KB LDS)
-// Reads 361 MB count table instead of scanning 10 GB packed data
+// Fast batch4: LDS codebook (8KB, 1-cycle access)
 __launch_bounds__(WORKGROUP_SIZE)
 __global__ void fixed12_matvec_batch4(
     const uint32_t* __restrict__ packed,
@@ -300,19 +299,17 @@ __global__ void fixed12_matvec_batch4(
     __shared__ int warp_esc_totals[4];
     for (int i = tid; i < 4096; i += WORKGROUP_SIZE) cb[i] = codebook[i];
 
-    // Load escape count (1 byte, coalesced) and compute prefix sum via warp shuffles
+    // Escape count prefix sum (same as before)
     int my_count = (int)escape_counts[row * WORKGROUP_SIZE + tid];
     int lane = tid & (WARP_SIZE - 1);
     int warp_id = tid >> 6;
-    // Warp-level inclusive prefix sum (Hillis-Steele)
     int prefix = my_count;
     for (int off = 1; off < WARP_SIZE; off <<= 1) {
         int v = __shfl_up(prefix, off, WARP_SIZE);
         if (lane >= off) prefix += v;
     }
     int warp_total = __shfl(prefix, WARP_SIZE - 1, WARP_SIZE);
-    prefix -= my_count;  // exclusive
-    // Cross-warp prefix sum
+    prefix -= my_count;
     if (lane == WARP_SIZE - 1) warp_esc_totals[warp_id] = warp_total;
     __syncthreads();
     int cross = 0;

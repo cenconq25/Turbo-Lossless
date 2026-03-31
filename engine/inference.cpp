@@ -10,6 +10,7 @@ extern "C" {
     // Batched ops
     void launch_rms_norm_batch(const float* x, const float* weight, float* y, int n, float eps, int batch_size, hipStream_t stream);
     void launch_rms_norm_bf16_batch(const float* x, const float* weight, int16_t* y, int n, float eps, int batch_size, hipStream_t stream);
+    void launch_add_rms_norm_bf16_batch(float* x, const float* residual, const float* weight, int16_t* y, int n, float eps, int batch_size, hipStream_t stream);
     void launch_silu_mul_batch(const float* gate, const float* up, float* out, int n, int batch_size, hipStream_t stream);
     void launch_silu_mul_bf16_batch(const float* gate, const float* up, int16_t* out, int n, int batch_size, hipStream_t stream);
     void launch_add_batch(float* y, const float* x, int n, int batch_size, hipStream_t stream);
@@ -147,10 +148,9 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
         // wo: attn_out → BF16 (can't fuse — attention outputs FP32)
         launch_fp32_to_bf16(state->attn_out, bf16_a, n, stream);
         MATVEC_B1(L.wo, bf16_a, res);
-        launch_add_batch(res, cur, n, 1, stream);
 
-        // Fused RMSNorm → BF16 for gate/up input (saves 1 launch)
-        launch_rms_norm_bf16_batch(res, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
+        // Fused add + RMSNorm → BF16 (res += cur, then bf16_a = norm(res))
+        launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
         MATVEC_B1(L.w_gate, bf16_a, state->ffn_gate);
         MATVEC_B1(L.w_up, bf16_a, state->ffn_up);
 
@@ -233,10 +233,8 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
             L.wo.escape_row_base, L.wo.escape_counts, L.wo.escape_vals,
             SEQ(res,0,n), SEQ(res,1,n), SEQ(res,2,n), SEQ(res,3,n),
             L.wo.M, L.wo.K, stream);
-        launch_add_batch(res, cur, n, B, stream);
-
-        // Fused RMSNorm → BF16 for gate/up (saves 1 launch)
-        launch_rms_norm_bf16_batch(res, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, B, stream);
+        // Fused add + RMSNorm → BF16 (res += cur, then bf16_a = norm(res))
+        launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, B, stream);
         launch_fixed12_batch4_async(L.w_gate.packed, L.w_gate.codebook,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.w_gate.escape_row_base, L.w_gate.escape_counts, L.w_gate.escape_vals,

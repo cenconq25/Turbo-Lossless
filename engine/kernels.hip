@@ -417,6 +417,46 @@ __global__ void rms_norm_bf16_batch_kernel(
 }
 
 // ============================================================
+// Fused Add + RMSNorm → BF16: y = bf16(rms_norm(x + residual, weight))
+// Replaces add_batch + rms_norm_bf16_batch (saves 1 launch + 1 read/write pass)
+// Also writes the FP32 sum back to x for the residual path
+// ============================================================
+__global__ void add_rms_norm_bf16_batch_kernel(
+    float* __restrict__ x,             // [batch_size * n] FP32 — gets x += residual IN PLACE
+    const float* __restrict__ residual, // [batch_size * n] FP32
+    const float* __restrict__ weight,   // [n]
+    int16_t* __restrict__ y,           // [batch_size * n] BF16 output
+    int n, float eps, int batch_size)
+{
+    int batch = blockIdx.x;
+    if (batch >= batch_size) return;
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int offset = batch * n;
+
+    // Pass 1: add residual and compute sum of squares
+    float sum_sq = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) {
+        float v = x[offset + i] + residual[offset + i];
+        x[offset + i] = v;  // write back sum for residual path
+        sum_sq += v * v;
+    }
+    sdata[tid] = sum_sq;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float rms = rsqrtf(sdata[0] / n + eps);
+    __syncthreads();
+
+    // Pass 2: normalize, scale, convert to BF16
+    for (int i = tid; i < n; i += blockDim.x) {
+        y[offset + i] = float_to_bf16(x[offset + i] * rms * weight[i]);
+    }
+}
+
+// ============================================================
 // Fused SiLU(gate) * up → BF16 output
 // ============================================================
 __global__ void silu_mul_bf16_batch_kernel(
@@ -447,6 +487,13 @@ void launch_rms_norm_bf16_batch(const float* x, const float* weight, int16_t* y,
     int threads = 256;
     rms_norm_bf16_batch_kernel<<<batch_size, threads, threads * sizeof(float), stream>>>(
         x, weight, y, n, eps, batch_size);
+}
+
+void launch_add_rms_norm_bf16_batch(float* x, const float* residual, const float* weight,
+                                     int16_t* y, int n, float eps, int batch_size, hipStream_t stream) {
+    int threads = 256;
+    add_rms_norm_bf16_batch_kernel<<<batch_size, threads, threads * sizeof(float), stream>>>(
+        x, residual, weight, y, n, eps, batch_size);
 }
 
 void launch_silu_mul_batch(const float* gate, const float* up, float* out,
