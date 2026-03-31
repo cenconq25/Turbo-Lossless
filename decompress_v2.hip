@@ -1380,7 +1380,7 @@ __global__ void structured12_matvec_batch4(
         s1a += wt0 * bf16_to_float(act1[col]);  s1b += wt1 * bf16_to_float(act1[col + WORKGROUP_SIZE]);
         s2a += wt0 * bf16_to_float(act2[col]);  s2b += wt1 * bf16_to_float(act2[col + WORKGROUP_SIZE]);
         s3a += wt0 * bf16_to_float(act3[col]);  s3b += wt1 * bf16_to_float(act3[col + WORKGROUP_SIZE]);
-        base_ptr += 768;  // stride*2 / 32 * 4 = 2*384
+        base_ptr += 768;
     }
     if (col < K) {
         uint32_t raw = (uint32_t)(*(const uint64_t*)(base_ptr) >> shift) & 0xFFF;
