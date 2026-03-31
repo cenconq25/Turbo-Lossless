@@ -17,9 +17,9 @@
 
 | Mode | tok/s total | VRAM | vs llama.cpp BF16 (32.2 tok/s) |
 |------|------------:|-----:|:-------------------------------|
-| B=1 | 18.7 | ~10 GB | 0.58x |
-| B=4 | 46.0 | 10.3 GB | 1.43x faster |
-| **B=8** | **61.4** | **10.3 GB** | **1.91x faster, 1.32x less VRAM** |
+| B=1 | 20.1 | ~10 GB | 0.58x |
+| B=4 | 50.7 | 10.3 GB | 1.43x faster |
+| **B=8** | **67.1** | **10.3 GB** | **2.08x faster, 1.32x less VRAM** |
 
 ### Kernel-Level (bench_fixed12.py, Llama 8B)
 

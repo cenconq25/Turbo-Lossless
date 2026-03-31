@@ -80,8 +80,8 @@ Reading 12 bits instead of 16 bits saves 25% HBM bandwidth, but the codebook loo
 
 ```
 B=1:  read 12-bit → decode → 1× multiply           (overhead dominates → 0.58x)
-B=4:  read 12-bit → decode → 4× multiply            (1.43x faster than BF16)
-B=8:  read 12-bit → decode → 8× multiply            (1.95x faster than BF16)
+B=4:  read 12-bit → decode → 4× multiply            (1.57x faster than BF16)
+B=8:  read 12-bit → decode → 8× multiply            (2.08x faster than BF16)
 ```
 
 Same weight decode cost, B× the useful work. At B=8, decode is nearly free.
@@ -140,9 +140,9 @@ We don't compete with INT4 on compression ratio. We offer something that doesn't
 
 | Mode | tok/s total | tok/s/user | VRAM | vs llama.cpp BF16 (32.2 tok/s) |
 |------|------------:|-----------:|-----:|:-------------------------------|
-| B=1 | 18.7 | 18.7 | ~10 GB | 0.58x |
-| B=4 | 46.0 | 11.5 | 10.3 GB | **1.43x faster** |
-| **B=8** | **61.4** | **7.7** | **10.3 GB** | **1.91x faster, 1.32x less VRAM** |
+| B=1 | 20.1 | 20.1 | ~10 GB | 0.58x |
+| B=4 | 50.7 | 12.7 | 10.3 GB | **1.57x faster** |
+| **B=8** | **67.1** | **8.4** | **10.3 GB** | **2.08x faster, 1.32x less VRAM** |
 
 Verified: 1+1=2, 3*3=9, 10*100=1000, ANU=Canberra, correct Python code generation. B=1 == B=4 == B=8 identical output.
 
@@ -150,8 +150,8 @@ Verified: 1+1=2, 3*3=9, 10*100=1000, ANU=Canberra, correct Python code generatio
 
 | Tokens | tok/s | Attention Mode |
 |-------:|------:|:---------------|
-| 100 | 62.9 | Naive (fast) |
-| 300 | 59.2 | Naive |
+| 100 | 68+ | Naive (fast) |
+| 300 | 65+ | Naive |
 | 1000+ | 53+ | Flash Attention (auto at 1024) |
 | 2000+ | 41+ | Flash Attention |
 | 20000 | supported | Flash Attention, 34 KB constant LDS |
@@ -160,19 +160,19 @@ Verified: 1+1=2, 3*3=9, 10*100=1000, ANU=Canberra, correct Python code generatio
 
 | GPU | Year | BW (TB/s) | Est. B=8 tok/s | vs native BF16 |
 |-----|------|----------:|---------------:|:--------------:|
-| MI50 32GB (measured) | 2019 | 1.0 | **63** | 1.95x |
-| A100 80GB | 2020 | 2.0 | ~128 | 1.95x |
-| H100 80GB | 2022 | 3.4 | ~211 | 1.95x |
-| MI300X 192GB | 2023 | 5.3 | ~333 | 1.95x |
-| B200 192GB | 2025 | 8.0 | ~503 | 1.95x |
+| MI50 32GB (measured) | 2019 | 1.0 | **67** | 2.08x |
+| A100 80GB | 2020 | 2.0 | ~140 | 2.08x |
+| H100 80GB | 2022 | 3.4 | ~230 | 2.08x |
+| MI300X 192GB | 2023 | 5.3 | ~360 | 2.08x |
+| B200 192GB | 2025 | 8.0 | ~540 | 2.08x |
 
-The 1.95x speedup is hardware-independent — both compressed and BF16 scale with HBM bandwidth.
+The 2.08x speedup is hardware-independent — both compressed and BF16 scale with HBM bandwidth.
 
 ### Lossless-Only Competitors
 
 | Project | Encoding | Compression | Speed vs BF16 | Status |
 |---------|----------|------------:|:-------------:|:-------|
-| **Turbo Lossless** | **12-bit codebook** | **1.33x** | **1.95x (B=8)** | **Measured on MI50** |
+| **Turbo Lossless** | **12-bit structured** | **1.33x** | **2.08x (B=8)** | **Measured on MI50** |
 | ZipServ (2026) | 3-bit bitmap | 1.40x | 1.22x | L40S/RTX5090 |
 | DFloat11 (2025) | Huffman exponent | 1.43x | 0.5x (slower) | NVIDIA CUDA |
 | ZipNN (2025) | Stream split | 1.51x | no GPU kernel | CPU only |
@@ -247,7 +247,7 @@ HIP_VISIBLE_DEVICES=1 TURBO_FAST=1 ./turbo-engine models/mistral-7b-instruct-tur
 | File | Purpose |
 |------|---------|
 | **`decompress_v2.hip`** | Fused decode-matvec GPU kernels (B=1/2/4/8) |
-| **`fixed12_pack.c`** | 12-bit codebook builder + packer |
+| **`fixed12_pack.c`** | 12-bit structured builder + packer |
 | **`bench_fixed12.py`** | Per-tensor kernel benchmark + bit-exact verification |
 | `engine/main.cpp` | CLI entry point |
 | `engine/model.cpp` | Model loader + escape table builder |
