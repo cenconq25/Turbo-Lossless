@@ -1416,25 +1416,33 @@ __global__ void structured12_matvec_v2(
     const int tid = threadIdx.x;
     __shared__ float warp_sums[4];
     float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
-    const int64_t stride = (int64_t)(WORKGROUP_SIZE * 12);
-    int64_t bp = (int64_t)row * K * 12 + (int64_t)tid * 12;
+
+    // Use per-row base pointer to avoid 64-bit arithmetic in hot loop
+    // row_bits = row * K * 12, pre-divided into word offset + bit shift
+    const uint32_t* row_packed = packed + (int64_t)row * K * 12 / 32;
+    int bp = (int)((int64_t)row * K * 12 % 32) + tid * 12;
+    const int stride = WORKGROUP_SIZE * 12;
+
     int col = tid;
-    // 4× unroll: process 4 elements per iteration (more loads in flight)
     for (; col + WORKGROUP_SIZE * 3 < K; col += WORKGROUP_SIZE * 4) {
-        float w0 = structured12_decode(read12(packed, bp), base_exp);
-        float w1 = structured12_decode(read12(packed, bp + stride), base_exp);
-        float w2 = structured12_decode(read12(packed, bp + stride * 2), base_exp);
-        float w3 = structured12_decode(read12(packed, bp + stride * 3), base_exp);
-        sum0 += w0 * bf16_to_float(activations[col]);
-        sum1 += w1 * bf16_to_float(activations[col + WORKGROUP_SIZE]);
-        sum2 += w2 * bf16_to_float(activations[col + WORKGROUP_SIZE * 2]);
-        sum3 += w3 * bf16_to_float(activations[col + WORKGROUP_SIZE * 3]);
+        int w0 = bp >> 5; int s0 = bp & 31;
+        int w1 = (bp + stride) >> 5; int s1 = (bp + stride) & 31;
+        int w2 = (bp + stride*2) >> 5; int s2 = (bp + stride*2) & 31;
+        int w3 = (bp + stride*3) >> 5; int s3 = (bp + stride*3) & 31;
+        uint32_t d0 = (uint32_t)(((uint64_t)row_packed[w0] | ((uint64_t)row_packed[w0+1] << 32)) >> s0) & 0xFFF;
+        uint32_t d1 = (uint32_t)(((uint64_t)row_packed[w1] | ((uint64_t)row_packed[w1+1] << 32)) >> s1) & 0xFFF;
+        uint32_t d2 = (uint32_t)(((uint64_t)row_packed[w2] | ((uint64_t)row_packed[w2+1] << 32)) >> s2) & 0xFFF;
+        uint32_t d3 = (uint32_t)(((uint64_t)row_packed[w3] | ((uint64_t)row_packed[w3+1] << 32)) >> s3) & 0xFFF;
+        sum0 += structured12_decode(d0, base_exp) * bf16_to_float(activations[col]);
+        sum1 += structured12_decode(d1, base_exp) * bf16_to_float(activations[col + WORKGROUP_SIZE]);
+        sum2 += structured12_decode(d2, base_exp) * bf16_to_float(activations[col + WORKGROUP_SIZE * 2]);
+        sum3 += structured12_decode(d3, base_exp) * bf16_to_float(activations[col + WORKGROUP_SIZE * 3]);
         bp += stride * 4;
     }
-    // Remainder
     for (; col < K; col += WORKGROUP_SIZE) {
-        float w = structured12_decode(read12(packed, bp), base_exp);
-        sum0 += w * bf16_to_float(activations[col]);
+        int w = bp >> 5; int s = bp & 31;
+        uint32_t d = (uint32_t)(((uint64_t)row_packed[w] | ((uint64_t)row_packed[w+1] << 32)) >> s) & 0xFFF;
+        sum0 += structured12_decode(d, base_exp) * bf16_to_float(activations[col]);
         bp += stride;
     }
     float sum = sum0 + sum1 + sum2 + sum3;
