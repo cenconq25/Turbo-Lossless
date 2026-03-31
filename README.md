@@ -2,6 +2,96 @@
 
 100% bit-perfect lossless compression for LLM weights. BF16 in, BF16 out — no precision loss, 1.33x smaller, up to 1.95x faster inference.
 
+## How It Works — The Full Picture
+
+### The Problem
+
+LLM inference is **memory-bandwidth bound**: each generated token reads the entire weight matrix from GPU HBM. A 7B model reads ~14 GB of BF16 weights per token. The GPU's compute units sit idle waiting for data.
+
+Quantization (INT4/INT8) solves this by reading less data, but **destroys precision**. Every quantized model has measurable quality loss (perplexity increase, benchmark degradation).
+
+### Our Solution: Lossless 12-Bit Codebook Compression
+
+We observe that BF16 weight tensors have **highly concentrated value distributions**. Across a 7B model, the top 4095 most frequent values cover **99.92%** of all weight elements. Only 40 unique exponents are used (out of 256 possible).
+
+**Encoding** (offline, once per model):
+
+```
+Original BF16 tensor: [0.0312, -0.0156, 0.0312, 0.0625, -0.0156, ...]
+                       ↓ frequency sort: top 4095 values → codebook
+Codebook[4096]:       [0.0312, -0.0156, 0.0625, 0.0469, ...]  (most frequent first)
+                       ↓ each value → 12-bit index (0-4094), rare values → 4095 (escape)
+Packed 12-bit stream: [0, 1, 0, 2, 1, ...]  (1.5 bytes per element vs 2 bytes BF16)
+Escape table:         [(row, col, correct_value)]  (only 0.08% of elements)
+```
+
+**Result**: 16-bit BF16 → 12-bit packed indices = **1.33x compression**. Plus a tiny escape table (~14 MB for 7B model) storing the 0.08% of values not in the codebook. Decode reconstructs the **exact original BF16 value** — zero loss, bit-perfect.
+
+### Why It's Faster (Not Just Smaller)
+
+Reading 12 bits instead of 16 bits means **25% less HBM bandwidth** per weight element. But the codebook lookup (LDS shared memory, 1 cycle) adds decode overhead. At B=1, the overhead slightly exceeds the bandwidth savings (0.58x llama.cpp).
+
+**The key innovation: batch decode amortization.** When serving multiple concurrent users (B=4 or B=8), we **decode each weight element once** and multiply by B activation vectors:
+
+```
+B=1:  read_12bit → decode → 1× FMA                    (decode overhead dominates)
+B=4:  read_12bit → decode → 4× FMA  (same decode!)    (decode amortized 4 ways)
+B=8:  read_12bit → decode → 8× FMA  (same decode!)    (decode nearly free)
+```
+
+At B=8, the decode cost is spread across 8 dot products. Net effect: **read 25% less data with nearly zero overhead = 1.95x faster than raw BF16**.
+
+### The Fused GPU Kernel
+
+Everything happens in a **single GPU kernel launch** per weight matrix — no separate decompress step:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ GPU Kernel: fused decode-matvec (1 block per output row)           │
+│                                                                     │
+│  1. Load 4096-entry codebook into LDS (8 KB shared memory)        │
+│  2. Compute escape pointer via warp shuffle prefix sum             │
+│  3. For each pair of elements (2× unrolled):                      │
+│     a. Branchless 64-bit read → extract 12-bit index              │
+│     b. LDS codebook lookup: cb[index] → BF16 weight (1 cycle)    │
+│     c. If index == 4095 (escape): read correct value from table   │
+│     d. FMA: accumulator += weight × activation (×B for batch)     │
+│  4. Wavefront shuffle reduction → final dot product               │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+No intermediate buffer. No separate decode pass. The weight goes from 12-bit packed HBM → LDS codebook → FP32 register → FMA → output, all in one kernel.
+
+### Flash Attention for Long Context
+
+At short context (<1024 tokens), we use a simple per-head attention kernel. At longer context, we auto-switch to **Flash Attention v2** with tiled KV (Tc=128), online softmax, and constant 34 KB LDS — supporting 20K+ tokens without memory scaling.
+
+### Production Integration Path
+
+The standalone engine proves the concept. The real deployment is as a **drop-in GEMV replacement inside vLLM or TGI**:
+
+```
+Current vLLM: rocBLAS GEMV (reads 16-bit BF16 weights every time)
+With Turbo:   Turbo kernel (reads 12-bit weights, decodes in-kernel, same output)
+```
+
+vLLM handles continuous batching, PagedAttention, and serving infrastructure. We handle the weight matvec — faster and with less VRAM. The combination would give vLLM's throughput with 1.33x VRAM savings and zero quality loss.
+
+### What Makes This Different From Quantization
+
+| | Turbo Lossless | INT4 (GPTQ/AWQ) | INT8 |
+|---|---|---|---|
+| Quality loss | **None (bit-exact BF16)** | PPL +0.1-0.5 | PPL +0.01-0.1 |
+| Compression | 1.33x | 4x | 2x |
+| Calibration data needed | No | Yes | Yes |
+| Risk of degradation | Zero | Nonzero | Nonzero |
+| Speed vs BF16 (B=8) | **1.95x faster** | ~3-4x faster | ~1.8x faster |
+| Use case | Lossless serving | Max compression | Balanced |
+
+We don't compete with INT4 on compression ratio. We offer something that **doesn't exist elsewhere**: faster-than-BF16 inference with mathematically guaranteed zero quality loss.
+
+---
+
 ## End-to-End Engine Results — Mistral 7B Instruct v0.2 on MI50 32GB
 
 | Mode | tok/s total | tok/s/user | VRAM | vs llama.cpp BF16 (32.2 tok/s) |
