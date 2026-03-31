@@ -17,9 +17,9 @@
 
 | Mode | tok/s total | VRAM | vs llama.cpp BF16 (32.2 tok/s) |
 |------|------------:|-----:|:-------------------------------|
-| B=1 | 20.1 | ~10 GB | 0.62x |
-| B=4 | 50.7 | 10.3 GB | 1.57x faster |
-| **B=8** | **67.1** | **10.3 GB** | **2.08x faster, 1.32x less VRAM** |
+| B=1 | 26.1 | ~10 GB | 0.81x |
+| B=4 | 61.5 | 10.3 GB | 1.91x faster |
+| **B=8** | **71.7** | **10.3 GB** | **2.23x faster, 1.32x less VRAM** |
 
 ### Compression
 
@@ -118,7 +118,10 @@ argmax(logits) → next_token
 | uint8 escape counts | -360 MB | Replaced uint16 thread_off table |
 | Flash Attention | 20K+ ctx | Constant LDS, tiled KV |
 | B=8 kernel | 61.4 tok/s | Decode once, 8 FMAs |
-| **Structured12 decode** | **67.1 tok/s** | **BaseExp + group: no LDS, pure ALU** |
+| Structured12 decode | 67.1 tok/s | BaseExp + group: no LDS, pure ALU |
+| 32-bit addressing | 24.0→ B=1 | Pre-compute row base, 32-bit bp in loop |
+| Fused add+RMSNorm cross-layer | +3.7% | Saves 31 kernel launches per forward |
+| **Pointer-based addressing** | **71.7 tok/s B=8** | **Base ptr + constant byte offsets → immediate offset loads** |
 
 ## Tested and Rejected
 
@@ -132,6 +135,8 @@ argmax(logits) → next_token
 | Dual-row per block | -11% | Register spill + branch overhead |
 | 11-bit codebook | N/A | 28% escape on attention tensors |
 | Concurrent streams (gate/up) | broken | Race condition on shared buffer |
+| Fused B=1 single-pass escape | -14% | Per-block prefix sum overhead > saved launches |
+| Branchless escape in batch4 | -6% | Branch is 99.97% predicted, waits on memory not branch |
 
 ## File Map
 
