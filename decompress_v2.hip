@@ -1470,6 +1470,90 @@ __global__ void structured12_matvec_v2(
 }
 
 // ---------------------------------------------------------------------------
+// Structured 12-bit B=1 fused matvec (single-pass with escape counts)
+// Replaces two-pass (v2 + patches) — saves 224 kernel launches per forward
+// ---------------------------------------------------------------------------
+__launch_bounds__(WORKGROUP_SIZE)
+__global__ void structured12_matvec_fused_b1(
+    const uint32_t* __restrict__ packed,
+    int base_exp,
+    const int16_t*  __restrict__ activations,
+    const int32_t*  __restrict__ escape_row_base,
+    const uint8_t*  __restrict__ escape_counts,
+    const int16_t*  __restrict__ escape_vals,
+    float*          __restrict__ output,
+    int M, int K)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    __shared__ float warp_sums[4];
+    __shared__ int warp_esc_totals[4];
+
+    // Escape count prefix sum via warp shuffles
+    int my_count = (int)escape_counts[row * WORKGROUP_SIZE + tid];
+    int lane = tid & (WARP_SIZE - 1);
+    int warp_id = tid >> 6;
+    int prefix = my_count;
+    for (int off = 1; off < WARP_SIZE; off <<= 1) {
+        int v = __shfl_up(prefix, off, WARP_SIZE);
+        if (lane >= off) prefix += v;
+    }
+    int warp_total = __shfl(prefix, WARP_SIZE - 1, WARP_SIZE);
+    prefix -= my_count;
+    if (lane == WARP_SIZE - 1) warp_esc_totals[warp_id] = warp_total;
+    __syncthreads();
+    int cross = 0;
+    for (int w = 0; w < warp_id; w++) cross += warp_esc_totals[w];
+    int esc_ptr = escape_row_base[row] + cross + prefix;
+
+    // Main FMA loop — 32-bit bp, 4x unroll (matches v2 pattern for best ILP)
+    const uint32_t* row_packed = packed + (int64_t)row * K * 12 / 32;
+    int bp = (int)((int64_t)row * K * 12 % 32) + tid * 12;
+    const int stride = WORKGROUP_SIZE * 12;
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+
+    int col = tid;
+    for (; col + WORKGROUP_SIZE * 3 < K; col += WORKGROUP_SIZE * 4) {
+        int w0 = bp >> 5; int s0 = bp & 31;
+        int w1 = (bp + stride) >> 5; int s1 = (bp + stride) & 31;
+        int w2 = (bp + stride*2) >> 5; int s2 = (bp + stride*2) & 31;
+        int w3 = (bp + stride*3) >> 5; int s3 = (bp + stride*3) & 31;
+        uint32_t d0 = (uint32_t)(((uint64_t)row_packed[w0] | ((uint64_t)row_packed[w0+1] << 32)) >> s0) & 0xFFF;
+        uint32_t d1 = (uint32_t)(((uint64_t)row_packed[w1] | ((uint64_t)row_packed[w1+1] << 32)) >> s1) & 0xFFF;
+        uint32_t d2 = (uint32_t)(((uint64_t)row_packed[w2] | ((uint64_t)row_packed[w2+1] << 32)) >> s2) & 0xFFF;
+        uint32_t d3 = (uint32_t)(((uint64_t)row_packed[w3] | ((uint64_t)row_packed[w3+1] << 32)) >> s3) & 0xFFF;
+
+        uint32_t g0 = d0 >> 8, g1 = d1 >> 8, g2 = d2 >> 8, g3 = d3 >> 8;
+        float wt0 = (__builtin_expect(g0 != 0, 1)) ? structured12_decode(d0, base_exp) : bf16_to_float(escape_vals[esc_ptr++]);
+        float wt1 = (__builtin_expect(g1 != 0, 1)) ? structured12_decode(d1, base_exp) : bf16_to_float(escape_vals[esc_ptr++]);
+        float wt2 = (__builtin_expect(g2 != 0, 1)) ? structured12_decode(d2, base_exp) : bf16_to_float(escape_vals[esc_ptr++]);
+        float wt3 = (__builtin_expect(g3 != 0, 1)) ? structured12_decode(d3, base_exp) : bf16_to_float(escape_vals[esc_ptr++]);
+
+        sum0 += wt0 * bf16_to_float(activations[col]);
+        sum1 += wt1 * bf16_to_float(activations[col + WORKGROUP_SIZE]);
+        sum2 += wt2 * bf16_to_float(activations[col + WORKGROUP_SIZE * 2]);
+        sum3 += wt3 * bf16_to_float(activations[col + WORKGROUP_SIZE * 3]);
+        bp += stride * 4;
+    }
+    for (; col < K; col += WORKGROUP_SIZE) {
+        int wi = bp >> 5; int si = bp & 31;
+        uint32_t d = (uint32_t)(((uint64_t)row_packed[wi] | ((uint64_t)row_packed[wi+1] << 32)) >> si) & 0xFFF;
+        uint32_t g = d >> 8;
+        float wt = (__builtin_expect(g != 0, 1)) ? structured12_decode(d, base_exp) : bf16_to_float(escape_vals[esc_ptr++]);
+        sum0 += wt * bf16_to_float(activations[col]);
+        bp += stride;
+    }
+
+    // Warp reduction + output
+    float sum = sum0 + sum1 + sum2 + sum3;
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) sum += __shfl_down(sum, off, WARP_SIZE);
+    if ((tid & (WARP_SIZE-1)) == 0) warp_sums[tid >> 6] = sum;
+    __syncthreads();
+    if (tid == 0) output[row] = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+}
+
+// ---------------------------------------------------------------------------
 // Structured 12-bit B=8 fused matvec (single-pass with escape counts)
 // ---------------------------------------------------------------------------
 __launch_bounds__(WORKGROUP_SIZE)
@@ -1612,6 +1696,22 @@ int launch_structured12_v2_async(
         dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
         (const uint32_t*)packed, base_exp,
         (const int16_t*)activations, (float*)output, M, K);
+    return 0;
+}
+
+int launch_structured12_fused_b1_async(
+    const void* packed, int base_exp,
+    const void* activations,
+    const void* esc_row_base, const void* esc_counts, const void* esc_vals,
+    void* output, int M, int K, void* stream)
+{
+    hipLaunchKernelGGL(structured12_matvec_fused_b1,
+        dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
+        (const uint32_t*)packed, base_exp,
+        (const int16_t*)activations,
+        (const int32_t*)esc_row_base, (const uint8_t*)esc_counts,
+        (const int16_t*)esc_vals,
+        (float*)output, M, K);
     return 0;
 }
 

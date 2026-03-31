@@ -39,6 +39,7 @@ extern "C" {
 
     // Structured 12-bit: arithmetic decode (no LDS codebook)
     int launch_structured12_v2_async(const void* packed, int base_exp, const void* activations, void* output, int M, int K, void* stream);
+    int launch_structured12_fused_b1_async(const void* packed, int base_exp, const void* activations, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* output, int M, int K, void* stream);
     int launch_structured12_batch4_async(const void* packed, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, int M, int K, void* stream);
     int launch_structured12_batch8_async(const void* packed, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* a4, const void* a5, const void* a6, const void* a7, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, void* o4, void* o5, void* o6, void* o7, int M, int K, void* stream);
 }
@@ -87,7 +88,7 @@ InferenceState* create_inference_state(Model* model, int batch_size, int max_seq
     hipStreamCreateWithFlags(&s->stream2, hipStreamNonBlocking);
     // Event for safe cross-stream synchronization (lighter than hipStreamSynchronize)
     hipEventCreateWithFlags(&s->sync_event, hipEventDisableTiming);
-    init_sampler();
+    init_sampler(batch_size);
     return s;
 }
 
@@ -124,6 +125,8 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
     int16_t* bf16_b = state->bf16_act2;  // second BF16 buffer
 
     // Two-pass BF16 matvec: structured 12-bit v2 (no escape) + patch correction
+    // Benchmarked: two-pass with 4x unroll is faster than single-pass fused for B=1
+    // because per-block escape prefix sum overhead > saved kernel launches
     #define MATVEC_B1(w, bf16_in, fp32_out) do { \
         launch_structured12_v2_async((w).packed, (w).base_exp, bf16_in, fp32_out, (w).M, (w).K, stream); \
         if ((w).num_patches > 0 && (w).row_offsets) \
@@ -134,8 +137,12 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
     for (int layer = 0; layer < cfg.n_layer; layer++) {
         auto& L = m->layers[layer];
 
-        // Fused RMSNorm → BF16 for Q/K/V input (saves 1 launch)
-        launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
+        // Fused RMSNorm → BF16 for Q/K/V input
+        // (first layer: standalone norm; subsequent: fused with previous layer's add)
+        if (layer == 0)
+            launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
+        // else: bf16_a already set by fused add+norm at end of previous layer
+
         MATVEC_B1(L.wq, bf16_a, state->q_buf);
         MATVEC_B1(L.wk, bf16_a, state->k_buf);
         MATVEC_B1(L.wv, bf16_a, state->v_buf);
@@ -165,7 +172,15 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
         // Fused SiLU*mul → BF16 for w_down input (saves 1 launch)
         launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, cfg.n_ff, 1, stream);
         MATVEC_B1(L.w_down, bf16_b, cur);
-        launch_add_batch(cur, res, n, 1, stream);
+
+        // Fuse add + next layer's RMSNorm (saves 1 kernel launch per layer)
+        if (layer + 1 < cfg.n_layer) {
+            auto& nextL = m->layers[layer + 1];
+            // cur += res, bf16_a = norm(cur) — cur holds hidden state, res is free for next wo
+            launch_add_rms_norm_bf16_batch(cur, res, nextL.attn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
+        } else {
+            launch_add_batch(cur, res, n, 1, stream);
+        }
     }
 
     // Fused RMSNorm → BF16 for output projection (saves 1 launch)
@@ -212,9 +227,9 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
     for (int layer = 0; layer < cfg.n_layer; layer++) {
         auto& L = m->layers[layer];
 
-        // Fused RMSNorm → BF16 for Q/K/V (saves 1 launch)
-        launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, B, stream);
-        // Q on stream0, K+V on stream2 (K,V are 4x smaller — can overlap with Q's tail)
+        // Fused RMSNorm → BF16 for Q/K/V (layer 0 only; subsequent fused with prev add)
+        if (layer == 0)
+            launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, B, stream);
         launch_structured12_batch4_async(L.wq.packed, L.wq.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.wq.escape_row_base, L.wq.escape_counts, L.wq.escape_vals,
@@ -275,7 +290,14 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
             L.w_down.escape_row_base, L.w_down.escape_counts, L.w_down.escape_vals,
             SEQ(cur,0,n), SEQ(cur,1,n), SEQ(cur,2,n), SEQ(cur,3,n),
             L.w_down.M, L.w_down.K, stream);
-        launch_add_batch(cur, res, n, B, stream);
+
+        // Fuse add + next layer's RMSNorm (saves 1 kernel launch per layer)
+        if (layer + 1 < cfg.n_layer) {
+            auto& nextL = m->layers[layer + 1];
+            launch_add_rms_norm_bf16_batch(cur, res, nextL.attn_norm, bf16_a, n, cfg.rms_norm_eps, B, stream);
+        } else {
+            launch_add_batch(cur, res, n, B, stream);
+        }
     }
 
     // Fused RMSNorm → BF16 for output projection (saves 1 launch)
@@ -312,8 +334,9 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
     for (int layer = 0; layer < cfg.n_layer; layer++) {
         auto& L = m->layers[layer];
 
-        // Fused RMSNorm -> BF16 for Q/K/V
-        launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
+        // Fused RMSNorm -> BF16 for Q/K/V (layer 0 only; subsequent fused with prev add)
+        if (layer == 0)
+            launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
         launch_structured12_batch8_async(L.wq.packed, L.wq.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             SEQI(bf16_a,4,n), SEQI(bf16_a,5,n), SEQI(bf16_a,6,n), SEQI(bf16_a,7,n),
@@ -388,7 +411,14 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
             SEQ(cur,0,n), SEQ(cur,1,n), SEQ(cur,2,n), SEQ(cur,3,n),
             SEQ(cur,4,n), SEQ(cur,5,n), SEQ(cur,6,n), SEQ(cur,7,n),
             L.w_down.M, L.w_down.K, stream);
-        launch_add_batch(cur, res, n, BS, stream);
+
+        // Fuse add + next layer's RMSNorm (saves 1 kernel launch per layer)
+        if (layer + 1 < cfg.n_layer) {
+            auto& nextL = m->layers[layer + 1];
+            launch_add_rms_norm_bf16_batch(cur, res, nextL.attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
+        } else {
+            launch_add_batch(cur, res, n, BS, stream);
+        }
     }
 
     // Fused RMSNorm -> BF16 for output projection
@@ -466,8 +496,8 @@ std::vector<int> generate(InferenceState* state, const std::vector<int>& prompt_
             forward(state, tokens.data());
         }
         for (int t = 0; t < max_tokens; t++) {
-            for (int s = 0; s < bs; s++)
-                tokens[s] = sample_greedy(state->logits + s * n_vocab, n_vocab, state->stream);
+            // Single batched argmax launch + one sync (was: bs separate launches + syncs)
+            sample_greedy_batch(state->logits, tokens.data(), n_vocab, bs, state->stream);
             if (tokens[0] == 2) break;
             output.push_back(tokens[0]);
             forward(state, tokens.data());

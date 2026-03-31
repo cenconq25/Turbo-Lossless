@@ -162,19 +162,21 @@ __global__ void add_kernel(
 // Argmax: find token with highest logit
 // ============================================================
 __global__ void argmax_kernel(
-    const float* __restrict__ logits,  // [n_vocab]
-    int* __restrict__ result,          // [1]
+    const float* __restrict__ logits,  // [batch, n_vocab] (one block per batch element)
+    int* __restrict__ result,          // [batch]
     int n)
 {
     extern __shared__ float sdata[];
     int* sidx = (int*)(sdata + blockDim.x);
     int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    const float* my_logits = logits + (size_t)bid * n;
 
     float max_val = -INFINITY;
     int max_idx = 0;
     for (int i = tid; i < n; i += blockDim.x) {
-        if (logits[i] > max_val) {
-            max_val = logits[i];
+        if (my_logits[i] > max_val) {
+            max_val = my_logits[i];
             max_idx = i;
         }
     }
@@ -190,7 +192,7 @@ __global__ void argmax_kernel(
         __syncthreads();
     }
 
-    if (tid == 0) result[0] = sidx[0];
+    if (tid == 0) result[bid] = sidx[0];
 }
 
 // ============================================================
@@ -237,6 +239,12 @@ void launch_embed_lookup(const int16_t* embd_table, const int* token_ids,
 void launch_argmax(const float* logits, int* result, int n, hipStream_t stream) {
     int threads = 256;
     argmax_kernel<<<1, threads, threads * (sizeof(float) + sizeof(int)), stream>>>(logits, result, n);
+}
+
+void launch_argmax_batch(const float* logits, int* results, int n_vocab, int batch_size, hipStream_t stream) {
+    int threads = 256;
+    // One block per sequence in the batch
+    argmax_kernel<<<batch_size, threads, threads * (sizeof(float) + sizeof(int)), stream>>>(logits, results, n_vocab);
 }
 
 }
