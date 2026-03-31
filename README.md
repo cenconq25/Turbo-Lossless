@@ -90,6 +90,10 @@ Single kernel launch, no separate decompress step, NO LDS codebook:
 | B=1 | 20.1 | 20.1 | ~10 GB | 0.62x |
 | B=4 | 50.7 | 12.7 | 10.3 GB | **1.57x faster** |
 | **B=8** | **67.1** | **8.4** | **10.3 GB** | **2.08x faster, 1.32x less VRAM** |
+| B=16 | 66.6 | 4.2 | ~10.5 GB | 2.07x (plateau) |
+| B=32 | 66.3 | 2.1 | ~11 GB | 2.06x (plateau) |
+
+B=8 is the throughput ceiling — beyond B=8, weight decode is fully HBM bandwidth saturated. B=16/32 run as multiple B=8 passes with no additional amortization.
 
 ### Hardware Projection (B=8)
 
