@@ -408,7 +408,38 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
 void forward(InferenceState* state, const int* token_ids) {
     if (state->batch_size == 8) forward_b8(state, token_ids);
     else if (state->batch_size == 4) forward_b4(state, token_ids);
-    else forward_b1(state, token_ids);
+    else if (state->batch_size > 8 && state->batch_size % 8 == 0) {
+        // Process as multiple B=8 passes (e.g., B=16 = 2× B=8, B=32 = 4× B=8)
+        int orig_bs = state->batch_size;
+        int n = state->model->config.n_embd;
+        int n_ff = state->model->config.n_ff;
+        int n_vocab = state->model->config.n_vocab;
+        int kv_dim = state->model->config.n_head_kv * (n / state->model->config.n_head);
+
+        for (int chunk = 0; chunk < orig_bs; chunk += 8) {
+            // Temporarily adjust state to point to this chunk's slice
+            InferenceState slice = *state;
+            slice.batch_size = 8;
+            slice.positions = state->positions + chunk;
+            slice.hidden = state->hidden + chunk * n;
+            slice.hidden2 = state->hidden2 + chunk * n;
+            slice.attn_out = state->attn_out + chunk * n;
+            slice.q_buf = state->q_buf + chunk * n;
+            slice.k_buf = state->k_buf + chunk * kv_dim;
+            slice.v_buf = state->v_buf + chunk * kv_dim;
+            slice.ffn_gate = state->ffn_gate + chunk * n_ff;
+            slice.ffn_up = state->ffn_up + chunk * n_ff;
+            slice.logits = state->logits + chunk * n_vocab;
+            slice.d_positions = state->d_positions + chunk;
+            slice.d_tokens = state->d_tokens + chunk;
+            slice.bf16_act = state->bf16_act + chunk * std::max(n, n_ff);
+            slice.bf16_act2 = state->bf16_act2 + chunk * std::max(n, n_ff);
+
+            forward_b8(&slice, token_ids + chunk);
+        }
+    } else {
+        forward_b1(state, token_ids);
+    }
 }
 
 std::vector<int> generate(InferenceState* state, const std::vector<int>& prompt_tokens, int max_tokens) {
