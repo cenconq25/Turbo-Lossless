@@ -33,7 +33,6 @@ extern "C" {
     // Structured 12-bit: arithmetic decode (no LDS codebook)
     int launch_structured12_v2_async(const void* packed, int base_exp, const void* activations, void* output, int M, int K, void* stream);
     int launch_structured12_v2_fp32act_async(const void* packed, int base_exp, const void* activations, void* output, int M, int K, void* stream);
-    int launch_patches_v2_f32_async(const void* row_offsets, const void* patch_cols, const void* correct_vals, const void* wrong_vals, const void* activations, void* output, int M, void* stream);
     int launch_structured12_batch4_async(const void* packed, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, int M, int K, void* stream);
     int launch_structured12_batch8_async(const void* packed, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* a4, const void* a5, const void* a6, const void* a7, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, void* o4, void* o5, void* o6, void* o7, int M, int K, void* stream);
 }
@@ -182,14 +181,11 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
             launch_flash_attention(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
                 state->attn_out, cfg.n_head, cfg.n_head_kv, head_dim, pos+1, m->max_seq_len, scale, stream);
 
+        launch_fp32_to_bf16(state->attn_out, bf16_a, n, stream);
         PROF_END_NM(stream);
 
-        // wo: use FP32 activations directly from attention output (skip bf16 conversion)
         PROF_START(stream);
-        launch_structured12_v2_fp32act_async(L.wo.packed, L.wo.base_exp, state->attn_out, res, L.wo.M, L.wo.K, stream);
-        if (L.wo.num_patches > 0 && L.wo.row_offsets)
-            launch_patches_v2_f32_async(L.wo.row_offsets, L.wo.patch_cols, L.wo.patch_correct, L.wo.patch_wrong,
-                                        state->attn_out, res, L.wo.M, stream);
+        MATVEC_B1(L.wo, bf16_a, res);
         PROF_END_MV(stream);
 
         PROF_START(stream);

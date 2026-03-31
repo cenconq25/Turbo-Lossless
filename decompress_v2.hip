@@ -1481,19 +1481,12 @@ __global__ void structured12_matvec_v2(
     __shared__ float warp_sums[4];
     float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
 
-    // Use per-row base pointer to avoid 64-bit arithmetic in hot loop
-    // row_bits = row * K * 12, pre-divided into word offset + bit shift
     const uint32_t* row_packed = packed + (int64_t)row * K * 12 / 32;
     int bp = (int)((int64_t)row * K * 12 % 32) + tid * 12;
-    const int stride = WORKGROUP_SIZE * 12;
-
-    // Pointer-based access for BOTH packed data and activations
-    // Shift is constant across all iterations (stride = 256*12 = 3072 = 96*32)
     const int shift = bp & 31;
     const char* pack_ptr = (const char*)(row_packed + (bp >> 5));
     const char* act_ptr = (const char*)(activations + tid);
-    // Packed: 384 bytes between unrolled elements, 1536 per iteration
-    // Activations: 512 bytes between elements (256 int16), 2048 per iteration
+
     int col = tid;
     for (; col + WORKGROUP_SIZE * 3 < K; col += WORKGROUP_SIZE * 4) {
         uint32_t d0 = (uint32_t)(*(const uint64_t*)(pack_ptr) >> shift) & 0xFFF;
