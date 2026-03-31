@@ -322,11 +322,15 @@ __global__ void fixed12_matvec_batch4(
     BATCH4_REDUCE_BODY()
 }
 
-// Scan batch4: computes escape offsets on-the-fly (saves 721 MB VRAM, 9KB LDS)
+// Forward declaration for structured12 decode (defined later in file)
+__device__ __forceinline__ float structured12_decode(uint32_t raw12, int base_exp);
+
+// Scan batch4: on-the-fly escape scan using structured12 format (group==0 = escape)
+// No LDS codebook, no escape_counts table. Saves max VRAM.
 __launch_bounds__(WORKGROUP_SIZE)
-__global__ void fixed12_matvec_batch4_scan(
+__global__ void structured12_matvec_batch4_scan(
     const uint32_t* __restrict__ packed,
-    const int16_t*  __restrict__ codebook,
+    int base_exp,
     const int16_t*  __restrict__ act0, const int16_t* __restrict__ act1,
     const int16_t*  __restrict__ act2, const int16_t* __restrict__ act3,
     const int32_t*  __restrict__ escape_row_base,
@@ -337,22 +341,19 @@ __global__ void fixed12_matvec_batch4_scan(
 {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
-    __shared__ int16_t cb[4096];
     __shared__ float warp_sums[16];
     __shared__ int esc_scan[WORKGROUP_SIZE];
-    for (int i = tid; i < 4096; i += WORKGROUP_SIZE) cb[i] = codebook[i];
-    __syncthreads();
 
-    // Phase 1: count escapes
+    // Phase 1: count escapes (group==0 in structured12 format)
     int64_t bp_start = (int64_t)row * K * 12 + (int64_t)tid * 12;
     int my_esc = 0;
     { int64_t bp_s = bp_start; int c = tid;
       for (; c + WORKGROUP_SIZE < K; c += WORKGROUP_SIZE * 2) {
-          if (read12(packed, bp_s) == 4095) my_esc++;
-          if (read12(packed, bp_s + (int64_t)(WORKGROUP_SIZE * 12)) == 4095) my_esc++;
+          if ((read12(packed, bp_s) >> 8) == 0) my_esc++;
+          if ((read12(packed, bp_s + (int64_t)(WORKGROUP_SIZE * 12)) >> 8) == 0) my_esc++;
           bp_s += (int64_t)(WORKGROUP_SIZE * 2 * 12);
       }
-      if (c < K) { if (read12(packed, bp_s) == 4095) my_esc++; }
+      if (c < K) { if ((read12(packed, bp_s) >> 8) == 0) my_esc++; }
     }
     esc_scan[tid] = my_esc;
     __syncthreads();
@@ -360,10 +361,36 @@ __global__ void fixed12_matvec_batch4_scan(
     __syncthreads();
     int esc_ptr = escape_row_base[row] + esc_scan[tid];
 
-    // Phase 2: FMA
+    // Phase 2: FMA with structured12 decode
     int64_t bp = bp_start;
     float s0a=0,s0b=0,s1a=0,s1b=0,s2a=0,s2b=0,s3a=0,s3b=0;
-    BATCH4_FMA_BODY()
+
+    int col = tid;
+    for (; col + WORKGROUP_SIZE < K; col += WORKGROUP_SIZE * 2) {
+        uint32_t raw0 = read12(packed, bp);
+        uint32_t raw1 = read12(packed, bp + (int64_t)(WORKGROUP_SIZE * 12));
+        uint32_t g0 = raw0 >> 8, g1 = raw1 >> 8;
+        float w0 = (__builtin_expect(g0 != 0, 1))
+            ? structured12_decode(raw0, base_exp) : bf16_to_float(escape_vals[esc_ptr++]);
+        float w1 = (__builtin_expect(g1 != 0, 1))
+            ? structured12_decode(raw1, base_exp) : bf16_to_float(escape_vals[esc_ptr++]);
+        s0a += w0 * bf16_to_float(act0[col]);  s0b += w1 * bf16_to_float(act0[col + WORKGROUP_SIZE]);
+        s1a += w0 * bf16_to_float(act1[col]);  s1b += w1 * bf16_to_float(act1[col + WORKGROUP_SIZE]);
+        s2a += w0 * bf16_to_float(act2[col]);  s2b += w1 * bf16_to_float(act2[col + WORKGROUP_SIZE]);
+        s3a += w0 * bf16_to_float(act3[col]);  s3b += w1 * bf16_to_float(act3[col + WORKGROUP_SIZE]);
+        bp += (int64_t)(WORKGROUP_SIZE * 2 * 12);
+    }
+    if (col < K) {
+        uint32_t raw = read12(packed, bp);
+        uint32_t g = raw >> 8;
+        float w = (__builtin_expect(g != 0, 1))
+            ? structured12_decode(raw, base_exp) : bf16_to_float(escape_vals[esc_ptr++]);
+        s0a += w * bf16_to_float(act0[col]);
+        s1a += w * bf16_to_float(act1[col]);
+        s2a += w * bf16_to_float(act2[col]);
+        s3a += w * bf16_to_float(act3[col]);
+    }
+
     BATCH4_REDUCE_BODY()
 }
 
@@ -705,10 +732,10 @@ int launch_fixed12_batch4_async(
             (const int16_t*)esc_vals,
             (float*)o0, (float*)o1, (float*)o2, (float*)o3, M, K);
     } else {
-        // VRAM-saving path: on-the-fly scan
-        hipLaunchKernelGGL(fixed12_matvec_batch4_scan,
+        // VRAM-saving path: use structured12 scan kernel (legacy launcher)
+        hipLaunchKernelGGL(structured12_matvec_batch4_scan,
             dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
-            (const uint32_t*)packed, (const int16_t*)codebook,
+            (const uint32_t*)packed, 0,
             (const int16_t*)a0, (const int16_t*)a1,
             (const int16_t*)a2, (const int16_t*)a3,
             (const int32_t*)esc_row_base,
@@ -1561,14 +1588,25 @@ int launch_structured12_batch4_async(
     const void* esc_row_base, const void* esc_counts, const void* esc_vals,
     void* o0, void* o1, void* o2, void* o3, int M, int K, void* stream)
 {
-    hipLaunchKernelGGL(structured12_matvec_batch4,
-        dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
-        (const uint32_t*)packed, base_exp,
-        (const int16_t*)a0, (const int16_t*)a1,
-        (const int16_t*)a2, (const int16_t*)a3,
-        (const int32_t*)esc_row_base, (const uint8_t*)esc_counts,
-        (const int16_t*)esc_vals,
-        (float*)o0, (float*)o1, (float*)o2, (float*)o3, M, K);
+    if (esc_counts) {
+        hipLaunchKernelGGL(structured12_matvec_batch4,
+            dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
+            (const uint32_t*)packed, base_exp,
+            (const int16_t*)a0, (const int16_t*)a1,
+            (const int16_t*)a2, (const int16_t*)a3,
+            (const int32_t*)esc_row_base, (const uint8_t*)esc_counts,
+            (const int16_t*)esc_vals,
+            (float*)o0, (float*)o1, (float*)o2, (float*)o3, M, K);
+    } else {
+        hipLaunchKernelGGL(structured12_matvec_batch4_scan,
+            dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
+            (const uint32_t*)packed, base_exp,
+            (const int16_t*)a0, (const int16_t*)a1,
+            (const int16_t*)a2, (const int16_t*)a3,
+            (const int32_t*)esc_row_base,
+            (const int16_t*)esc_vals,
+            (float*)o0, (float*)o1, (float*)o2, (float*)o3, M, K);
+    }
     return 0;
 }
 
