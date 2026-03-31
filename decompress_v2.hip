@@ -437,6 +437,125 @@ __global__ void fixed12_matvec_batch8(
         out[tid][row] = warp_sums[tid * 4] + warp_sums[tid * 4 + 1] + warp_sums[tid * 4 + 2] + warp_sums[tid * 4 + 3];
 }
 
+// Batch8 FMA body macro: decode once, 8 FMAs per weight (explicit pointers)
+#define BATCH8_FMA_BODY() \
+    int col = tid; \
+    for (; col + WORKGROUP_SIZE < K; col += WORKGROUP_SIZE * 2) { \
+        uint32_t idx0 = read12(packed, bp); \
+        uint32_t idx1 = read12(packed, bp + (int64_t)(WORKGROUP_SIZE * 12)); \
+        float w0 = (__builtin_expect(idx0 != 4095, 1)) \
+            ? bf16_to_float(cb[idx0]) : bf16_to_float(escape_vals[esc_ptr++]); \
+        float w1 = (__builtin_expect(idx1 != 4095, 1)) \
+            ? bf16_to_float(cb[idx1]) : bf16_to_float(escape_vals[esc_ptr++]); \
+        s0a += w0 * bf16_to_float(act0[col]);  s0b += w1 * bf16_to_float(act0[col + WORKGROUP_SIZE]); \
+        s1a += w0 * bf16_to_float(act1[col]);  s1b += w1 * bf16_to_float(act1[col + WORKGROUP_SIZE]); \
+        s2a += w0 * bf16_to_float(act2[col]);  s2b += w1 * bf16_to_float(act2[col + WORKGROUP_SIZE]); \
+        s3a += w0 * bf16_to_float(act3[col]);  s3b += w1 * bf16_to_float(act3[col + WORKGROUP_SIZE]); \
+        s4a += w0 * bf16_to_float(act4[col]);  s4b += w1 * bf16_to_float(act4[col + WORKGROUP_SIZE]); \
+        s5a += w0 * bf16_to_float(act5[col]);  s5b += w1 * bf16_to_float(act5[col + WORKGROUP_SIZE]); \
+        s6a += w0 * bf16_to_float(act6[col]);  s6b += w1 * bf16_to_float(act6[col + WORKGROUP_SIZE]); \
+        s7a += w0 * bf16_to_float(act7[col]);  s7b += w1 * bf16_to_float(act7[col + WORKGROUP_SIZE]); \
+        bp += (int64_t)(WORKGROUP_SIZE * 2 * 12); \
+    } \
+    if (col < K) { \
+        uint32_t idx = read12(packed, bp); \
+        float w = (__builtin_expect(idx != 4095, 1)) \
+            ? bf16_to_float(cb[idx]) : bf16_to_float(escape_vals[esc_ptr++]); \
+        s0a += w * bf16_to_float(act0[col]); \
+        s1a += w * bf16_to_float(act1[col]); \
+        s2a += w * bf16_to_float(act2[col]); \
+        s3a += w * bf16_to_float(act3[col]); \
+        s4a += w * bf16_to_float(act4[col]); \
+        s5a += w * bf16_to_float(act5[col]); \
+        s6a += w * bf16_to_float(act6[col]); \
+        s7a += w * bf16_to_float(act7[col]); \
+    }
+
+#define BATCH8_REDUCE_BODY() \
+    float s0 = s0a + s0b, s1 = s1a + s1b, s2 = s2a + s2b, s3 = s3a + s3b; \
+    float s4 = s4a + s4b, s5 = s5a + s5b, s6 = s6a + s6b, s7 = s7a + s7b; \
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) { \
+        s0 += __shfl_down(s0, off, WARP_SIZE); \
+        s1 += __shfl_down(s1, off, WARP_SIZE); \
+        s2 += __shfl_down(s2, off, WARP_SIZE); \
+        s3 += __shfl_down(s3, off, WARP_SIZE); \
+        s4 += __shfl_down(s4, off, WARP_SIZE); \
+        s5 += __shfl_down(s5, off, WARP_SIZE); \
+        s6 += __shfl_down(s6, off, WARP_SIZE); \
+        s7 += __shfl_down(s7, off, WARP_SIZE); \
+    } \
+    int wid = tid >> 6; \
+    if ((tid & (WARP_SIZE - 1)) == 0) { \
+        warp_sums[wid]       = s0; \
+        warp_sums[wid + 4]   = s1; \
+        warp_sums[wid + 8]   = s2; \
+        warp_sums[wid + 12]  = s3; \
+        warp_sums[wid + 16]  = s4; \
+        warp_sums[wid + 20]  = s5; \
+        warp_sums[wid + 24]  = s6; \
+        warp_sums[wid + 28]  = s7; \
+    } \
+    __syncthreads(); \
+    if (tid == 0) { \
+        out0[row] = warp_sums[0]+warp_sums[1]+warp_sums[2]+warp_sums[3]; \
+        out1[row] = warp_sums[4]+warp_sums[5]+warp_sums[6]+warp_sums[7]; \
+        out2[row] = warp_sums[8]+warp_sums[9]+warp_sums[10]+warp_sums[11]; \
+        out3[row] = warp_sums[12]+warp_sums[13]+warp_sums[14]+warp_sums[15]; \
+        out4[row] = warp_sums[16]+warp_sums[17]+warp_sums[18]+warp_sums[19]; \
+        out5[row] = warp_sums[20]+warp_sums[21]+warp_sums[22]+warp_sums[23]; \
+        out6[row] = warp_sums[24]+warp_sums[25]+warp_sums[26]+warp_sums[27]; \
+        out7[row] = warp_sums[28]+warp_sums[29]+warp_sums[30]+warp_sums[31]; \
+    }
+
+// Fast batch8: LDS codebook (8KB, 1-cycle access), explicit pointers, escape_counts prefix sum
+__launch_bounds__(WORKGROUP_SIZE)
+__global__ void fixed12_matvec_batch8_v2(
+    const uint32_t* __restrict__ packed,
+    const int16_t*  __restrict__ codebook,
+    const int16_t*  __restrict__ act0, const int16_t* __restrict__ act1,
+    const int16_t*  __restrict__ act2, const int16_t* __restrict__ act3,
+    const int16_t*  __restrict__ act4, const int16_t* __restrict__ act5,
+    const int16_t*  __restrict__ act6, const int16_t* __restrict__ act7,
+    const int32_t*  __restrict__ escape_row_base,
+    const uint8_t*  __restrict__ escape_counts,
+    const int16_t*  __restrict__ escape_vals,
+    float* __restrict__ out0, float* __restrict__ out1,
+    float* __restrict__ out2, float* __restrict__ out3,
+    float* __restrict__ out4, float* __restrict__ out5,
+    float* __restrict__ out6, float* __restrict__ out7,
+    int M, int K)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    __shared__ int16_t cb[4096];
+    __shared__ float warp_sums[32];  // 4 warps × 8 outputs
+    __shared__ int warp_esc_totals[4];
+    for (int i = tid; i < 4096; i += WORKGROUP_SIZE) cb[i] = codebook[i];
+
+    // Escape count prefix sum (same as batch4)
+    int my_count = (int)escape_counts[row * WORKGROUP_SIZE + tid];
+    int lane = tid & (WARP_SIZE - 1);
+    int warp_id = tid >> 6;
+    int prefix = my_count;
+    for (int off = 1; off < WARP_SIZE; off <<= 1) {
+        int v = __shfl_up(prefix, off, WARP_SIZE);
+        if (lane >= off) prefix += v;
+    }
+    int warp_total = __shfl(prefix, WARP_SIZE - 1, WARP_SIZE);
+    prefix -= my_count;
+    if (lane == WARP_SIZE - 1) warp_esc_totals[warp_id] = warp_total;
+    __syncthreads();
+    int cross = 0;
+    for (int w = 0; w < warp_id; w++) cross += warp_esc_totals[w];
+    int esc_ptr = escape_row_base[row] + cross + prefix;
+
+    int64_t bp = (int64_t)row * K * 12 + (int64_t)tid * 12;
+    float s0a=0,s0b=0,s1a=0,s1b=0,s2a=0,s2b=0,s3a=0,s3b=0;
+    float s4a=0,s4b=0,s5a=0,s5b=0,s6a=0,s6b=0,s7a=0,s7b=0;
+    BATCH8_FMA_BODY()
+    BATCH8_REDUCE_BODY()
+}
+
 // ---------------------------------------------------------------------------
 // Decompress-only: decode all weights to BF16 buffer for bit-exact verification
 // ---------------------------------------------------------------------------
@@ -596,6 +715,30 @@ int launch_fixed12_batch4_async(
             (const int16_t*)esc_vals,
             (float*)o0, (float*)o1, (float*)o2, (float*)o3, M, K);
     }
+    return 0;
+}
+
+int launch_fixed12_batch8_v2_async(
+    const void* packed, const void* codebook,
+    const void* a0, const void* a1, const void* a2, const void* a3,
+    const void* a4, const void* a5, const void* a6, const void* a7,
+    const void* esc_row_base, const void* esc_counts, const void* esc_vals,
+    void* o0, void* o1, void* o2, void* o3,
+    void* o4, void* o5, void* o6, void* o7,
+    int M, int K, void* stream)
+{
+    hipLaunchKernelGGL(fixed12_matvec_batch8_v2,
+        dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
+        (const uint32_t*)packed, (const int16_t*)codebook,
+        (const int16_t*)a0, (const int16_t*)a1,
+        (const int16_t*)a2, (const int16_t*)a3,
+        (const int16_t*)a4, (const int16_t*)a5,
+        (const int16_t*)a6, (const int16_t*)a7,
+        (const int32_t*)esc_row_base, (const uint8_t*)esc_counts,
+        (const int16_t*)esc_vals,
+        (float*)o0, (float*)o1, (float*)o2, (float*)o3,
+        (float*)o4, (float*)o5, (float*)o6, (float*)o7,
+        M, K);
     return 0;
 }
 }
