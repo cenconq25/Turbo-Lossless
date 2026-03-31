@@ -200,7 +200,7 @@ extern "C" {
 
 void launch_rms_norm(const float* x, const float* weight, float* y,
                      int n, float eps, hipStream_t stream) {
-    int threads = 256;
+    int threads = min(1024, n);
     rms_norm_kernel<<<1, threads, threads * sizeof(float), stream>>>(x, weight, y, n, eps);
 }
 
@@ -477,21 +477,21 @@ extern "C" {
 
 void launch_rms_norm_batch(const float* x, const float* weight, float* y,
                            int n, float eps, int batch_size, hipStream_t stream) {
-    int threads = 256;
+    int threads = min(1024, n);  // more threads = faster reduction for large n
     rms_norm_batch_kernel<<<batch_size, threads, threads * sizeof(float), stream>>>(
         x, weight, y, n, eps, batch_size);
 }
 
 void launch_rms_norm_bf16_batch(const float* x, const float* weight, int16_t* y,
                                 int n, float eps, int batch_size, hipStream_t stream) {
-    int threads = 256;
+    int threads = min(1024, n);
     rms_norm_bf16_batch_kernel<<<batch_size, threads, threads * sizeof(float), stream>>>(
         x, weight, y, n, eps, batch_size);
 }
 
 void launch_add_rms_norm_bf16_batch(float* x, const float* residual, const float* weight,
                                      int16_t* y, int n, float eps, int batch_size, hipStream_t stream) {
-    int threads = 256;
+    int threads = min(1024, n);
     add_rms_norm_bf16_batch_kernel<<<batch_size, threads, threads * sizeof(float), stream>>>(
         x, residual, weight, y, n, eps, batch_size);
 }
