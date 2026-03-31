@@ -1417,6 +1417,55 @@ __global__ void structured12_matvec_batch4(
 }
 
 // ---------------------------------------------------------------------------
+// Structured 12-bit B=1 two-pass matvec with FP32 activations (no bf16→fp32 needed)
+// Used for wo matvec where attention output is already FP32
+// ---------------------------------------------------------------------------
+__launch_bounds__(WORKGROUP_SIZE)
+__global__ void structured12_matvec_v2_fp32act(
+    const uint32_t* __restrict__ packed,
+    int base_exp,
+    const float*    __restrict__ activations,
+    float*          __restrict__ output,
+    int M, int K)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    __shared__ float warp_sums[4];
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+
+    const uint32_t* row_packed = packed + (int64_t)row * K * 12 / 32;
+    int bp = (int)((int64_t)row * K * 12 % 32) + tid * 12;
+    const int shift = bp & 31;
+    const char* pack_ptr = (const char*)(row_packed + (bp >> 5));
+    const char* act_ptr = (const char*)(activations + tid);
+    // Activations: 1024 bytes between elements (256 float), 4096 per iteration
+    int col = tid;
+    for (; col + WORKGROUP_SIZE * 3 < K; col += WORKGROUP_SIZE * 4) {
+        uint32_t d0 = (uint32_t)(*(const uint64_t*)(pack_ptr) >> shift) & 0xFFF;
+        uint32_t d1 = (uint32_t)(*(const uint64_t*)(pack_ptr + 384) >> shift) & 0xFFF;
+        uint32_t d2 = (uint32_t)(*(const uint64_t*)(pack_ptr + 768) >> shift) & 0xFFF;
+        uint32_t d3 = (uint32_t)(*(const uint64_t*)(pack_ptr + 1152) >> shift) & 0xFFF;
+        sum0 += structured12_decode(d0, base_exp) * *(const float*)(act_ptr);
+        sum1 += structured12_decode(d1, base_exp) * *(const float*)(act_ptr + 1024);
+        sum2 += structured12_decode(d2, base_exp) * *(const float*)(act_ptr + 2048);
+        sum3 += structured12_decode(d3, base_exp) * *(const float*)(act_ptr + 3072);
+        pack_ptr += 1536;
+        act_ptr += 4096;
+    }
+    for (; col < K; col += WORKGROUP_SIZE) {
+        uint32_t d = (uint32_t)(*(const uint64_t*)(pack_ptr) >> shift) & 0xFFF;
+        sum0 += structured12_decode(d, base_exp) * *(const float*)(act_ptr);
+        pack_ptr += 384;
+        act_ptr += 1024;
+    }
+    float sum = sum0 + sum1 + sum2 + sum3;
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) sum += __shfl_down(sum, off, WARP_SIZE);
+    if ((tid & (WARP_SIZE-1)) == 0) warp_sums[tid >> 6] = sum;
+    __syncthreads();
+    if (tid == 0) output[row] = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+}
+
+// ---------------------------------------------------------------------------
 // Structured 12-bit B=1 two-pass matvec (no escape handling — patches applied separately)
 // ---------------------------------------------------------------------------
 __launch_bounds__(WORKGROUP_SIZE)
@@ -1438,28 +1487,31 @@ __global__ void structured12_matvec_v2(
     int bp = (int)((int64_t)row * K * 12 % 32) + tid * 12;
     const int stride = WORKGROUP_SIZE * 12;
 
-    // Pointer-based access: base pointer + constant byte offsets per unrolled element
+    // Pointer-based access for BOTH packed data and activations
     // Shift is constant across all iterations (stride = 256*12 = 3072 = 96*32)
     const int shift = bp & 31;
-    const char* base_ptr = (const char*)(row_packed + (bp >> 5));
-    // Byte offsets between unrolled elements: stride/32 * 4 = 96*4 = 384 bytes
-    // Advance per iteration: stride*4/32 * 4 = 384*4 = 1536 bytes
+    const char* pack_ptr = (const char*)(row_packed + (bp >> 5));
+    const char* act_ptr = (const char*)(activations + tid);
+    // Packed: 384 bytes between unrolled elements, 1536 per iteration
+    // Activations: 512 bytes between elements (256 int16), 2048 per iteration
     int col = tid;
     for (; col + WORKGROUP_SIZE * 3 < K; col += WORKGROUP_SIZE * 4) {
-        uint32_t d0 = (uint32_t)(*(const uint64_t*)(base_ptr) >> shift) & 0xFFF;
-        uint32_t d1 = (uint32_t)(*(const uint64_t*)(base_ptr + 384) >> shift) & 0xFFF;
-        uint32_t d2 = (uint32_t)(*(const uint64_t*)(base_ptr + 768) >> shift) & 0xFFF;
-        uint32_t d3 = (uint32_t)(*(const uint64_t*)(base_ptr + 1152) >> shift) & 0xFFF;
-        sum0 += structured12_decode(d0, base_exp) * bf16_to_float(activations[col]);
-        sum1 += structured12_decode(d1, base_exp) * bf16_to_float(activations[col + WORKGROUP_SIZE]);
-        sum2 += structured12_decode(d2, base_exp) * bf16_to_float(activations[col + WORKGROUP_SIZE * 2]);
-        sum3 += structured12_decode(d3, base_exp) * bf16_to_float(activations[col + WORKGROUP_SIZE * 3]);
-        base_ptr += 1536;
+        uint32_t d0 = (uint32_t)(*(const uint64_t*)(pack_ptr) >> shift) & 0xFFF;
+        uint32_t d1 = (uint32_t)(*(const uint64_t*)(pack_ptr + 384) >> shift) & 0xFFF;
+        uint32_t d2 = (uint32_t)(*(const uint64_t*)(pack_ptr + 768) >> shift) & 0xFFF;
+        uint32_t d3 = (uint32_t)(*(const uint64_t*)(pack_ptr + 1152) >> shift) & 0xFFF;
+        sum0 += structured12_decode(d0, base_exp) * bf16_to_float(*(const int16_t*)(act_ptr));
+        sum1 += structured12_decode(d1, base_exp) * bf16_to_float(*(const int16_t*)(act_ptr + 512));
+        sum2 += structured12_decode(d2, base_exp) * bf16_to_float(*(const int16_t*)(act_ptr + 1024));
+        sum3 += structured12_decode(d3, base_exp) * bf16_to_float(*(const int16_t*)(act_ptr + 1536));
+        pack_ptr += 1536;
+        act_ptr += 2048;
     }
     for (; col < K; col += WORKGROUP_SIZE) {
-        uint32_t d = (uint32_t)(*(const uint64_t*)(base_ptr) >> shift) & 0xFFF;
-        sum0 += structured12_decode(d, base_exp) * bf16_to_float(activations[col]);
-        base_ptr += 384;
+        uint32_t d = (uint32_t)(*(const uint64_t*)(pack_ptr) >> shift) & 0xFFF;
+        sum0 += structured12_decode(d, base_exp) * bf16_to_float(*(const int16_t*)(act_ptr));
+        pack_ptr += 384;
+        act_ptr += 512;
     }
     float sum = sum0 + sum1 + sum2 + sum3;
     for (int off = WARP_SIZE / 2; off > 0; off >>= 1) sum += __shfl_down(sum, off, WARP_SIZE);
@@ -1690,6 +1742,17 @@ int launch_structured12_v2_async(
         dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
         (const uint32_t*)packed, base_exp,
         (const int16_t*)activations, (float*)output, M, K);
+    return 0;
+}
+
+int launch_structured12_v2_fp32act_async(
+    const void* packed, int base_exp,
+    const void* activations, void* output, int M, int K, void* stream)
+{
+    hipLaunchKernelGGL(structured12_matvec_v2_fp32act,
+        dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
+        (const uint32_t*)packed, base_exp,
+        (const float*)activations, (float*)output, M, K);
     return 0;
 }
 

@@ -28,18 +28,12 @@ extern "C" {
     void launch_fp32_to_bf16(const float* input, int16_t* output, int n, hipStream_t stream);
 
     // Two-pass BF16: v2 matvec (no escape) + BF16 patch correction
-    int launch_fixed12_v2_async(const void* packed, const void* codebook, const void* activations, void* output, int M, int K, void* stream);
     int launch_patches_v2_async(const void* row_offsets, const void* patch_cols, const void* correct_vals, const void* wrong_vals, const void* activations, void* output, int M, void* stream);
-
-    // Fused BF16 batch4 (single-pass, O(1) escape with split offset table)
-    int launch_fixed12_batch4_async(const void* packed, const void* codebook, const void* a0, const void* a1, const void* a2, const void* a3, const void* esc_row_base, const void* esc_thread_off, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, int M, int K, void* stream);
-
-    // Fused BF16 batch8 (single-pass, O(1) escape with split offset table)
-    int launch_fixed12_batch8_v2_async(const void* packed, const void* codebook, const void* a0, const void* a1, const void* a2, const void* a3, const void* a4, const void* a5, const void* a6, const void* a7, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, void* o4, void* o5, void* o6, void* o7, int M, int K, void* stream);
 
     // Structured 12-bit: arithmetic decode (no LDS codebook)
     int launch_structured12_v2_async(const void* packed, int base_exp, const void* activations, void* output, int M, int K, void* stream);
-    int launch_structured12_fused_b1_async(const void* packed, int base_exp, const void* activations, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* output, int M, int K, void* stream);
+    int launch_structured12_v2_fp32act_async(const void* packed, int base_exp, const void* activations, void* output, int M, int K, void* stream);
+    int launch_patches_v2_f32_async(const void* row_offsets, const void* patch_cols, const void* correct_vals, const void* wrong_vals, const void* activations, void* output, int M, void* stream);
     int launch_structured12_batch4_async(const void* packed, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, int M, int K, void* stream);
     int launch_structured12_batch8_async(const void* packed, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* a4, const void* a5, const void* a6, const void* a7, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, void* o4, void* o5, void* o6, void* o7, int M, int K, void* stream);
 }
@@ -188,11 +182,14 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
             launch_flash_attention(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
                 state->attn_out, cfg.n_head, cfg.n_head_kv, head_dim, pos+1, m->max_seq_len, scale, stream);
 
-        launch_fp32_to_bf16(state->attn_out, bf16_a, n, stream);
         PROF_END_NM(stream);
 
+        // wo: use FP32 activations directly from attention output (skip bf16 conversion)
         PROF_START(stream);
-        MATVEC_B1(L.wo, bf16_a, res);
+        launch_structured12_v2_fp32act_async(L.wo.packed, L.wo.base_exp, state->attn_out, res, L.wo.M, L.wo.K, stream);
+        if (L.wo.num_patches > 0 && L.wo.row_offsets)
+            launch_patches_v2_f32_async(L.wo.row_offsets, L.wo.patch_cols, L.wo.patch_correct, L.wo.patch_wrong,
+                                        state->attn_out, res, L.wo.M, stream);
         PROF_END_MV(stream);
 
         PROF_START(stream);
@@ -217,15 +214,13 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
             auto& nextL = m->layers[layer + 1];
             launch_add_rms_norm_bf16_batch(cur, res, nextL.attn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
         } else {
-            launch_add_batch(cur, res, n, 1, stream);
+            // Fuse last layer's add with output RMSNorm (saves 2 launches → 0)
+            launch_add_rms_norm_bf16_batch(cur, res, m->output_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
         }
         PROF_END_NM(stream);
     }
 
-    // Fused RMSNorm → BF16 for output projection (saves 1 launch)
-    PROF_START(stream);
-    launch_rms_norm_bf16_batch(cur, m->output_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
-    PROF_END_NM(stream);
+    // Output projection (bf16_a already set by fused add+norm above)
     PROF_START(stream);
     MATVEC_B1(m->output_proj, bf16_a, state->logits);
     PROF_END_MV(stream);
@@ -341,12 +336,12 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
             auto& nextL = m->layers[layer + 1];
             launch_add_rms_norm_bf16_batch(cur, res, nextL.attn_norm, bf16_a, n, cfg.rms_norm_eps, B, stream);
         } else {
-            launch_add_batch(cur, res, n, B, stream);
+            // Fuse last layer's add with output RMSNorm
+            launch_add_rms_norm_bf16_batch(cur, res, m->output_norm, bf16_a, n, cfg.rms_norm_eps, B, stream);
         }
     }
 
-    // Fused RMSNorm → BF16 for output projection (saves 1 launch)
-    launch_rms_norm_bf16_batch(cur, m->output_norm, bf16_a, n, cfg.rms_norm_eps, B, stream);
+    // Output projection (bf16_a already set by fused add+norm above)
     launch_structured12_batch4_async(m->output_proj.packed, m->output_proj.base_exp,
         SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
         m->output_proj.escape_row_base, m->output_proj.escape_counts, m->output_proj.escape_vals,
@@ -462,12 +457,12 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
             auto& nextL = m->layers[layer + 1];
             launch_add_rms_norm_bf16_batch(cur, res, nextL.attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
         } else {
-            launch_add_batch(cur, res, n, BS, stream);
+            // Fuse last layer's add with output RMSNorm
+            launch_add_rms_norm_bf16_batch(cur, res, m->output_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
         }
     }
 
-    // Fused RMSNorm -> BF16 for output projection
-    launch_rms_norm_bf16_batch(cur, m->output_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
+    // Output projection (bf16_a already set by fused add+norm above)
     launch_structured12_batch8_async(m->output_proj.packed, m->output_proj.base_exp,
         SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
         SEQI(bf16_a,4,n), SEQI(bf16_a,5,n), SEQI(bf16_a,6,n), SEQI(bf16_a,7,n),
