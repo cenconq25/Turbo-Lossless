@@ -1415,26 +1415,29 @@ __global__ void structured12_matvec_v2(
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
     __shared__ float warp_sums[4];
-    float sum0 = 0.0f, sum1 = 0.0f;
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+    const int64_t stride = (int64_t)(WORKGROUP_SIZE * 12);
     int64_t bp = (int64_t)row * K * 12 + (int64_t)tid * 12;
     int col = tid;
-    for (; col + WORKGROUP_SIZE < K; col += WORKGROUP_SIZE * 2) {
-        uint32_t raw0 = read12(packed, bp);
-        uint32_t raw1 = read12(packed, bp + (int64_t)(WORKGROUP_SIZE * 12));
-        // Structured decode: group=0 means escape, decoded value will be wrong
-        // but patches_v2 will correct it (same two-pass strategy as fixed12_matvec_v2)
-        float w0 = structured12_decode(raw0, base_exp);
-        float w1 = structured12_decode(raw1, base_exp);
+    // 4× unroll: process 4 elements per iteration (more loads in flight)
+    for (; col + WORKGROUP_SIZE * 3 < K; col += WORKGROUP_SIZE * 4) {
+        float w0 = structured12_decode(read12(packed, bp), base_exp);
+        float w1 = structured12_decode(read12(packed, bp + stride), base_exp);
+        float w2 = structured12_decode(read12(packed, bp + stride * 2), base_exp);
+        float w3 = structured12_decode(read12(packed, bp + stride * 3), base_exp);
         sum0 += w0 * bf16_to_float(activations[col]);
         sum1 += w1 * bf16_to_float(activations[col + WORKGROUP_SIZE]);
-        bp += (int64_t)(WORKGROUP_SIZE * 2 * 12);
+        sum2 += w2 * bf16_to_float(activations[col + WORKGROUP_SIZE * 2]);
+        sum3 += w3 * bf16_to_float(activations[col + WORKGROUP_SIZE * 3]);
+        bp += stride * 4;
     }
-    if (col < K) {
-        uint32_t raw = read12(packed, bp);
-        float w = structured12_decode(raw, base_exp);
+    // Remainder
+    for (; col < K; col += WORKGROUP_SIZE) {
+        float w = structured12_decode(read12(packed, bp), base_exp);
         sum0 += w * bf16_to_float(activations[col]);
+        bp += stride;
     }
-    float sum = sum0 + sum1;
+    float sum = sum0 + sum1 + sum2 + sum3;
     for (int off = WARP_SIZE / 2; off > 0; off >>= 1) sum += __shfl_down(sum, off, WARP_SIZE);
     if ((tid & (WARP_SIZE-1)) == 0) warp_sums[tid >> 6] = sum;
     __syncthreads();
