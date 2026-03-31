@@ -1356,18 +1356,17 @@ __global__ void structured12_matvec_batch4(
     for (int w = 0; w < warp_id; w++) cross += warp_esc_totals[w];
     int esc_ptr = escape_row_base[row] + cross + prefix;
 
-    // Main FMA loop — 32-bit bp to avoid int64 overhead in hot loop
+    // Main FMA loop — pointer-based addressing with constant offsets
     const uint32_t* row_packed = packed + (int64_t)row * K * 12 / 32;
     int bp = (int)((int64_t)row * K * 12 % 32) + tid * 12;
-    const int stride = WORKGROUP_SIZE * 12;
+    const int shift = bp & 31;  // constant — stride is multiple of 32
+    const char* base_ptr = (const char*)(row_packed + (bp >> 5));
     float s0a=0,s0b=0,s1a=0,s1b=0,s2a=0,s2b=0,s3a=0,s3b=0;
 
     int col = tid;
     for (; col + WORKGROUP_SIZE < K; col += WORKGROUP_SIZE * 2) {
-        int w0i = bp >> 5; int s0i = bp & 31;
-        int w1i = (bp+stride) >> 5; int s1i = (bp+stride) & 31;
-        uint32_t raw0 = (uint32_t)(((uint64_t)row_packed[w0i] | ((uint64_t)row_packed[w0i+1] << 32)) >> s0i) & 0xFFF;
-        uint32_t raw1 = (uint32_t)(((uint64_t)row_packed[w1i] | ((uint64_t)row_packed[w1i+1] << 32)) >> s1i) & 0xFFF;
+        uint32_t raw0 = (uint32_t)(*(const uint64_t*)(base_ptr) >> shift) & 0xFFF;
+        uint32_t raw1 = (uint32_t)(*(const uint64_t*)(base_ptr + 384) >> shift) & 0xFFF;
 
         uint32_t g0 = raw0 >> 8, g1 = raw1 >> 8;
         float wt0 = (__builtin_expect(g0 != 0, 1))
@@ -1381,11 +1380,10 @@ __global__ void structured12_matvec_batch4(
         s1a += wt0 * bf16_to_float(act1[col]);  s1b += wt1 * bf16_to_float(act1[col + WORKGROUP_SIZE]);
         s2a += wt0 * bf16_to_float(act2[col]);  s2b += wt1 * bf16_to_float(act2[col + WORKGROUP_SIZE]);
         s3a += wt0 * bf16_to_float(act3[col]);  s3b += wt1 * bf16_to_float(act3[col + WORKGROUP_SIZE]);
-        bp += stride * 2;
+        base_ptr += 768;  // stride*2 / 32 * 4 = 2*384
     }
     if (col < K) {
-        int wi = bp >> 5; int si = bp & 31;
-        uint32_t raw = (uint32_t)(((uint64_t)row_packed[wi] | ((uint64_t)row_packed[wi+1] << 32)) >> si) & 0xFFF;
+        uint32_t raw = (uint32_t)(*(const uint64_t*)(base_ptr) >> shift) & 0xFFF;
         uint32_t g = raw >> 8;
         float wt = (__builtin_expect(g != 0, 1))
             ? structured12_decode(raw, base_exp)
@@ -1440,27 +1438,28 @@ __global__ void structured12_matvec_v2(
     int bp = (int)((int64_t)row * K * 12 % 32) + tid * 12;
     const int stride = WORKGROUP_SIZE * 12;
 
+    // Pointer-based access: base pointer + constant byte offsets per unrolled element
+    // Shift is constant across all iterations (stride = 256*12 = 3072 = 96*32)
+    const int shift = bp & 31;
+    const char* base_ptr = (const char*)(row_packed + (bp >> 5));
+    // Byte offsets between unrolled elements: stride/32 * 4 = 96*4 = 384 bytes
+    // Advance per iteration: stride*4/32 * 4 = 384*4 = 1536 bytes
     int col = tid;
     for (; col + WORKGROUP_SIZE * 3 < K; col += WORKGROUP_SIZE * 4) {
-        int w0 = bp >> 5; int s0 = bp & 31;
-        int w1 = (bp + stride) >> 5; int s1 = (bp + stride) & 31;
-        int w2 = (bp + stride*2) >> 5; int s2 = (bp + stride*2) & 31;
-        int w3 = (bp + stride*3) >> 5; int s3 = (bp + stride*3) & 31;
-        uint32_t d0 = (uint32_t)(((uint64_t)row_packed[w0] | ((uint64_t)row_packed[w0+1] << 32)) >> s0) & 0xFFF;
-        uint32_t d1 = (uint32_t)(((uint64_t)row_packed[w1] | ((uint64_t)row_packed[w1+1] << 32)) >> s1) & 0xFFF;
-        uint32_t d2 = (uint32_t)(((uint64_t)row_packed[w2] | ((uint64_t)row_packed[w2+1] << 32)) >> s2) & 0xFFF;
-        uint32_t d3 = (uint32_t)(((uint64_t)row_packed[w3] | ((uint64_t)row_packed[w3+1] << 32)) >> s3) & 0xFFF;
+        uint32_t d0 = (uint32_t)(*(const uint64_t*)(base_ptr) >> shift) & 0xFFF;
+        uint32_t d1 = (uint32_t)(*(const uint64_t*)(base_ptr + 384) >> shift) & 0xFFF;
+        uint32_t d2 = (uint32_t)(*(const uint64_t*)(base_ptr + 768) >> shift) & 0xFFF;
+        uint32_t d3 = (uint32_t)(*(const uint64_t*)(base_ptr + 1152) >> shift) & 0xFFF;
         sum0 += structured12_decode(d0, base_exp) * bf16_to_float(activations[col]);
         sum1 += structured12_decode(d1, base_exp) * bf16_to_float(activations[col + WORKGROUP_SIZE]);
         sum2 += structured12_decode(d2, base_exp) * bf16_to_float(activations[col + WORKGROUP_SIZE * 2]);
         sum3 += structured12_decode(d3, base_exp) * bf16_to_float(activations[col + WORKGROUP_SIZE * 3]);
-        bp += stride * 4;
+        base_ptr += 1536;
     }
     for (; col < K; col += WORKGROUP_SIZE) {
-        int w = bp >> 5; int s = bp & 31;
-        uint32_t d = (uint32_t)(((uint64_t)row_packed[w] | ((uint64_t)row_packed[w+1] << 32)) >> s) & 0xFFF;
+        uint32_t d = (uint32_t)(*(const uint64_t*)(base_ptr) >> shift) & 0xFFF;
         sum0 += structured12_decode(d, base_exp) * bf16_to_float(activations[col]);
-        bp += stride;
+        base_ptr += 384;
     }
     float sum = sum0 + sum1 + sum2 + sum3;
     for (int off = WARP_SIZE / 2; off > 0; off >>= 1) sum += __shfl_down(sum, off, WARP_SIZE);
@@ -1507,22 +1506,19 @@ __global__ void structured12_matvec_fused_b1(
     for (int w = 0; w < warp_id; w++) cross += warp_esc_totals[w];
     int esc_ptr = escape_row_base[row] + cross + prefix;
 
-    // Main FMA loop — 32-bit bp, 4x unroll (matches v2 pattern for best ILP)
+    // Main FMA loop — pointer-based addressing with constant offsets
     const uint32_t* row_packed = packed + (int64_t)row * K * 12 / 32;
     int bp = (int)((int64_t)row * K * 12 % 32) + tid * 12;
-    const int stride = WORKGROUP_SIZE * 12;
+    const int shift = bp & 31;
+    const char* base_ptr = (const char*)(row_packed + (bp >> 5));
     float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
 
     int col = tid;
     for (; col + WORKGROUP_SIZE * 3 < K; col += WORKGROUP_SIZE * 4) {
-        int w0 = bp >> 5; int s0 = bp & 31;
-        int w1 = (bp + stride) >> 5; int s1 = (bp + stride) & 31;
-        int w2 = (bp + stride*2) >> 5; int s2 = (bp + stride*2) & 31;
-        int w3 = (bp + stride*3) >> 5; int s3 = (bp + stride*3) & 31;
-        uint32_t d0 = (uint32_t)(((uint64_t)row_packed[w0] | ((uint64_t)row_packed[w0+1] << 32)) >> s0) & 0xFFF;
-        uint32_t d1 = (uint32_t)(((uint64_t)row_packed[w1] | ((uint64_t)row_packed[w1+1] << 32)) >> s1) & 0xFFF;
-        uint32_t d2 = (uint32_t)(((uint64_t)row_packed[w2] | ((uint64_t)row_packed[w2+1] << 32)) >> s2) & 0xFFF;
-        uint32_t d3 = (uint32_t)(((uint64_t)row_packed[w3] | ((uint64_t)row_packed[w3+1] << 32)) >> s3) & 0xFFF;
+        uint32_t d0 = (uint32_t)(*(const uint64_t*)(base_ptr) >> shift) & 0xFFF;
+        uint32_t d1 = (uint32_t)(*(const uint64_t*)(base_ptr + 384) >> shift) & 0xFFF;
+        uint32_t d2 = (uint32_t)(*(const uint64_t*)(base_ptr + 768) >> shift) & 0xFFF;
+        uint32_t d3 = (uint32_t)(*(const uint64_t*)(base_ptr + 1152) >> shift) & 0xFFF;
 
         uint32_t g0 = d0 >> 8, g1 = d1 >> 8, g2 = d2 >> 8, g3 = d3 >> 8;
         float wt0 = (__builtin_expect(g0 != 0, 1)) ? structured12_decode(d0, base_exp) : bf16_to_float(escape_vals[esc_ptr++]);
@@ -1534,15 +1530,15 @@ __global__ void structured12_matvec_fused_b1(
         sum1 += wt1 * bf16_to_float(activations[col + WORKGROUP_SIZE]);
         sum2 += wt2 * bf16_to_float(activations[col + WORKGROUP_SIZE * 2]);
         sum3 += wt3 * bf16_to_float(activations[col + WORKGROUP_SIZE * 3]);
-        bp += stride * 4;
+        base_ptr += 1536;
     }
     for (; col < K; col += WORKGROUP_SIZE) {
         int wi = bp >> 5; int si = bp & 31;
-        uint32_t d = (uint32_t)(((uint64_t)row_packed[wi] | ((uint64_t)row_packed[wi+1] << 32)) >> si) & 0xFFF;
+        uint32_t d = (uint32_t)(*(const uint64_t*)(base_ptr) >> shift) & 0xFFF;
         uint32_t g = d >> 8;
         float wt = (__builtin_expect(g != 0, 1)) ? structured12_decode(d, base_exp) : bf16_to_float(escape_vals[esc_ptr++]);
         sum0 += wt * bf16_to_float(activations[col]);
-        bp += stride;
+        base_ptr += 384;
     }
 
     // Warp reduction + output
@@ -1597,19 +1593,18 @@ __global__ void structured12_matvec_batch8(
     for (int w = 0; w < warp_id; w++) cross += warp_esc_totals[w];
     int esc_ptr = escape_row_base[row] + cross + prefix;
 
-    // Main FMA loop — 32-bit bp to avoid int64 overhead in hot loop
+    // Main FMA loop — pointer-based addressing with constant offsets
     const uint32_t* row_packed = packed + (int64_t)row * K * 12 / 32;
     int bp = (int)((int64_t)row * K * 12 % 32) + tid * 12;
-    const int stride = WORKGROUP_SIZE * 12;
+    const int shift = bp & 31;  // constant — stride is multiple of 32
+    const char* base_ptr = (const char*)(row_packed + (bp >> 5));
     float s0a=0,s0b=0,s1a=0,s1b=0,s2a=0,s2b=0,s3a=0,s3b=0;
     float s4a=0,s4b=0,s5a=0,s5b=0,s6a=0,s6b=0,s7a=0,s7b=0;
 
     int col = tid;
     for (; col + WORKGROUP_SIZE < K; col += WORKGROUP_SIZE * 2) {
-        int w0i = bp >> 5; int s0i = bp & 31;
-        int w1i = (bp+stride) >> 5; int s1i = (bp+stride) & 31;
-        uint32_t raw0 = (uint32_t)(((uint64_t)row_packed[w0i] | ((uint64_t)row_packed[w0i+1] << 32)) >> s0i) & 0xFFF;
-        uint32_t raw1 = (uint32_t)(((uint64_t)row_packed[w1i] | ((uint64_t)row_packed[w1i+1] << 32)) >> s1i) & 0xFFF;
+        uint32_t raw0 = (uint32_t)(*(const uint64_t*)(base_ptr) >> shift) & 0xFFF;
+        uint32_t raw1 = (uint32_t)(*(const uint64_t*)(base_ptr + 384) >> shift) & 0xFFF;
 
         uint32_t g0 = raw0 >> 8, g1 = raw1 >> 8;
         float wt0 = (__builtin_expect(g0 != 0, 1))
@@ -1627,11 +1622,10 @@ __global__ void structured12_matvec_batch8(
         s5a += wt0 * bf16_to_float(act5[col]);  s5b += wt1 * bf16_to_float(act5[col + WORKGROUP_SIZE]);
         s6a += wt0 * bf16_to_float(act6[col]);  s6b += wt1 * bf16_to_float(act6[col + WORKGROUP_SIZE]);
         s7a += wt0 * bf16_to_float(act7[col]);  s7b += wt1 * bf16_to_float(act7[col + WORKGROUP_SIZE]);
-        bp += stride * 2;
+        base_ptr += 768;
     }
     if (col < K) {
-        int wi = bp >> 5; int si = bp & 31;
-        uint32_t raw = (uint32_t)(((uint64_t)row_packed[wi] | ((uint64_t)row_packed[wi+1] << 32)) >> si) & 0xFFF;
+        uint32_t raw = (uint32_t)(*(const uint64_t*)(base_ptr) >> shift) & 0xFFF;
         uint32_t g = raw >> 8;
         float wt = (__builtin_expect(g != 0, 1))
             ? structured12_decode(raw, base_exp)

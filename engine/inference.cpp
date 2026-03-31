@@ -104,6 +104,30 @@ void free_inference_state(InferenceState* state) {
     delete state;
 }
 
+// Profiling support (TURBO_PROFILE=1 to enable)
+static int s_profile = -1;
+static int s_profile_tokens = 0;
+static float s_prof_matvec = 0, s_prof_nonmv = 0;
+
+#define PROF_INIT() do { \
+    if (s_profile < 0) { const char* e = getenv("TURBO_PROFILE"); s_profile = (e && e[0]=='1') ? 1 : 0; } \
+} while(0)
+
+#define PROF_EVENT_DECL() hipEvent_t _pE0, _pE1
+#define PROF_EVENT_CREATE() do { if (s_profile) { hipEventCreate(&_pE0); hipEventCreate(&_pE1); } } while(0)
+#define PROF_EVENT_DESTROY() do { if (s_profile) { hipEventDestroy(_pE0); hipEventDestroy(_pE1); } } while(0)
+#define PROF_START(strm) do { if (s_profile) hipEventRecord(_pE0, strm); } while(0)
+#define PROF_END_MV(strm) do { if (s_profile) { hipEventRecord(_pE1, strm); hipEventSynchronize(_pE1); \
+    float _ms; hipEventElapsedTime(&_ms, _pE0, _pE1); s_prof_matvec += _ms; } } while(0)
+#define PROF_END_NM(strm) do { if (s_profile) { hipEventRecord(_pE1, strm); hipEventSynchronize(_pE1); \
+    float _ms; hipEventElapsedTime(&_ms, _pE0, _pE1); s_prof_nonmv += _ms; } } while(0)
+#define PROF_TOKEN() do { if (s_profile && ++s_profile_tokens % 10 == 0) { \
+    float total = s_prof_matvec + s_prof_nonmv; \
+    printf("  [PROFILE] %d tokens: matvec %.1fms (%.0f%%), non-matvec %.1fms (%.0f%%), total %.1fms (%.1f tok/s)\n", \
+        s_profile_tokens, s_prof_matvec, 100*s_prof_matvec/total, s_prof_nonmv, 100*s_prof_nonmv/total, \
+        total, 10000.0f/total); \
+    s_prof_matvec = s_prof_nonmv = 0; } } while(0)
+
 // B=1 forward — optimized: no redundant memcpy, single sync at end
 static void forward_b1(InferenceState* state, const int* token_ids) {
     Model* m = state->model;
@@ -124,9 +148,11 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
     int16_t* bf16_a = state->bf16_act;   // BF16 activation buffer
     int16_t* bf16_b = state->bf16_act2;  // second BF16 buffer
 
+    PROF_INIT();
+    PROF_EVENT_DECL();
+    PROF_EVENT_CREATE();
+
     // Two-pass BF16 matvec: structured 12-bit v2 (no escape) + patch correction
-    // Benchmarked: two-pass with 4x unroll is faster than single-pass fused for B=1
-    // because per-block escape prefix sum overhead > saved kernel launches
     #define MATVEC_B1(w, bf16_in, fp32_out) do { \
         launch_structured12_v2_async((w).packed, (w).base_exp, bf16_in, fp32_out, (w).M, (w).K, stream); \
         if ((w).num_patches > 0 && (w).row_offsets) \
@@ -138,21 +164,23 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
         auto& L = m->layers[layer];
 
         // Fused RMSNorm → BF16 for Q/K/V input
-        // (first layer: standalone norm; subsequent: fused with previous layer's add)
+        PROF_START(stream);
         if (layer == 0)
             launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
-        // else: bf16_a already set by fused add+norm at end of previous layer
+        PROF_END_NM(stream);
 
+        PROF_START(stream);
         MATVEC_B1(L.wq, bf16_a, state->q_buf);
         MATVEC_B1(L.wk, bf16_a, state->k_buf);
         MATVEC_B1(L.wv, bf16_a, state->v_buf);
+        PROF_END_MV(stream);
 
+        PROF_START(stream);
         launch_rope(state->q_buf, state->k_buf, head_dim, cfg.n_head, cfg.n_head_kv, pos, cfg.rope_theta, stream);
 
         size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
         launch_store_kv(state->k_buf, state->v_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
                         pos, cfg.n_head_kv, head_dim, m->max_seq_len, stream);
-        // Adaptive: naive attention for short context, flash for long
         if (pos < 1024)
             launch_attention_all_heads(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
                 state->attn_out, cfg.n_head, cfg.n_head_kv, head_dim, pos+1, m->max_seq_len, scale, stream);
@@ -160,32 +188,49 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
             launch_flash_attention(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
                 state->attn_out, cfg.n_head, cfg.n_head_kv, head_dim, pos+1, m->max_seq_len, scale, stream);
 
-        // wo: attn_out → BF16 (can't fuse — attention outputs FP32)
         launch_fp32_to_bf16(state->attn_out, bf16_a, n, stream);
-        MATVEC_B1(L.wo, bf16_a, res);
+        PROF_END_NM(stream);
 
-        // Fused add + RMSNorm → BF16 (res += cur, then bf16_a = norm(res))
+        PROF_START(stream);
+        MATVEC_B1(L.wo, bf16_a, res);
+        PROF_END_MV(stream);
+
+        PROF_START(stream);
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
+        PROF_END_NM(stream);
+
+        PROF_START(stream);
         MATVEC_B1(L.w_gate, bf16_a, state->ffn_gate);
         MATVEC_B1(L.w_up, bf16_a, state->ffn_up);
+        PROF_END_MV(stream);
 
-        // Fused SiLU*mul → BF16 for w_down input (saves 1 launch)
+        PROF_START(stream);
         launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, cfg.n_ff, 1, stream);
-        MATVEC_B1(L.w_down, bf16_b, cur);
+        PROF_END_NM(stream);
 
-        // Fuse add + next layer's RMSNorm (saves 1 kernel launch per layer)
+        PROF_START(stream);
+        MATVEC_B1(L.w_down, bf16_b, cur);
+        PROF_END_MV(stream);
+
+        PROF_START(stream);
         if (layer + 1 < cfg.n_layer) {
             auto& nextL = m->layers[layer + 1];
-            // cur += res, bf16_a = norm(cur) — cur holds hidden state, res is free for next wo
             launch_add_rms_norm_bf16_batch(cur, res, nextL.attn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
         } else {
             launch_add_batch(cur, res, n, 1, stream);
         }
+        PROF_END_NM(stream);
     }
 
     // Fused RMSNorm → BF16 for output projection (saves 1 launch)
+    PROF_START(stream);
     launch_rms_norm_bf16_batch(cur, m->output_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
+    PROF_END_NM(stream);
+    PROF_START(stream);
     MATVEC_B1(m->output_proj, bf16_a, state->logits);
+    PROF_END_MV(stream);
+    PROF_EVENT_DESTROY();
+    PROF_TOKEN();
     state->positions[0] = pos + 1;
     #undef MATVEC_B1
 }
