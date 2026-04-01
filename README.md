@@ -63,7 +63,7 @@ B=8:  decode -> 8x FMA    (2.4x faster than BF16)
 
 ## Benchmarks
 
-### RTX 5070 Ti 16GB (NVIDIA Blackwell, 504 GB/s)
+### RTX 5070 Ti 16GB (NVIDIA Blackwell, 896 GB/s)
 
 #### Mistral 7B Instruct (7.25B params, escape rate 0.031%)
 
@@ -71,7 +71,12 @@ B=8:  decode -> 8x FMA    (2.4x faster than BF16)
 |------:|---------------:|-------------:|:-------:|:-----------:|-----:|
 | B=1 | 55.6 tok/s | **62.0 tok/s** | **1.12x** | **1.36x** | 13.5 vs **~10 GB** |
 | B=4 | — | **156.0 tok/s** | — | **1.36x** | **~10 GB** |
-| **B=8** | — | **162.2 tok/s** | **2.92x** | **1.36x** | **~10 GB** |
+| B=8 | — | **162.2 tok/s** | **2.92x** | **1.36x** | **~10 GB** |
+| B=16 | — | **171.0 tok/s** | **3.08x** | **1.36x** | **~10 GB** |
+| B=32 | — | 169.8 tok/s | 3.06x | **1.36x** | **~10 GB** |
+| B=64 | — | 169.3 tok/s | 3.05x | **1.36x** | **~10 GB** |
+
+Throughput peaks at **B=16 (171 tok/s)** then plateaus — memory bandwidth saturated.
 
 #### Llama 3.1 8B Instruct (8.03B params, escape rate 0.021%)
 
@@ -79,7 +84,12 @@ B=8:  decode -> 8x FMA    (2.4x faster than BF16)
 |------:|---------------:|-------------:|:-------:|:-----------:|-----:|
 | B=1 | 51.0 tok/s | **58.6 tok/s** | **1.15x** | **1.42x** | 15.0 vs **~10.5 GB** |
 | B=4 | — | **146.7 tok/s** | — | **1.42x** | **~10.5 GB** |
-| **B=8** | — | **159.0 tok/s** | **3.12x** | **1.42x** | **~10.5 GB** |
+| B=8 | — | **159.0 tok/s** | **3.12x** | **1.42x** | **~10.5 GB** |
+| B=16 | — | **162.9 tok/s** | **3.19x** | **1.42x** | **~10.5 GB** |
+| B=32 | — | 162.0 tok/s | 3.18x | **1.42x** | **~10.5 GB** |
+| B=64 | — | 161.7 tok/s | 3.17x | **1.42x** | **~10.5 GB** |
+
+Throughput peaks at **B=16 (163 tok/s)** then plateaus. No OOM up to B=1024.
 
 ### MI50 32GB (AMD GCN, 1.0 TB/s)
 
