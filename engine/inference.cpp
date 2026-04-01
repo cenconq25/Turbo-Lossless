@@ -31,8 +31,9 @@ extern "C" {
     int launch_patches_v2_async(const void* row_offsets, const void* patch_cols, const void* correct_vals, const void* wrong_vals, const void* activations, void* output, int M, void* stream);
 
     // Structured 12-bit: arithmetic decode (no LDS codebook)
-    int launch_structured12_v2_async(const void* packed, int base_exp, const void* activations, void* output, int M, int K, void* stream);
+    int launch_structured12_v2_async(const void* packed, int base_exp, const void* activations, void* output, int M, int K, void* stream, const void* patch_row_offsets, const void* patch_cols, const void* patch_correct_vals, const void* patch_wrong_vals);
     int launch_structured12_v2_fp32act_async(const void* packed, int base_exp, const void* activations, void* output, int M, int K, void* stream);
+    int launch_structured12_v2_dual_async(const void* packed_a, int base_exp_a, const void* packed_b, int base_exp_b, const void* activations, void* output_a, void* output_b, int M, int K, void* stream);
     int launch_structured12_batch4_async(const void* packed, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, int M, int K, void* stream);
     int launch_structured12_batch8_async(const void* packed, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* a4, const void* a5, const void* a6, const void* a7, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, void* o4, void* o5, void* o6, void* o7, int M, int K, void* stream);
 }
@@ -152,12 +153,10 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
     PROF_EVENT_DECL();
     PROF_EVENT_CREATE();
 
-    // Two-pass BF16 matvec: structured 12-bit v2 (no escape) + patch correction
+    // Single-pass BF16 matvec: structured 12-bit v2 with inline patch correction
     #define MATVEC_B1(w, bf16_in, fp32_out) do { \
-        launch_structured12_v2_async((w).packed, (w).base_exp, bf16_in, fp32_out, (w).M, (w).K, stream); \
-        if ((w).num_patches > 0 && (w).row_offsets) \
-            launch_patches_v2_async((w).row_offsets, (w).patch_cols, (w).patch_correct, (w).patch_wrong, \
-                                    bf16_in, fp32_out, (w).M, stream); \
+        launch_structured12_v2_async((w).packed, (w).base_exp, bf16_in, fp32_out, (w).M, (w).K, stream, \
+            (w).row_offsets, (w).patch_cols, (w).patch_correct, (w).patch_wrong); \
     } while(0)
 
     for (int layer = 0; layer < cfg.n_layer; layer++) {
@@ -200,8 +199,20 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
         PROF_END_NORM(stream);
 
         PROF_START(stream);
-        MATVEC_B1(L.w_gate, bf16_a, state->ffn_gate);
-        MATVEC_B1(L.w_up, bf16_a, state->ffn_up);
+        // Fused dual kernel: gate + up share activation reads (1 launch instead of 2)
+        launch_structured12_v2_dual_async(
+            L.w_gate.packed, L.w_gate.base_exp,
+            L.w_up.packed, L.w_up.base_exp,
+            bf16_a,
+            state->ffn_gate, state->ffn_up,
+            L.w_gate.M, L.w_gate.K, stream);
+        // Apply patch corrections for both tensors
+        if (L.w_gate.num_patches > 0 && L.w_gate.row_offsets)
+            launch_patches_v2_async(L.w_gate.row_offsets, L.w_gate.patch_cols, L.w_gate.patch_correct, L.w_gate.patch_wrong,
+                                    bf16_a, state->ffn_gate, L.w_gate.M, stream);
+        if (L.w_up.num_patches > 0 && L.w_up.row_offsets)
+            launch_patches_v2_async(L.w_up.row_offsets, L.w_up.patch_cols, L.w_up.patch_correct, L.w_up.patch_wrong,
+                                    bf16_a, state->ffn_up, L.w_up.M, stream);
         PROF_END_MV(stream);
 
         PROF_START(stream);

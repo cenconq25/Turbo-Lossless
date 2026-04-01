@@ -1565,6 +1565,104 @@ __global__ void structured12_matvec_v2(
 }
 
 // ---------------------------------------------------------------------------
+// Structured 12-bit B=1 DUAL matvec: processes TWO weight tensors (gate+up)
+// sharing the same activation reads. Saves 1 kernel launch per layer and
+// shares L2 cache for activations.
+// ---------------------------------------------------------------------------
+__launch_bounds__(WORKGROUP_SIZE)
+__global__ void structured12_matvec_v2_dual(
+    const uint32_t* __restrict__ packed_a, int base_exp_a,  // first tensor (gate)
+    const uint32_t* __restrict__ packed_b, int base_exp_b,  // second tensor (up)
+    const int16_t*  __restrict__ activations,
+    float*          __restrict__ output_a,
+    float*          __restrict__ output_b,
+    int M, int K)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    __shared__ float warp_sums_a[4];
+    __shared__ float warp_sums_b[4];
+
+    float sa0 = 0.0f, sa1 = 0.0f, sa2 = 0.0f, sa3 = 0.0f;
+    float sb0 = 0.0f, sb1 = 0.0f, sb2 = 0.0f, sb3 = 0.0f;
+
+    // Both tensors have same dimensions, so same row layout
+    int64_t row_bit_start = (int64_t)row * K * 12;
+    int bp = (int)(row_bit_start % 32) + tid * 12;
+    const int shift = bp & 31;
+
+    // Pointer-based addressing for tensor A
+    const char* pa_ptr = (const char*)((const uint32_t*)packed_a + (row_bit_start / 32) + (bp >> 5));
+    // Pointer-based addressing for tensor B
+    const char* pb_ptr = (const char*)((const uint32_t*)packed_b + (row_bit_start / 32) + (bp >> 5));
+    // Activation pointer
+    const char* act_ptr = (const char*)(activations + tid);
+
+    int col = tid;
+    for (; col + WORKGROUP_SIZE * 3 < K; col += WORKGROUP_SIZE * 4) {
+        // Read activations ONCE (shared between both tensors)
+        float af0 = bf16_to_float(*(const int16_t*)(act_ptr));
+        float af1 = bf16_to_float(*(const int16_t*)(act_ptr + 512));
+        float af2 = bf16_to_float(*(const int16_t*)(act_ptr + 1024));
+        float af3 = bf16_to_float(*(const int16_t*)(act_ptr + 1536));
+
+        // Decode weights from tensor A (gate)
+        uint32_t da0 = (uint32_t)(*(const uint64_t*)(pa_ptr) >> shift) & 0xFFF;
+        uint32_t da1 = (uint32_t)(*(const uint64_t*)(pa_ptr + 384) >> shift) & 0xFFF;
+        uint32_t da2 = (uint32_t)(*(const uint64_t*)(pa_ptr + 768) >> shift) & 0xFFF;
+        uint32_t da3 = (uint32_t)(*(const uint64_t*)(pa_ptr + 1152) >> shift) & 0xFFF;
+        sa0 += structured12_decode(da0, base_exp_a) * af0;
+        sa1 += structured12_decode(da1, base_exp_a) * af1;
+        sa2 += structured12_decode(da2, base_exp_a) * af2;
+        sa3 += structured12_decode(da3, base_exp_a) * af3;
+
+        // Decode weights from tensor B (up)
+        uint32_t db0 = (uint32_t)(*(const uint64_t*)(pb_ptr) >> shift) & 0xFFF;
+        uint32_t db1 = (uint32_t)(*(const uint64_t*)(pb_ptr + 384) >> shift) & 0xFFF;
+        uint32_t db2 = (uint32_t)(*(const uint64_t*)(pb_ptr + 768) >> shift) & 0xFFF;
+        uint32_t db3 = (uint32_t)(*(const uint64_t*)(pb_ptr + 1152) >> shift) & 0xFFF;
+        sb0 += structured12_decode(db0, base_exp_b) * af0;
+        sb1 += structured12_decode(db1, base_exp_b) * af1;
+        sb2 += structured12_decode(db2, base_exp_b) * af2;
+        sb3 += structured12_decode(db3, base_exp_b) * af3;
+
+        pa_ptr += 1536;
+        pb_ptr += 1536;
+        act_ptr += 2048;
+    }
+    // Remainder
+    for (; col < K; col += WORKGROUP_SIZE) {
+        float af = bf16_to_float(*(const int16_t*)(act_ptr));
+        uint32_t da = (uint32_t)(*(const uint64_t*)(pa_ptr) >> shift) & 0xFFF;
+        uint32_t db = (uint32_t)(*(const uint64_t*)(pb_ptr) >> shift) & 0xFFF;
+        sa0 += structured12_decode(da, base_exp_a) * af;
+        sb0 += structured12_decode(db, base_exp_b) * af;
+        pa_ptr += 384;
+        pb_ptr += 384;
+        act_ptr += 512;
+    }
+
+    // Reduction for tensor A
+    float sum_a = sa0 + sa1 + sa2 + sa3;
+    // Reduction for tensor B
+    float sum_b = sb0 + sb1 + sb2 + sb3;
+
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        sum_a += __shfl_down(sum_a, off, WARP_SIZE);
+        sum_b += __shfl_down(sum_b, off, WARP_SIZE);
+    }
+    if ((tid & (WARP_SIZE-1)) == 0) {
+        warp_sums_a[tid >> 6] = sum_a;
+        warp_sums_b[tid >> 6] = sum_b;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        output_a[row] = warp_sums_a[0] + warp_sums_a[1] + warp_sums_a[2] + warp_sums_a[3];
+        output_b[row] = warp_sums_b[0] + warp_sums_b[1] + warp_sums_b[2] + warp_sums_b[3];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Structured 12-bit B=1 matvec with buffer_load_dwordx2 (GFX9 SRD)
 // Uses buffer resource descriptors for packed data + activation loads.
 // Issue 4 packed loads + 4 activation loads, then single s_waitcnt.
@@ -1575,7 +1673,12 @@ __global__ void structured12_matvec_v2_bufload(
     uint32_t asrd0, uint32_t asrd1, uint32_t asrd2, uint32_t asrd3,  // activation SRD
     int base_exp,
     float*          __restrict__ output,
-    int M, int K)
+    int M, int K,
+    const int32_t*  __restrict__ patch_row_offsets,
+    const int32_t*  __restrict__ patch_cols,
+    const int16_t*  __restrict__ patch_correct_vals,
+    const int16_t*  __restrict__ patch_wrong_vals,
+    const int16_t*  __restrict__ patch_activations)
 {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
@@ -1704,7 +1807,20 @@ __global__ void structured12_matvec_v2_bufload(
     for (int off = WARP_SIZE / 2; off > 0; off >>= 1) sum += __shfl_down(sum, off, WARP_SIZE);
     if ((tid & (WARP_SIZE-1)) == 0) warp_sums[tid >> 6] = sum;
     __syncthreads();
-    if (tid == 0) output[row] = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+    if (tid == 0) {
+        float result = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+        // Inline patch correction for escape values (group=0)
+        if (patch_row_offsets != nullptr) {
+            int start = patch_row_offsets[row];
+            int end   = patch_row_offsets[row + 1];
+            for (int p = start; p < end; p++) {
+                int col = patch_cols[p];
+                result += (bf16_to_float(patch_correct_vals[p]) - bf16_to_float(patch_wrong_vals[p]))
+                          * bf16_to_float(patch_activations[col]);
+            }
+        }
+        output[row] = result;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1921,7 +2037,9 @@ extern "C" {
 
 int launch_structured12_v2_async(
     const void* packed, int base_exp,
-    const void* activations, void* output, int M, int K, void* stream)
+    const void* activations, void* output, int M, int K, void* stream,
+    const void* patch_row_offsets, const void* patch_cols,
+    const void* patch_correct_vals, const void* patch_wrong_vals)
 {
     // Compute SRDs for packed data buffer
     uint64_t pack_addr = (uint64_t)packed;
@@ -1943,7 +2061,10 @@ int launch_structured12_v2_async(
         psrd0, psrd1, psrd2, psrd3,
         asrd0, asrd1, asrd2, asrd3,
         base_exp,
-        (float*)output, M, K);
+        (float*)output, M, K,
+        (const int32_t*)patch_row_offsets, (const int32_t*)patch_cols,
+        (const int16_t*)patch_correct_vals, (const int16_t*)patch_wrong_vals,
+        (const int16_t*)activations);
     return 0;
 }
 
@@ -1955,6 +2076,23 @@ int launch_structured12_v2_fp32act_async(
         dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
         (const uint32_t*)packed, base_exp,
         (const float*)activations, (float*)output, M, K);
+    return 0;
+}
+
+int launch_structured12_v2_dual_async(
+    const void* packed_a, int base_exp_a,
+    const void* packed_b, int base_exp_b,
+    const void* activations,
+    void* output_a, void* output_b,
+    int M, int K, void* stream)
+{
+    hipLaunchKernelGGL(structured12_matvec_v2_dual,
+        dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
+        (const uint32_t*)packed_a, base_exp_a,
+        (const uint32_t*)packed_b, base_exp_b,
+        (const int16_t*)activations,
+        (float*)output_a, (float*)output_b,
+        M, K);
     return 0;
 }
 
