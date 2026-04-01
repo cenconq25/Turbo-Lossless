@@ -400,6 +400,37 @@ __global__ void nv_split12_gemm_tc(
 }
 
 // ============================================================
+// Batched patch correction: single launch for all B items
+// Grid: (M, B), each block handles one (row, batch_item)
+// ============================================================
+__global__ void nv_apply_patches_batch(
+    const int32_t* __restrict__ row_offsets,
+    const int32_t* __restrict__ patch_cols,
+    const int16_t* __restrict__ correct_vals,
+    const int16_t* __restrict__ wrong_vals,
+    const int16_t* __restrict__ activations,  // [B * act_stride]
+    int act_stride,
+    float* __restrict__ output,               // [B * out_stride]
+    int out_stride,
+    int M, int B)
+{
+    int row = blockIdx.x;
+    int b = blockIdx.y;
+    if (row >= M || b >= B) return;
+    int tid = threadIdx.x;
+    int start = row_offsets[row], end = row_offsets[row + 1];
+    const int16_t* act = activations + b * act_stride;
+    float correction = 0.0f;
+    for (int p = start + tid; p < end; p += WARP_SIZE)
+        correction += (bf16_to_float(correct_vals[p]) - bf16_to_float(wrong_vals[p]))
+                      * bf16_to_float(act[patch_cols[p]]);
+    for (int off = WARP_SIZE/2; off > 0; off >>= 1)
+        correction += __shfl_down_sync(0xFFFFFFFF, correction, off, WARP_SIZE);
+    if (tid == 0 && correction != 0.0f)
+        output[b * out_stride + row] += correction;
+}
+
+// ============================================================
 // Decode + cuBLAS GEMM: fastest batch path
 // Step 1: Decode split12 weights to BF16 in a temp buffer (GPU kernel)
 // Step 2: cuBLAS BF16 GEMM (tensor cores, 176 TFLOPS)
@@ -466,6 +497,22 @@ int nv_launch_patches_async(
         (const int32_t*)row_off, (const int32_t*)cols,
         (const int16_t*)correct, (const int16_t*)wrong,
         (const int16_t*)act, (float*)out, M);
+    return 0;
+}
+
+// Batched patch correction (1 launch for all B items)
+int nv_launch_patches_batch_async(
+    const void* row_off, const void* cols, const void* correct, const void* wrong,
+    const void* act, int act_stride, void* out, int out_stride,
+    int M, int B, void* stream)
+{
+    if (M == 0 || B == 0) return 0;
+    dim3 grid(M, B);
+    nv_apply_patches_batch<<<grid, WARP_SIZE, 0, (cudaStream_t)stream>>>(
+        (const int32_t*)row_off, (const int32_t*)cols,
+        (const int16_t*)correct, (const int16_t*)wrong,
+        (const int16_t*)act, act_stride,
+        (float*)out, out_stride, M, B);
     return 0;
 }
 
