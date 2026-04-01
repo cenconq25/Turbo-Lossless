@@ -29,6 +29,10 @@ struct InferenceState {
     // BF16 activation buffers for matvec (halves L2 activation bandwidth)
     int16_t* bf16_act;      // [batch_size * max(n_embd, n_ff)] BF16 temp
     int16_t* bf16_act2;     // second buffer for ffn (gate input differs from attn input)
+
+#ifdef TURBO_NVIDIA
+    void* weight_buf;       // [max_M * max_K] BF16 temp for cuBLAS decode+GEMM path
+#endif
 };
 
 // Create inference state
