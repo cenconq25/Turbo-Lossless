@@ -1694,8 +1694,8 @@ __global__ void structured12_matvec_batch8(
     int bp = (int)((int64_t)row * K * 12 % 32) + tid * 12;
     const int shift = bp & 31;  // constant — stride is multiple of 32
     const char* base_ptr = (const char*)(row_packed + (bp >> 5));
-    float s0a=0,s0b=0,s1a=0,s1b=0,s2a=0,s2b=0,s3a=0,s3b=0;
-    float s4a=0,s4b=0,s5a=0,s5b=0,s6a=0,s6b=0,s7a=0,s7b=0;
+    // Single accumulators (saves 8 VGPRs vs split a/b — critical for B=8 register pressure)
+    float s0=0,s1=0,s2=0,s3=0,s4=0,s5=0,s6=0,s7=0;
 
     int col = tid;
     for (; col + WORKGROUP_SIZE < K; col += WORKGROUP_SIZE * 2) {
@@ -1710,14 +1710,14 @@ __global__ void structured12_matvec_batch8(
             ? structured12_decode(raw1, base_exp)
             : bf16_to_float(escape_vals[esc_ptr++]);
 
-        s0a += wt0 * bf16_to_float(act0[col]);  s0b += wt1 * bf16_to_float(act0[col + WORKGROUP_SIZE]);
-        s1a += wt0 * bf16_to_float(act1[col]);  s1b += wt1 * bf16_to_float(act1[col + WORKGROUP_SIZE]);
-        s2a += wt0 * bf16_to_float(act2[col]);  s2b += wt1 * bf16_to_float(act2[col + WORKGROUP_SIZE]);
-        s3a += wt0 * bf16_to_float(act3[col]);  s3b += wt1 * bf16_to_float(act3[col + WORKGROUP_SIZE]);
-        s4a += wt0 * bf16_to_float(act4[col]);  s4b += wt1 * bf16_to_float(act4[col + WORKGROUP_SIZE]);
-        s5a += wt0 * bf16_to_float(act5[col]);  s5b += wt1 * bf16_to_float(act5[col + WORKGROUP_SIZE]);
-        s6a += wt0 * bf16_to_float(act6[col]);  s6b += wt1 * bf16_to_float(act6[col + WORKGROUP_SIZE]);
-        s7a += wt0 * bf16_to_float(act7[col]);  s7b += wt1 * bf16_to_float(act7[col + WORKGROUP_SIZE]);
+        s0 += wt0 * bf16_to_float(act0[col]) + wt1 * bf16_to_float(act0[col + WORKGROUP_SIZE]);
+        s1 += wt0 * bf16_to_float(act1[col]) + wt1 * bf16_to_float(act1[col + WORKGROUP_SIZE]);
+        s2 += wt0 * bf16_to_float(act2[col]) + wt1 * bf16_to_float(act2[col + WORKGROUP_SIZE]);
+        s3 += wt0 * bf16_to_float(act3[col]) + wt1 * bf16_to_float(act3[col + WORKGROUP_SIZE]);
+        s4 += wt0 * bf16_to_float(act4[col]) + wt1 * bf16_to_float(act4[col + WORKGROUP_SIZE]);
+        s5 += wt0 * bf16_to_float(act5[col]) + wt1 * bf16_to_float(act5[col + WORKGROUP_SIZE]);
+        s6 += wt0 * bf16_to_float(act6[col]) + wt1 * bf16_to_float(act6[col + WORKGROUP_SIZE]);
+        s7 += wt0 * bf16_to_float(act7[col]) + wt1 * bf16_to_float(act7[col + WORKGROUP_SIZE]);
         base_ptr += 768;
     }
     if (col < K) {
@@ -1726,19 +1726,17 @@ __global__ void structured12_matvec_batch8(
         float wt = (__builtin_expect(g != 0, 1))
             ? structured12_decode(raw, base_exp)
             : bf16_to_float(escape_vals[esc_ptr++]);
-        s0a += wt * bf16_to_float(act0[col]);
-        s1a += wt * bf16_to_float(act1[col]);
-        s2a += wt * bf16_to_float(act2[col]);
-        s3a += wt * bf16_to_float(act3[col]);
-        s4a += wt * bf16_to_float(act4[col]);
-        s5a += wt * bf16_to_float(act5[col]);
-        s6a += wt * bf16_to_float(act6[col]);
-        s7a += wt * bf16_to_float(act7[col]);
+        s0 += wt * bf16_to_float(act0[col]);
+        s1 += wt * bf16_to_float(act1[col]);
+        s2 += wt * bf16_to_float(act2[col]);
+        s3 += wt * bf16_to_float(act3[col]);
+        s4 += wt * bf16_to_float(act4[col]);
+        s5 += wt * bf16_to_float(act5[col]);
+        s6 += wt * bf16_to_float(act6[col]);
+        s7 += wt * bf16_to_float(act7[col]);
     }
 
     // Warp reduction + output
-    float s0=s0a+s0b, s1=s1a+s1b, s2=s2a+s2b, s3=s3a+s3b;
-    float s4=s4a+s4b, s5=s5a+s5b, s6=s6a+s6b, s7=s7a+s7b;
     for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
         s0 += __shfl_down(s0, off, WARP_SIZE);
         s1 += __shfl_down(s1, off, WARP_SIZE);
