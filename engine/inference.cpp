@@ -560,9 +560,9 @@ static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
         if (layer == 0)
             launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
 
-        FUSED_MATVEC(L.wq, bf16_a, state->q_buf, n, n, BS, stream);
-        FUSED_MATVEC(L.wk, bf16_a, state->k_buf, n, kv_dim, BS, stream);
-        FUSED_MATVEC(L.wv, bf16_a, state->v_buf, n, kv_dim, BS, stream);
+        CUBLAS_MATVEC(L.wq, bf16_a, state->q_buf, n, n, BS, stream, state->weight_buf, state->weight_buf_half);
+        CUBLAS_MATVEC(L.wk, bf16_a, state->k_buf, n, kv_dim, BS, stream, state->weight_buf, state->weight_buf_half);
+        CUBLAS_MATVEC(L.wv, bf16_a, state->v_buf, n, kv_dim, BS, stream, state->weight_buf, state->weight_buf_half);
 
         size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
         launch_rope_batch(state->q_buf, state->k_buf, state->d_positions,
@@ -582,12 +582,12 @@ static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
                 bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
                 max_pos + 1, scale, BS, 0, stream);
 
-        FUSED_MATVEC(L.wo, bf16_a, res, n, n, BS, stream);
+        CUBLAS_MATVEC(L.wo, bf16_a, res, n, n, BS, stream, state->weight_buf, state->weight_buf_half);
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
-        FUSED_MATVEC(L.w_gate, bf16_a, state->ffn_gate, n, n_ff, BS, stream);
-        FUSED_MATVEC(L.w_up, bf16_a, state->ffn_up, n, n_ff, BS, stream);
+        CUBLAS_MATVEC(L.w_gate, bf16_a, state->ffn_gate, n, n_ff, BS, stream, state->weight_buf, state->weight_buf_half);
+        CUBLAS_MATVEC(L.w_up, bf16_a, state->ffn_up, n, n_ff, BS, stream, state->weight_buf, state->weight_buf_half);
         launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, BS, stream);
-        FUSED_MATVEC(L.w_down, bf16_b, cur, n_ff, n, BS, stream);
+        CUBLAS_MATVEC(L.w_down, bf16_b, cur, n_ff, n, BS, stream, state->weight_buf, state->weight_buf_half);
 
         if (layer + 1 < cfg.n_layer)
             launch_add_rms_norm_bf16_batch(cur, res, m->layers[layer + 1].attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
@@ -595,7 +595,7 @@ static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
             launch_add_rms_norm_bf16_batch(cur, res, m->output_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
     }
 
-    FUSED_MATVEC(m->output_proj, bf16_a, state->logits, n, cfg.n_vocab, BS, stream);
+    CUBLAS_MATVEC(m->output_proj, bf16_a, state->logits, n, cfg.n_vocab, BS, stream, state->weight_buf, state->weight_buf_half);
     for (int s = 0; s < BS; s++) state->positions[s]++;
 }
 #endif
