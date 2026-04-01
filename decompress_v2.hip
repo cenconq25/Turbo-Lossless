@@ -2257,16 +2257,176 @@ __global__ void split12_matvec_v2(
     if (tid == 0) output[row] = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
 }
 
+// ---------------------------------------------------------------------------
+// Split12 multirow: 2 rows per block, shared activation reads
+// Grid: (M/2) blocks. Each block computes 2 adjacent output rows.
+// 25% fewer loads per element: 12 loads / 8 elements vs 8 loads / 4 elements
+// ---------------------------------------------------------------------------
+__launch_bounds__(WORKGROUP_SIZE)
+__global__ void split12_matvec_v2_multirow(
+    const uint8_t* __restrict__ sign_mantissa,  // [M * K]
+    const uint8_t* __restrict__ groups,          // [M * K / 2]
+    int base_exp,
+    const int16_t* __restrict__ activations,     // [K] BF16
+    float* __restrict__ output,                  // [M]
+    int M, int K)
+{
+    const int row0 = blockIdx.x * 2;
+    const int row1 = row0 + 1;
+    const int tid = threadIdx.x;
+    __shared__ float warp_sums[8]; // 4 per row
+
+    // Row 0 accumulators
+    float sum_a0 = 0.0f, sum_a1 = 0.0f, sum_a2 = 0.0f, sum_a3 = 0.0f;
+    // Row 1 accumulators
+    float sum_b0 = 0.0f, sum_b1 = 0.0f, sum_b2 = 0.0f, sum_b3 = 0.0f;
+
+    const int has_row1 = (row1 < M);
+
+    // Pointer setup for row 0
+    const uint8_t* sm_ptr0  = sign_mantissa + (int64_t)row0 * K + tid;
+    const uint8_t* gr_ptr0  = groups + (int64_t)row0 * K / 2 + tid / 2;
+    // Pointer setup for row 1
+    const uint8_t* sm_ptr1  = sign_mantissa + (int64_t)row1 * K + tid;
+    const uint8_t* gr_ptr1  = groups + (int64_t)row1 * K / 2 + tid / 2;
+    // Shared activation pointer
+    const char*    act_ptr  = (const char*)(activations + tid);
+
+    const int is_odd = tid & 1;
+
+    int col = tid;
+    for (; col + WORKGROUP_SIZE * 3 < K; col += WORKGROUP_SIZE * 4) {
+        // Load activations ONCE (shared between both rows)
+        float a0 = bf16_to_float(*(const int16_t*)(act_ptr));
+        float a1 = bf16_to_float(*(const int16_t*)(act_ptr + 512));
+        float a2 = bf16_to_float(*(const int16_t*)(act_ptr + 1024));
+        float a3 = bf16_to_float(*(const int16_t*)(act_ptr + 1536));
+
+        // Row 0: load sign+mantissa and groups
+        uint8_t sm0_0 = sm_ptr0[0];
+        uint8_t sm0_1 = sm_ptr0[256];
+        uint8_t sm0_2 = sm_ptr0[512];
+        uint8_t sm0_3 = sm_ptr0[768];
+        uint8_t gb0_0 = gr_ptr0[0];
+        uint8_t gb0_1 = gr_ptr0[128];
+        uint8_t gb0_2 = gr_ptr0[256];
+        uint8_t gb0_3 = gr_ptr0[384];
+
+        uint32_t g0_0 = is_odd ? (gb0_0 >> 4) : (gb0_0 & 0xF);
+        uint32_t g0_1 = is_odd ? (gb0_1 >> 4) : (gb0_1 & 0xF);
+        uint32_t g0_2 = is_odd ? (gb0_2 >> 4) : (gb0_2 & 0xF);
+        uint32_t g0_3 = is_odd ? (gb0_3 >> 4) : (gb0_3 & 0xF);
+
+        union { uint32_t u; float f; } c0_0, c0_1, c0_2, c0_3;
+        c0_0.u = (((uint32_t)(sm0_0 >> 7)) << 15 | ((uint32_t)(base_exp + g0_0)) << 7 | (sm0_0 & 0x7F)) << 16;
+        c0_1.u = (((uint32_t)(sm0_1 >> 7)) << 15 | ((uint32_t)(base_exp + g0_1)) << 7 | (sm0_1 & 0x7F)) << 16;
+        c0_2.u = (((uint32_t)(sm0_2 >> 7)) << 15 | ((uint32_t)(base_exp + g0_2)) << 7 | (sm0_2 & 0x7F)) << 16;
+        c0_3.u = (((uint32_t)(sm0_3 >> 7)) << 15 | ((uint32_t)(base_exp + g0_3)) << 7 | (sm0_3 & 0x7F)) << 16;
+
+        sum_a0 += c0_0.f * a0;
+        sum_a1 += c0_1.f * a1;
+        sum_a2 += c0_2.f * a2;
+        sum_a3 += c0_3.f * a3;
+
+        // Row 1: load sign+mantissa and groups
+        if (has_row1) {
+            uint8_t sm1_0 = sm_ptr1[0];
+            uint8_t sm1_1 = sm_ptr1[256];
+            uint8_t sm1_2 = sm_ptr1[512];
+            uint8_t sm1_3 = sm_ptr1[768];
+            uint8_t gb1_0 = gr_ptr1[0];
+            uint8_t gb1_1 = gr_ptr1[128];
+            uint8_t gb1_2 = gr_ptr1[256];
+            uint8_t gb1_3 = gr_ptr1[384];
+
+            uint32_t g1_0 = is_odd ? (gb1_0 >> 4) : (gb1_0 & 0xF);
+            uint32_t g1_1 = is_odd ? (gb1_1 >> 4) : (gb1_1 & 0xF);
+            uint32_t g1_2 = is_odd ? (gb1_2 >> 4) : (gb1_2 & 0xF);
+            uint32_t g1_3 = is_odd ? (gb1_3 >> 4) : (gb1_3 & 0xF);
+
+            union { uint32_t u; float f; } c1_0, c1_1, c1_2, c1_3;
+            c1_0.u = (((uint32_t)(sm1_0 >> 7)) << 15 | ((uint32_t)(base_exp + g1_0)) << 7 | (sm1_0 & 0x7F)) << 16;
+            c1_1.u = (((uint32_t)(sm1_1 >> 7)) << 15 | ((uint32_t)(base_exp + g1_1)) << 7 | (sm1_1 & 0x7F)) << 16;
+            c1_2.u = (((uint32_t)(sm1_2 >> 7)) << 15 | ((uint32_t)(base_exp + g1_2)) << 7 | (sm1_2 & 0x7F)) << 16;
+            c1_3.u = (((uint32_t)(sm1_3 >> 7)) << 15 | ((uint32_t)(base_exp + g1_3)) << 7 | (sm1_3 & 0x7F)) << 16;
+
+            sum_b0 += c1_0.f * a0;
+            sum_b1 += c1_1.f * a1;
+            sum_b2 += c1_2.f * a2;
+            sum_b3 += c1_3.f * a3;
+        }
+
+        sm_ptr0 += 1024;
+        gr_ptr0 += 512;
+        sm_ptr1 += 1024;
+        gr_ptr1 += 512;
+        act_ptr += 2048;
+    }
+    // Tail loop
+    for (; col < K; col += WORKGROUP_SIZE) {
+        float a = bf16_to_float(*(const int16_t*)(act_ptr));
+        uint8_t sm0 = sm_ptr0[0];
+        uint8_t gb0 = gr_ptr0[0];
+        uint32_t g0 = is_odd ? (gb0 >> 4) : (gb0 & 0xF);
+        union { uint32_t u; float f; } c0;
+        c0.u = (((uint32_t)(sm0 >> 7)) << 15 | ((uint32_t)(base_exp + g0)) << 7 | (sm0 & 0x7F)) << 16;
+        sum_a0 += c0.f * a;
+
+        if (has_row1) {
+            uint8_t sm1 = sm_ptr1[0];
+            uint8_t gb1 = gr_ptr1[0];
+            uint32_t g1 = is_odd ? (gb1 >> 4) : (gb1 & 0xF);
+            union { uint32_t u; float f; } c1;
+            c1.u = (((uint32_t)(sm1 >> 7)) << 15 | ((uint32_t)(base_exp + g1)) << 7 | (sm1 & 0x7F)) << 16;
+            sum_b0 += c1.f * a;
+        }
+
+        sm_ptr0 += 256;
+        gr_ptr0 += 128;
+        sm_ptr1 += 256;
+        gr_ptr1 += 128;
+        act_ptr += 512;
+    }
+
+    // Warp reduction for row 0
+    float sum0 = sum_a0 + sum_a1 + sum_a2 + sum_a3;
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+        sum0 += __shfl_down(sum0, off, WARP_SIZE);
+    if ((tid & (WARP_SIZE - 1)) == 0) warp_sums[tid >> 6] = sum0;
+
+    // Warp reduction for row 1
+    float sum1 = sum_b0 + sum_b1 + sum_b2 + sum_b3;
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+        sum1 += __shfl_down(sum1, off, WARP_SIZE);
+    if ((tid & (WARP_SIZE - 1)) == 0) warp_sums[4 + (tid >> 6)] = sum1;
+
+    __syncthreads();
+    if (tid == 0) {
+        output[row0] = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+        if (has_row1)
+            output[row1] = warp_sums[4] + warp_sums[5] + warp_sums[6] + warp_sums[7];
+    }
+}
+
 extern "C" {
 
 int launch_split12_v2_async(
     const void* sign_mantissa, const void* groups, int base_exp,
     const void* activations, void* output, int M, int K, void* stream)
 {
-    hipLaunchKernelGGL(split12_matvec_v2,
-        dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
-        (const uint8_t*)sign_mantissa, (const uint8_t*)groups, base_exp,
-        (const int16_t*)activations, (float*)output, M, K);
+    // Use multirow (2 rows/block) when M >= 2
+    if (M >= 2) {
+        int grid = (M + 1) / 2;  // ceil(M/2)
+        hipLaunchKernelGGL(split12_matvec_v2_multirow,
+            dim3(grid), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
+            (const uint8_t*)sign_mantissa, (const uint8_t*)groups, base_exp,
+            (const int16_t*)activations, (float*)output, M, K);
+    } else {
+        hipLaunchKernelGGL(split12_matvec_v2,
+            dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
+            (const uint8_t*)sign_mantissa, (const uint8_t*)groups, base_exp,
+            (const int16_t*)activations, (float*)output, M, K);
+    }
     return 0;
 }
 
