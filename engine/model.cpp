@@ -41,10 +41,22 @@ static bool load_compressed(const std::string& dir, const std::string& prefix, C
     }
     df.close();
 
-    // Read and upload packed data
+    // Check if split12 format is available (skip packed12 upload to save VRAM)
+    bool has_split12 = false;
+    {
+        std::string sm_path = dir + "/" + prefix + ".sm.bin";
+        std::string gr_path = dir + "/" + prefix + ".gr.bin";
+        std::ifstream sf(sm_path, std::ios::binary), gf(gr_path, std::ios::binary);
+        has_split12 = sf.good() && gf.good();
+    }
+
+    // Read and upload packed data (skip if split12 available — saves ~10 GB VRAM)
     auto packed = read_file(dir + "/" + prefix + ".packed.bin");
-    if (packed.empty()) return false;
-    w.packed = upload_gpu<int32_t>(packed.data(), packed.size() / sizeof(int32_t));
+    if (packed.empty() && !has_split12) return false;
+    if (!packed.empty() && !has_split12)
+        w.packed = upload_gpu<int32_t>(packed.data(), packed.size() / sizeof(int32_t));
+    else
+        w.packed = nullptr;
 
     // Codebook (not needed for structured 12-bit, but load if present for backward compat)
     {

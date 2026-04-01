@@ -8,3 +8,4 @@ test_model.*
 !package.json
 llama.cpp/
 engine/turbo-engine
+.cu symlinks

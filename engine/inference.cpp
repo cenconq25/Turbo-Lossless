@@ -29,6 +29,12 @@ extern "C" {
     int launch_split12_v2_dual_async(const void* sm_a, const void* gr_a, int base_exp_a, const void* sm_b, const void* gr_b, int base_exp_b, const void* activations, void* output_a, void* output_b, int M, int K, void* stream);
     int launch_split12_batch4_async(const void* sm, const void* gr, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, int M, int K, void* stream);
     int launch_split12_batch8_async(const void* sm, const void* gr, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* a4, const void* a5, const void* a6, const void* a7, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, void* o4, void* o5, void* o6, void* o7, int M, int K, void* stream);
+
+#ifdef TURBO_NVIDIA
+    // NVIDIA tiled batch kernels (nvidia_batch_kernels.cu)
+    int launch_split12_tiled_batch_async(const void* sm, const void* gr, int base_exp, const void* activations, int act_stride, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* output, int out_stride, int M, int K, int B, void* stream);
+    int launch_packed12_tiled_batch_async(const void* packed, int base_exp, const void* activations, int act_stride, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* output, int out_stride, int M, int K, int B, void* stream);
+#endif
 }
 
 #define SEQ(buf, s, sz) ((buf) + (s) * (sz))
@@ -54,6 +60,25 @@ extern "C" {
             (w).M, (w).K, strm); \
     } \
 } while(0)
+
+// NVIDIA tiled batch matvec: single kernel for any B, shared-memory activation caching
+#ifdef TURBO_NVIDIA
+#define TILED_MATVEC(w, bf16_in, out_buf, n_in, n_out, bs, strm) do { \
+    if ((w).split_sm) { \
+        launch_split12_tiled_batch_async((w).split_sm, (w).split_gr, (w).base_exp, \
+            bf16_in, n_in, \
+            (w).escape_row_base, (w).escape_counts, (w).escape_vals, \
+            out_buf, n_out, \
+            (w).M, (w).K, bs, strm); \
+    } else { \
+        launch_packed12_tiled_batch_async((w).packed, (w).base_exp, \
+            bf16_in, n_in, \
+            (w).escape_row_base, (w).escape_counts, (w).escape_vals, \
+            out_buf, n_out, \
+            (w).M, (w).K, bs, strm); \
+    } \
+} while(0)
+#endif
 
 InferenceState* create_inference_state(Model* model, int batch_size, int max_seq_len) {
     auto* s = new InferenceState();
@@ -319,6 +344,14 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
         // Fused RMSNorm -> BF16 for Q/K/V (layer 0 only; subsequent fused with prev add)
         if (layer == 0)
             launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
+
+#ifdef TURBO_NVIDIA
+        // NVIDIA: auto-select split12 when available (saves 10 GB VRAM)
+        BATCH4_MATVEC(L.wq, bf16_a, state->q_buf, n, n, stream);
+        BATCH4_MATVEC(L.wk, bf16_a, state->k_buf, n, kv_dim, stream);
+        BATCH4_MATVEC(L.wv, bf16_a, state->v_buf, n, kv_dim, stream);
+#else
+        // AMD: original structured12 path (unchanged)
         launch_structured12_batch4_async(L.wq.packed, L.wq.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.wq.escape_row_base, L.wq.escape_counts, L.wq.escape_vals,
@@ -334,6 +367,7 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
             L.wv.escape_row_base, L.wv.escape_counts, L.wv.escape_vals,
             SEQ(state->v_buf,0,kv_dim), SEQ(state->v_buf,1,kv_dim), SEQ(state->v_buf,2,kv_dim), SEQ(state->v_buf,3,kv_dim),
             L.wv.M, L.wv.K, stream);
+#endif
 
         size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
         launch_rope_batch(state->q_buf, state->k_buf, state->d_positions,
@@ -353,13 +387,19 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
                 bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
                 max_pos + 1, scale, BS, 0, stream);
 
-        // wo: attention now writes BF16 directly to bf16_a
+#ifdef TURBO_NVIDIA
+        BATCH4_MATVEC(L.wo, bf16_a, res, n, n, stream);
+        launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
+        BATCH4_MATVEC(L.w_gate, bf16_a, state->ffn_gate, n, n_ff, stream);
+        BATCH4_MATVEC(L.w_up, bf16_a, state->ffn_up, n, n_ff, stream);
+        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, BS, stream);
+        BATCH4_MATVEC(L.w_down, bf16_b, cur, n_ff, n, stream);
+#else
         launch_structured12_batch4_async(L.wo.packed, L.wo.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.wo.escape_row_base, L.wo.escape_counts, L.wo.escape_vals,
             SEQ(res,0,n), SEQ(res,1,n), SEQ(res,2,n), SEQ(res,3,n),
             L.wo.M, L.wo.K, stream);
-        // Fused add + RMSNorm -> BF16 (res += cur, then bf16_a = norm(res))
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
         launch_structured12_batch4_async(L.w_gate.packed, L.w_gate.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
@@ -371,31 +411,34 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
             L.w_up.escape_row_base, L.w_up.escape_counts, L.w_up.escape_vals,
             SEQ(state->ffn_up,0,n_ff), SEQ(state->ffn_up,1,n_ff), SEQ(state->ffn_up,2,n_ff), SEQ(state->ffn_up,3,n_ff),
             L.w_up.M, L.w_up.K, stream);
-        // Fused SiLU*mul -> BF16 for w_down (saves 1 launch)
         launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, BS, stream);
         launch_structured12_batch4_async(L.w_down.packed, L.w_down.base_exp,
             SEQI(bf16_b,0,n_ff), SEQI(bf16_b,1,n_ff), SEQI(bf16_b,2,n_ff), SEQI(bf16_b,3,n_ff),
             L.w_down.escape_row_base, L.w_down.escape_counts, L.w_down.escape_vals,
             SEQ(cur,0,n), SEQ(cur,1,n), SEQ(cur,2,n), SEQ(cur,3,n),
             L.w_down.M, L.w_down.K, stream);
+#endif
 
         // Fuse add + next layer's RMSNorm (saves 1 kernel launch per layer)
         if (layer + 1 < cfg.n_layer) {
             auto& nextL = m->layers[layer + 1];
             launch_add_rms_norm_bf16_batch(cur, res, nextL.attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
         } else {
-            // Fuse last layer's add with output RMSNorm
             launch_add_rms_norm_bf16_batch(cur, res, m->output_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
         }
     }
 
-    // Output projection (bf16_a already set by fused add+norm above)
+    // Output projection
+#ifdef TURBO_NVIDIA
+    BATCH4_MATVEC(m->output_proj, bf16_a, state->logits, n, cfg.n_vocab, stream);
+#else
     launch_structured12_batch4_async(m->output_proj.packed, m->output_proj.base_exp,
         SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
         m->output_proj.escape_row_base, m->output_proj.escape_counts, m->output_proj.escape_vals,
         SEQ(state->logits,0,cfg.n_vocab), SEQ(state->logits,1,cfg.n_vocab),
         SEQ(state->logits,2,cfg.n_vocab), SEQ(state->logits,3,cfg.n_vocab),
         m->output_proj.M, m->output_proj.K, stream);
+#endif
     for (int s = 0; s < BS; s++) state->positions[s]++;
 }
 
@@ -425,27 +468,9 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
         // Fused RMSNorm -> BF16 for Q/K/V (layer 0 only; subsequent fused with prev add)
         if (layer == 0)
             launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
-        launch_structured12_batch8_async(L.wq.packed, L.wq.base_exp,
-            SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
-            SEQI(bf16_a,4,n), SEQI(bf16_a,5,n), SEQI(bf16_a,6,n), SEQI(bf16_a,7,n),
-            L.wq.escape_row_base, L.wq.escape_counts, L.wq.escape_vals,
-            SEQ(state->q_buf,0,n), SEQ(state->q_buf,1,n), SEQ(state->q_buf,2,n), SEQ(state->q_buf,3,n),
-            SEQ(state->q_buf,4,n), SEQ(state->q_buf,5,n), SEQ(state->q_buf,6,n), SEQ(state->q_buf,7,n),
-            L.wq.M, L.wq.K, stream);
-        launch_structured12_batch8_async(L.wk.packed, L.wk.base_exp,
-            SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
-            SEQI(bf16_a,4,n), SEQI(bf16_a,5,n), SEQI(bf16_a,6,n), SEQI(bf16_a,7,n),
-            L.wk.escape_row_base, L.wk.escape_counts, L.wk.escape_vals,
-            SEQ(state->k_buf,0,kv_dim), SEQ(state->k_buf,1,kv_dim), SEQ(state->k_buf,2,kv_dim), SEQ(state->k_buf,3,kv_dim),
-            SEQ(state->k_buf,4,kv_dim), SEQ(state->k_buf,5,kv_dim), SEQ(state->k_buf,6,kv_dim), SEQ(state->k_buf,7,kv_dim),
-            L.wk.M, L.wk.K, stream);
-        launch_structured12_batch8_async(L.wv.packed, L.wv.base_exp,
-            SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
-            SEQI(bf16_a,4,n), SEQI(bf16_a,5,n), SEQI(bf16_a,6,n), SEQI(bf16_a,7,n),
-            L.wv.escape_row_base, L.wv.escape_counts, L.wv.escape_vals,
-            SEQ(state->v_buf,0,kv_dim), SEQ(state->v_buf,1,kv_dim), SEQ(state->v_buf,2,kv_dim), SEQ(state->v_buf,3,kv_dim),
-            SEQ(state->v_buf,4,kv_dim), SEQ(state->v_buf,5,kv_dim), SEQ(state->v_buf,6,kv_dim), SEQ(state->v_buf,7,kv_dim),
-            L.wv.M, L.wv.K, stream);
+        BATCH8_MATVEC(L.wq, bf16_a, state->q_buf, n, n, stream);
+        BATCH8_MATVEC(L.wk, bf16_a, state->k_buf, n, kv_dim, stream);
+        BATCH8_MATVEC(L.wv, bf16_a, state->v_buf, n, kv_dim, stream);
 
         size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
         launch_rope_batch(state->q_buf, state->k_buf, state->d_positions,
@@ -466,38 +491,14 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
                 max_pos + 1, scale, BS, 0, stream);
 
         // wo: attention now writes BF16 directly to bf16_a
-        launch_structured12_batch8_async(L.wo.packed, L.wo.base_exp,
-            SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
-            SEQI(bf16_a,4,n), SEQI(bf16_a,5,n), SEQI(bf16_a,6,n), SEQI(bf16_a,7,n),
-            L.wo.escape_row_base, L.wo.escape_counts, L.wo.escape_vals,
-            SEQ(res,0,n), SEQ(res,1,n), SEQ(res,2,n), SEQ(res,3,n),
-            SEQ(res,4,n), SEQ(res,5,n), SEQ(res,6,n), SEQ(res,7,n),
-            L.wo.M, L.wo.K, stream);
+        BATCH8_MATVEC(L.wo, bf16_a, res, n, n, stream);
         // Fused add + RMSNorm -> BF16
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
-        launch_structured12_batch8_async(L.w_gate.packed, L.w_gate.base_exp,
-            SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
-            SEQI(bf16_a,4,n), SEQI(bf16_a,5,n), SEQI(bf16_a,6,n), SEQI(bf16_a,7,n),
-            L.w_gate.escape_row_base, L.w_gate.escape_counts, L.w_gate.escape_vals,
-            SEQ(state->ffn_gate,0,n_ff), SEQ(state->ffn_gate,1,n_ff), SEQ(state->ffn_gate,2,n_ff), SEQ(state->ffn_gate,3,n_ff),
-            SEQ(state->ffn_gate,4,n_ff), SEQ(state->ffn_gate,5,n_ff), SEQ(state->ffn_gate,6,n_ff), SEQ(state->ffn_gate,7,n_ff),
-            L.w_gate.M, L.w_gate.K, stream);
-        launch_structured12_batch8_async(L.w_up.packed, L.w_up.base_exp,
-            SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
-            SEQI(bf16_a,4,n), SEQI(bf16_a,5,n), SEQI(bf16_a,6,n), SEQI(bf16_a,7,n),
-            L.w_up.escape_row_base, L.w_up.escape_counts, L.w_up.escape_vals,
-            SEQ(state->ffn_up,0,n_ff), SEQ(state->ffn_up,1,n_ff), SEQ(state->ffn_up,2,n_ff), SEQ(state->ffn_up,3,n_ff),
-            SEQ(state->ffn_up,4,n_ff), SEQ(state->ffn_up,5,n_ff), SEQ(state->ffn_up,6,n_ff), SEQ(state->ffn_up,7,n_ff),
-            L.w_up.M, L.w_up.K, stream);
+        BATCH8_MATVEC(L.w_gate, bf16_a, state->ffn_gate, n, n_ff, stream);
+        BATCH8_MATVEC(L.w_up, bf16_a, state->ffn_up, n, n_ff, stream);
         // Fused SiLU*mul -> BF16 for w_down
         launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, BS, stream);
-        launch_structured12_batch8_async(L.w_down.packed, L.w_down.base_exp,
-            SEQI(bf16_b,0,n_ff), SEQI(bf16_b,1,n_ff), SEQI(bf16_b,2,n_ff), SEQI(bf16_b,3,n_ff),
-            SEQI(bf16_b,4,n_ff), SEQI(bf16_b,5,n_ff), SEQI(bf16_b,6,n_ff), SEQI(bf16_b,7,n_ff),
-            L.w_down.escape_row_base, L.w_down.escape_counts, L.w_down.escape_vals,
-            SEQ(cur,0,n), SEQ(cur,1,n), SEQ(cur,2,n), SEQ(cur,3,n),
-            SEQ(cur,4,n), SEQ(cur,5,n), SEQ(cur,6,n), SEQ(cur,7,n),
-            L.w_down.M, L.w_down.K, stream);
+        BATCH8_MATVEC(L.w_down, bf16_b, cur, n_ff, n, stream);
 
         // Fuse add + next layer's RMSNorm (saves 1 kernel launch per layer)
         if (layer + 1 < cfg.n_layer) {
@@ -510,19 +511,83 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
     }
 
     // Output projection (bf16_a already set by fused add+norm above)
-    launch_structured12_batch8_async(m->output_proj.packed, m->output_proj.base_exp,
-        SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
-        SEQI(bf16_a,4,n), SEQI(bf16_a,5,n), SEQI(bf16_a,6,n), SEQI(bf16_a,7,n),
-        m->output_proj.escape_row_base, m->output_proj.escape_counts, m->output_proj.escape_vals,
-        SEQ(state->logits,0,cfg.n_vocab), SEQ(state->logits,1,cfg.n_vocab),
-        SEQ(state->logits,2,cfg.n_vocab), SEQ(state->logits,3,cfg.n_vocab),
-        SEQ(state->logits,4,cfg.n_vocab), SEQ(state->logits,5,cfg.n_vocab),
-        SEQ(state->logits,6,cfg.n_vocab), SEQ(state->logits,7,cfg.n_vocab),
-        m->output_proj.M, m->output_proj.K, stream);
+    BATCH8_MATVEC(m->output_proj, bf16_a, state->logits, n, cfg.n_vocab, stream);
     for (int s = 0; s < BS; s++) state->positions[s]++;
 }
 
+// NVIDIA tiled batch forward: handles any B>=2 in a single pass per weight tensor
+#ifdef TURBO_NVIDIA
+static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
+    Model* m = state->model;
+    auto& cfg = m->config;
+    hipStream_t stream = 0;
+    int n = cfg.n_embd, n_ff = cfg.n_ff, head_dim = n / cfg.n_head;
+    int kv_dim = cfg.n_head_kv * head_dim;
+    int BS = state->batch_size;
+
+    hipMemcpyAsync(state->d_positions, state->positions, BS * sizeof(int), hipMemcpyHostToDevice, stream);
+    hipMemcpyAsync(state->d_tokens, token_ids, BS * sizeof(int), hipMemcpyHostToDevice, stream);
+    launch_embed_lookup(m->token_embd, state->d_tokens, state->hidden, n, BS, cfg.n_vocab, stream);
+
+    float* cur = state->hidden;
+    float* res = state->hidden2;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    int16_t* bf16_a = state->bf16_act;
+    int16_t* bf16_b = state->bf16_act2;
+
+    for (int layer = 0; layer < cfg.n_layer; layer++) {
+        auto& L = m->layers[layer];
+
+        if (layer == 0)
+            launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
+
+        TILED_MATVEC(L.wq, bf16_a, state->q_buf, n, n, BS, stream);
+        TILED_MATVEC(L.wk, bf16_a, state->k_buf, n, kv_dim, BS, stream);
+        TILED_MATVEC(L.wv, bf16_a, state->v_buf, n, kv_dim, BS, stream);
+
+        size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
+        launch_rope_batch(state->q_buf, state->k_buf, state->d_positions,
+                          head_dim, cfg.n_head, cfg.n_head_kv, n, kv_dim, cfg.rope_theta, BS, stream);
+        launch_store_kv_batch(state->k_buf, state->v_buf,
+                              m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+                              state->d_positions, kv_dim, m->max_seq_len, BS, stream);
+
+        int max_pos = 0;
+        for (int s = 0; s < BS; s++) max_pos = std::max(max_pos, state->positions[s]);
+        if (max_pos < 1024)
+            launch_attention_all_heads_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+                bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
+                max_pos + 1, scale, BS, 0, stream);
+        else
+            launch_flash_attention_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+                bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
+                max_pos + 1, scale, BS, 0, stream);
+
+        TILED_MATVEC(L.wo, bf16_a, res, n, n, BS, stream);
+        launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
+        TILED_MATVEC(L.w_gate, bf16_a, state->ffn_gate, n, n_ff, BS, stream);
+        TILED_MATVEC(L.w_up, bf16_a, state->ffn_up, n, n_ff, BS, stream);
+        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, BS, stream);
+        TILED_MATVEC(L.w_down, bf16_b, cur, n_ff, n, BS, stream);
+
+        if (layer + 1 < cfg.n_layer)
+            launch_add_rms_norm_bf16_batch(cur, res, m->layers[layer + 1].attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
+        else
+            launch_add_rms_norm_bf16_batch(cur, res, m->output_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
+    }
+
+    TILED_MATVEC(m->output_proj, bf16_a, state->logits, n, cfg.n_vocab, BS, stream);
+    for (int s = 0; s < BS; s++) state->positions[s]++;
+}
+#endif
+
 void forward(InferenceState* state, const int* token_ids) {
+#ifdef TURBO_NVIDIA
+    // NVIDIA anyB kernel for B > 8 with split12 (single launch, weights read once from DRAM)
+    if (state->batch_size > 8 && state->model->layers[0].wq.split_sm) {
+        forward_batch_tiled(state, token_ids); return;
+    }
+#endif
     if (state->batch_size == 8) forward_b8(state, token_ids);
     else if (state->batch_size == 4) forward_b4(state, token_ids);
     else if (state->batch_size > 8 && state->batch_size % 8 == 0) {
