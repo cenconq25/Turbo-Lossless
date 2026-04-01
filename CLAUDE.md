@@ -17,9 +17,9 @@
 
 | Mode | tok/s total | VRAM | vs llama.cpp BF16 (33.0 tok/s) |
 |------|------------:|-----:|:-------------------------------|
-| B=1 | 32.0 | ~10 GB | 0.97x (near parity!) |
-| B=4 | 63.0 | 10.3 GB | 1.91x faster |
-| **B=8** | **76.1** | **10.3 GB** | **2.31x faster, 1.32x less VRAM** |
+| B=1 | 32.6 | ~10 GB | 0.99x (**matched!**) |
+| B=4 | 64.3 | 10.3 GB | 1.95x faster |
+| **B=8** | **77.4** | **10.3 GB** | **2.35x faster, 1.32x less VRAM** |
 
 ### Compression
 

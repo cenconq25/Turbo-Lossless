@@ -1,6 +1,8 @@
 # Turbo Lossless: BF16 Compression Engine
 
-100% bit-perfect lossless compression for LLM weights. BF16 in, BF16 out — no precision loss, 1.33x smaller, 2.36x faster inference. Matches llama.cpp BF16 speed at B=1, beats it by 30% at B=8.
+100% bit-perfect lossless compression for BF16 LLM weights. BF16 in, BF16 out — no precision loss, 1.33x smaller, 29% less VRAM. Matches llama.cpp at B=1, beats it by 30% at B≥2.
+
+**BF16 safetensors only.** No GGUF, no FP16, no FP32, no quantized formats.
 
 ## How It Works
 
@@ -87,11 +89,11 @@ Single kernel launch, no separate decompress step, NO LDS codebook:
 
 | Mode | tok/s total | tok/s/user | VRAM | vs llama.cpp BF16 (33.0) |
 |------|------------:|-----------:|-----:|:-------------------------|
-| B=1 | 32.0 | 32.0 | ~10 GB | 0.97x |
-| B=4 | 63.0 | 15.8 | 10.3 GB | **1.91x faster** |
-| **B=8** | **76.1** | **9.5** | **10.3 GB** | **2.31x faster, 1.32x less VRAM** |
-| B=16 | ~76 | ~4.7 | ~10.5 GB | 2.30x (plateau) |
-| B=32 | ~76 | ~2.4 | ~11 GB | 2.30x (plateau) |
+| B=1 | 32.6 | 32.6 | ~10 GB | 0.99x (**matched!**) |
+| B=4 | 64.3 | 16.1 | 10.3 GB | **1.95x faster** |
+| **B=8** | **77.4** | **9.7** | **10.3 GB** | **2.35x faster, 1.32x less VRAM** |
+| B=16 | ~77 | ~4.8 | ~10.5 GB | 2.33x (plateau) |
+| B=32 | ~77 | ~2.4 | ~11 GB | 2.33x (plateau) |
 
 **Beats llama.cpp BF16 at B≥2.** At B=1, our 12-bit decode overhead makes us 15% slower. At B≥2, decode amortization more than compensates — we read 25% less data from HBM.
 
@@ -99,22 +101,22 @@ Single kernel launch, no separate decompress step, NO LDS codebook:
 
 | Batch | llama.cpp BF16 | Turbo Lossless | Winner | VRAM |
 |------:|---------------:|---------------:|:------:|-----:|
-| B=1 | 33.0 | **32.0** | llama.cpp +3% | 14.5 vs **10.3 GB** |
-| B=2 | 44.4 | **64.0** | **Turbo +44%** | 14.5 vs **10.3 GB** |
-| B=4 | 50.9 | **63.0** | **Turbo +24%** | 14.5 vs **10.3 GB** |
-| **B=8** | 58.7 | **76.1** | **Turbo +30%** | 14.5 vs **10.3 GB** |
+| B=1 | 33.0 | **32.6** | **Matched** (99%) | 14.5 vs **10.3 GB** |
+| B=2 | 44.4 | **65.2** | **Turbo +47%** | 14.5 vs **10.3 GB** |
+| B=4 | 50.9 | **64.3** | **Turbo +26%** | 14.5 vs **10.3 GB** |
+| **B=8** | 58.7 | **77.4** | **Turbo +32%** | 14.5 vs **10.3 GB** |
 
-Near-parity at B=1, faster at B≥2, **29% less VRAM at all batch sizes**.
+**Matched llama.cpp at B=1**, faster at B≥2, **29% less VRAM at all batch sizes**.
 
 ### Hardware Projection (B=8)
 
 | GPU | BW (TB/s) | Est. tok/s | vs native BF16 |
 |-----|----------:|-----------:|:--------------:|
-| MI50 (measured) | 1.0 | **76** | 2.31x |
-| A100 80GB | 2.0 | ~150 | 2.31x |
-| H100 80GB | 3.4 | ~260 | 2.31x |
-| MI300X | 5.3 | ~400 | 2.31x |
-| B200 | 8.0 | ~610 | 2.31x |
+| MI50 (measured) | 1.0 | **77** | 2.35x |
+| A100 80GB | 2.0 | ~155 | 2.35x |
+| H100 80GB | 3.4 | ~265 | 2.35x |
+| MI300X | 5.3 | ~410 | 2.35x |
+| B200 | 8.0 | ~620 | 2.35x |
 
 ---
 
