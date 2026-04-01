@@ -131,14 +131,14 @@ __global__ void split12_fused_gemm(
     // gr: S12_TILE_M × S12_TILE_K / 2 × 2 buffers = 64×32×2 = 4096 bytes
     __nv_bfloat16* B_buf = (__nv_bfloat16*)(gr_buf + S12_TILE_M * S12_TILE_K / 2 * 2);
     // B: S12_TILE_K × S12_TILE_N × 2 buffers
-    // Decoded BF16 weight tile: S12_TILE_M × S12_TILE_K × 2 bytes = 8192 bytes
-    __nv_bfloat16* w_decoded = (__nv_bfloat16*)((char*)B_buf + S12_TILE_K * S12_TILE_N * sizeof(__nv_bfloat16) * 2);
+    // NO w_decoded buffer needed — direct decode to PTX registers!
 
-    // WMMA accumulator fragments
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag[WARP_COL_TENSORS];
+    // PTX m16n8k16 accumulators: 4 float32 (=4 uint32) per N-tile
+    // For WARP_COL_TENSORS=2: 2 accumulators covering N=16 (two m16n8k16 ops)
+    uint32_t c_regs[WARP_COL_TENSORS][4];
     #pragma unroll
     for (int j = 0; j < WARP_COL_TENSORS; j++)
-        wmma::fill_fragment(c_frag[j], 0.0f);
+        c_regs[j][0] = c_regs[j][1] = c_regs[j][2] = c_regs[j][3] = 0;
 
     const int num_k_tiles = (K + S12_TILE_K - 1) / S12_TILE_K;
 
@@ -216,69 +216,93 @@ __global__ void split12_fused_gemm(
             }
         }
 
-        // Compute: decode to BF16 in shared memory, then WMMA load + mma
+        // DIRECT DECODE-TO-REGISTER: no intermediate BF16 buffer, no WMMA load
+        // Reads compressed bytes from shared memory → decodes to PTX mma registers → tensor core
         uint8_t* sm_read = sm_buf + buf_read * S12_TILE_M * S12_TILE_K;
         uint8_t* gr_read = gr_buf + buf_read * S12_TILE_M * S12_TILE_K / 2;
         __nv_bfloat16* B_read = B_buf + buf_read * S12_TILE_K * S12_TILE_N;
 
-        // Decode weight tile: split12 → BF16 in dedicated shared memory buffer
-        for (int i = tid; i < S12_TILE_M * S12_TILE_K; i += S12_BLOCK) {
-            int m_local = i / S12_TILE_K;
-            int k_local = i % S12_TILE_K;
-            uint8_t sm_val = sm_read[i];
-            uint8_t gb = gr_read[m_local * (S12_TILE_K/2) + k_local/2];
-            uint8_t group = (k_local & 1) ? (gb >> 4) : (gb & 0xF);
-            w_decoded[m_local * S12_TILE_K + k_local] = decode_split12_bf16(sm_val, group, base_exp);
-        }
-        __syncthreads();
+        int warp_m_start = warp_id * MMA_M;  // rows this warp handles (0,16,32,48)
+        int row0 = warp_m_start + lane_id / 4;       // rows 0-7 within warp tile
+        int row1 = warp_m_start + 8 + lane_id / 4;   // rows 8-15 within warp tile
+        int twg = lane_id % 4;
 
-        // Each warp handles rows [warp_id*16 .. warp_id*16+15]
-        int warp_m_start = warp_id * MMA_M;
+        // Macro to extract group nibble from shared memory
+        #define GR_SM(gr_ptr, row, k) \
+            (((k) & 1) ? ((gr_ptr)[(row) * (S12_TILE_K/2) + (k)/2] >> 4) \
+                       : ((gr_ptr)[(row) * (S12_TILE_K/2) + (k)/2] & 0xF))
 
         #pragma unroll
         for (int k_slice = 0; k_slice < S12_TILE_K / MMA_K; k_slice++) {
-            int k_off = k_slice * MMA_K;
+            int kk = k_slice * MMA_K;
 
-            // Use WMMA to load A from decoded BF16 in shared memory
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
-            wmma::load_matrix_sync(a_frag, w_decoded + warp_m_start * S12_TILE_K + k_off, S12_TILE_K);
+            // Decode A directly into PTX mma.sync.m16n8k16 register layout:
+            //   a[0] = bf16x2(A[row0][kk+twg*2],   A[row0][kk+twg*2+1])   K cols 0-7
+            //   a[1] = bf16x2(A[row1][kk+twg*2],   A[row1][kk+twg*2+1])   rows 8-15, K 0-7
+            //   a[2] = bf16x2(A[row0][kk+8+twg*2], A[row0][kk+8+twg*2+1]) K cols 8-15
+            //   a[3] = bf16x2(A[row1][kk+8+twg*2], A[row1][kk+8+twg*2+1]) rows 8-15, K 8-15
+            uint32_t a_regs[4];
+            int k0 = kk + twg * 2, k1 = kk + 8 + twg * 2;
 
-            // Load B and compute MMA for each N-tile
+            a_regs[0] = decode_split12_pair(
+                sm_read[row0 * S12_TILE_K + k0],     sm_read[row0 * S12_TILE_K + k0 + 1],
+                GR_SM(gr_read, row0, k0),             GR_SM(gr_read, row0, k0 + 1), base_exp);
+            a_regs[1] = decode_split12_pair(
+                sm_read[row1 * S12_TILE_K + k0],     sm_read[row1 * S12_TILE_K + k0 + 1],
+                GR_SM(gr_read, row1, k0),             GR_SM(gr_read, row1, k0 + 1), base_exp);
+            a_regs[2] = decode_split12_pair(
+                sm_read[row0 * S12_TILE_K + k1],     sm_read[row0 * S12_TILE_K + k1 + 1],
+                GR_SM(gr_read, row0, k1),             GR_SM(gr_read, row0, k1 + 1), base_exp);
+            a_regs[3] = decode_split12_pair(
+                sm_read[row1 * S12_TILE_K + k1],     sm_read[row1 * S12_TILE_K + k1 + 1],
+                GR_SM(gr_read, row1, k1),             GR_SM(gr_read, row1, k1 + 1), base_exp);
+
+            // Full PTX: load B from shared memory + mma.sync for each N-tile
+            // B fragment layout for m16n8k16: B[K=16][N=8], col-major
+            //   b[0] = bf16x2(B[K=twg*2][N=gid], B[K=twg*2+1][N=gid])
+            //   b[1] = bf16x2(B[K=8+twg*2][N=gid], B[K=8+twg*2+1][N=gid])
+            // B_read stored as [N][K], so B(N=n, K=k) = B_read[n * S12_TILE_K + k]
+            int b_gid = lane_id / 4;   // N position within 8-wide N-tile
+            int b_twg = lane_id % 4;   // K pair index
+
             #pragma unroll
             for (int n_tile = 0; n_tile < WARP_COL_TENSORS; n_tile++) {
-                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b_frag;
-                wmma::load_matrix_sync(b_frag, B_read + (n_tile * MMA_N) * S12_TILE_K + k_off, S12_TILE_K);
-                wmma::mma_sync(c_frag[n_tile], a_frag, b_frag, c_frag[n_tile]);
+                __nv_bfloat16* b_ptr = B_read + (n_tile * MMA_N + b_gid) * S12_TILE_K + kk;
+                int bk0 = b_twg * 2;
+
+                uint32_t b_regs[2];
+                __nv_bfloat162 bp0 = make_bfloat162(b_ptr[bk0], b_ptr[bk0 + 1]);
+                __nv_bfloat162 bp1 = make_bfloat162(b_ptr[8 + bk0], b_ptr[8 + bk0 + 1]);
+                b_regs[0] = *reinterpret_cast<uint32_t*>(&bp0);
+                b_regs[1] = *reinterpret_cast<uint32_t*>(&bp1);
+
+                mma_m16n8k16(c_regs[n_tile], a_regs, b_regs);
             }
         }
+        #undef GR_SM
 
         __syncthreads();  // Wait before overwriting read buffer
     }
 
-    // Store accumulators via WMMA → shared memory → global (batch-major)
-    float* out_smem = (float*)smem_raw;
+    // Store PTX m16n8k16 accumulators directly to global memory
+    // C output mapping: c[0]=C[gid][twg*2], c[1]=C[gid][twg*2+1],
+    //                   c[2]=C[8+gid][twg*2], c[3]=C[8+gid][twg*2+1]
+    // where gid=lane/4, twg=lane%4, relative to warp's 16-row tile
+    int c_gid = lane_id / 4;  // row offset 0-7
+    int c_twg = lane_id % 4;  // col pair 0-3
 
     for (int n_tile = 0; n_tile < WARP_COL_TENSORS; n_tile++) {
-        // WMMA store to shared memory as row-major [16 × 16]
-        if (warp_id < 4 && warp_id * MMA_M < rows_this_tile) {
-            wmma::store_matrix_sync(out_smem + warp_id * MMA_M * 16,
-                                    c_frag[n_tile], 16, wmma::mem_row_major);
-        }
-        __syncthreads();
+        float* cf = reinterpret_cast<float*>(c_regs[n_tile]);
+        int n_base = block_n + n_tile * MMA_N;  // MMA_N=8
 
-        // Scatter to global: C[b * out_stride + m]
-        int n_base = block_n + n_tile * 16;
-        int n_count = min(16, N - n_base);
-        if (n_count > 0) {
-            for (int i = tid; i < rows_this_tile * n_count; i += S12_BLOCK) {
-                int m_local = i / n_count;
-                int n_local = i % n_count;
-                int row = tile_m_start + m_local;
-                int b_idx = n_base + n_local;
-                if (row < M && b_idx < N)
-                    C_matrix[b_idx * out_stride + row] = out_smem[m_local * 16 + n_local];
-            }
-        }
-        __syncthreads();
+        int out_m0 = tile_m_start + warp_id * MMA_M + c_gid;
+        int out_m1 = tile_m_start + warp_id * MMA_M + 8 + c_gid;
+        int out_b0 = n_base + c_twg * 2;
+        int out_b1 = n_base + c_twg * 2 + 1;
+
+        if (out_m0 < M && out_b0 < N) C_matrix[out_b0 * out_stride + out_m0] = cf[0];
+        if (out_m0 < M && out_b1 < N) C_matrix[out_b1 * out_stride + out_m0] = cf[1];
+        if (out_m1 < M && out_b0 < N) C_matrix[out_b0 * out_stride + out_m1] = cf[2];
+        if (out_m1 < M && out_b1 < N) C_matrix[out_b1 * out_stride + out_m1] = cf[3];
     }
 }

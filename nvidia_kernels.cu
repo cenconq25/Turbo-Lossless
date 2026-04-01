@@ -525,11 +525,10 @@ int nv_launch_split12_fused_gemm_async(
     constexpr int WCT = 2;
     dim3 grid((M + S12_TILE_M - 1) / S12_TILE_M, (B + TN - 1) / TN);
 
-    // Shared memory: sm(2×64×256) + gr(2×64×128) + B(2×256×16×2) + decoded(64×256×2) = 96 KB
-    int smem = S12_TILE_M * S12_TILE_K * 2
-             + S12_TILE_M * S12_TILE_K / 2 * 2
-             + S12_TILE_K * TN * sizeof(__nv_bfloat16) * 2
-             + S12_TILE_M * S12_TILE_K * sizeof(__nv_bfloat16);
+    // Shared memory: sm(2×64×64) + gr(2×64×32) + B(2×64×16×2) — NO decoded buffer!
+    int smem = S12_TILE_M * S12_TILE_K * 2                         // 8 KB compressed sm
+             + S12_TILE_M * S12_TILE_K / 2 * 2                     // 4 KB compressed gr
+             + S12_TILE_K * TN * sizeof(__nv_bfloat16) * 2;        // 4 KB B matrix = 16 KB total
 
     split12_fused_gemm<TN, WCT><<<grid, S12_BLOCK, smem, (cudaStream_t)stream>>>(
         (const uint8_t*)sm, (const uint8_t*)gr, base_exp,
