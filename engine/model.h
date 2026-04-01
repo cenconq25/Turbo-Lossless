@@ -33,6 +33,9 @@ struct CompressedWeight {
     int32_t* escape_row_base;     // [M] absolute start of row's escapes (5.6 MB total)
     uint8_t* escape_counts;       // [M*256] optional: per-thread escape count (361 MB, max val 12)
     int16_t* escape_vals;         // [num_patches] correct BF16 values in thread-stride order
+    // Split12 format: byte-aligned arrays (zero read amplification)
+    uint8_t* split_sm;            // [M*K] sign+mantissa bytes (NULL if not loaded)
+    uint8_t* split_gr;            // [M*K/2] nibble-packed groups
 };
 
 // One transformer layer

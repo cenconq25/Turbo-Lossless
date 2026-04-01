@@ -77,6 +77,16 @@ static bool load_compressed(const std::string& dir, const std::string& prefix, C
     else
         w.patch_wrong = nullptr;
 
+    // Load split12 format if available (byte-aligned, zero read amplification)
+    w.split_sm = nullptr;
+    w.split_gr = nullptr;
+    auto sm_data = read_file(dir + "/" + prefix + ".sm.bin");
+    auto gr_data = read_file(dir + "/" + prefix + ".gr.bin");
+    if (!sm_data.empty() && !gr_data.empty()) {
+        w.split_sm = upload_gpu<uint8_t>(sm_data.data(), sm_data.size());
+        w.split_gr = upload_gpu<uint8_t>(gr_data.data(), gr_data.size());
+    }
+
     // Build fused escape table from CSR data
     // escape_offsets[row*256+tid] = exclusive prefix sum of escapes for thread tid in row
     // escape_vals = correct BF16 values in (row, tid, encounter_order) order

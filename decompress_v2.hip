@@ -2056,15 +2056,19 @@ int launch_structured12_v2_async(
     uint32_t asrd2 = (uint32_t)(K * 2);  // K int16 elements = K*2 bytes
     uint32_t asrd3 = 0x00020000;
 
-    hipLaunchKernelGGL(structured12_matvec_v2_bufload,
+    // Try original v2 kernel (23 VGPRs, 100% occupancy) vs bufload (33 VGPRs, 70%)
+    hipLaunchKernelGGL(structured12_matvec_v2,
         dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
-        psrd0, psrd1, psrd2, psrd3,
-        asrd0, asrd1, asrd2, asrd3,
-        base_exp,
-        (float*)output, M, K,
-        (const int32_t*)patch_row_offsets, (const int32_t*)patch_cols,
-        (const int16_t*)patch_correct_vals, (const int16_t*)patch_wrong_vals,
-        (const int16_t*)activations);
+        (const uint32_t*)packed, base_exp,
+        (const int16_t*)activations, (float*)output, M, K);
+    // Inline patches on thread 0 via separate lightweight launch
+    if (patch_row_offsets) {
+        hipLaunchKernelGGL(apply_patches_v2,
+            dim3(M), dim3(WARP_SIZE), 0, (hipStream_t)stream,
+            (const int32_t*)patch_row_offsets, (const int32_t*)patch_cols,
+            (const int16_t*)patch_correct_vals, (const int16_t*)patch_wrong_vals,
+            (const int16_t*)activations, (float*)output, M);
+    }
     return 0;
 }
 
@@ -2161,6 +2165,108 @@ int launch_structured12_batch8_async(
         (float*)o0, (float*)o1, (float*)o2, (float*)o3,
         (float*)o4, (float*)o5, (float*)o6, (float*)o7,
         M, K);
+    return 0;
+}
+
+}
+
+// ---------------------------------------------------------------------------
+// Split12 matvec: byte-aligned dual-array format
+// sign_mantissa[M*K]: uint8_t per element = [sign 1][mantissa 7]
+// groups[M*K/2]: nibble-packed = 2 groups per byte (low=even, high=odd)
+// ALL loads are byte-aligned → ZERO read amplification vs 1.33x with 12-bit packed
+// ---------------------------------------------------------------------------
+__launch_bounds__(WORKGROUP_SIZE)
+__global__ void split12_matvec_v2(
+    const uint8_t* __restrict__ sign_mantissa,  // [M * K]
+    const uint8_t* __restrict__ groups,          // [M * K / 2]
+    int base_exp,
+    const int16_t* __restrict__ activations,
+    float* __restrict__ output,
+    int M, int K)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    __shared__ float warp_sums[4];
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+
+    // Pointer setup: row-major layout
+    const uint8_t* sm_ptr  = sign_mantissa + (int64_t)row * K + tid;
+    const uint8_t* gr_ptr  = groups + (int64_t)row * K / 2 + tid / 2;
+    const char*    act_ptr = (const char*)(activations + tid);
+
+    // Each thread always accesses same nibble (tid parity is constant since 256 is even)
+    const int is_odd = tid & 1;
+
+    int col = tid;
+    for (; col + WORKGROUP_SIZE * 3 < K; col += WORKGROUP_SIZE * 4) {
+        // Load sign+mantissa (4 byte-aligned loads)
+        uint8_t sm0 = sm_ptr[0];
+        uint8_t sm1 = sm_ptr[256];
+        uint8_t sm2 = sm_ptr[512];
+        uint8_t sm3 = sm_ptr[768];
+
+        // Load group nibbles (4 byte-aligned loads, each shared between 2 elements)
+        uint8_t gb0 = gr_ptr[0];
+        uint8_t gb1 = gr_ptr[128];
+        uint8_t gb2 = gr_ptr[256];
+        uint8_t gb3 = gr_ptr[384];
+
+        // Extract group from correct nibble
+        uint32_t g0 = is_odd ? (gb0 >> 4) : (gb0 & 0xF);
+        uint32_t g1 = is_odd ? (gb1 >> 4) : (gb1 & 0xF);
+        uint32_t g2 = is_odd ? (gb2 >> 4) : (gb2 & 0xF);
+        uint32_t g3 = is_odd ? (gb3 >> 4) : (gb3 & 0xF);
+
+        // Decode to BF16 → float (pure ALU, no memory)
+        union { uint32_t u; float f; } c0, c1, c2, c3;
+        c0.u = (((uint32_t)(sm0 >> 7)) << 15 | ((uint32_t)(base_exp + g0)) << 7 | (sm0 & 0x7F)) << 16;
+        c1.u = (((uint32_t)(sm1 >> 7)) << 15 | ((uint32_t)(base_exp + g1)) << 7 | (sm1 & 0x7F)) << 16;
+        c2.u = (((uint32_t)(sm2 >> 7)) << 15 | ((uint32_t)(base_exp + g2)) << 7 | (sm2 & 0x7F)) << 16;
+        c3.u = (((uint32_t)(sm3 >> 7)) << 15 | ((uint32_t)(base_exp + g3)) << 7 | (sm3 & 0x7F)) << 16;
+
+        // FMA with activations
+        sum0 += c0.f * bf16_to_float(*(const int16_t*)(act_ptr));
+        sum1 += c1.f * bf16_to_float(*(const int16_t*)(act_ptr + 512));
+        sum2 += c2.f * bf16_to_float(*(const int16_t*)(act_ptr + 1024));
+        sum3 += c3.f * bf16_to_float(*(const int16_t*)(act_ptr + 1536));
+
+        sm_ptr  += 1024;   // 256 * 4 bytes
+        gr_ptr  += 512;    // 256 * 4 / 2 bytes
+        act_ptr += 2048;   // 256 * 4 * 2 bytes (int16)
+    }
+    // Tail loop
+    for (; col < K; col += WORKGROUP_SIZE) {
+        uint8_t sm = sm_ptr[0];
+        uint8_t gb = gr_ptr[0];
+        uint32_t g = is_odd ? (gb >> 4) : (gb & 0xF);
+        union { uint32_t u; float f; } c;
+        c.u = (((uint32_t)(sm >> 7)) << 15 | ((uint32_t)(base_exp + g)) << 7 | (sm & 0x7F)) << 16;
+        sum0 += c.f * bf16_to_float(*(const int16_t*)(act_ptr));
+        sm_ptr  += 256;
+        gr_ptr  += 128;
+        act_ptr += 512;
+    }
+
+    // Warp reduction + output (same as v2)
+    float sum = sum0 + sum1 + sum2 + sum3;
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+        sum += __shfl_down(sum, off, WARP_SIZE);
+    if ((tid & (WARP_SIZE - 1)) == 0) warp_sums[tid >> 6] = sum;
+    __syncthreads();
+    if (tid == 0) output[row] = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+}
+
+extern "C" {
+
+int launch_split12_v2_async(
+    const void* sign_mantissa, const void* groups, int base_exp,
+    const void* activations, void* output, int M, int K, void* stream)
+{
+    hipLaunchKernelGGL(split12_matvec_v2,
+        dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
+        (const uint8_t*)sign_mantissa, (const uint8_t*)groups, base_exp,
+        (const int16_t*)activations, (float*)output, M, K);
     return 0;
 }
 

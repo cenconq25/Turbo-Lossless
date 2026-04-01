@@ -36,6 +36,9 @@ extern "C" {
     int launch_structured12_v2_dual_async(const void* packed_a, int base_exp_a, const void* packed_b, int base_exp_b, const void* activations, void* output_a, void* output_b, int M, int K, void* stream);
     int launch_structured12_batch4_async(const void* packed, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, int M, int K, void* stream);
     int launch_structured12_batch8_async(const void* packed, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* a4, const void* a5, const void* a6, const void* a7, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, void* o4, void* o5, void* o6, void* o7, int M, int K, void* stream);
+
+    // Split12 format: byte-aligned arrays
+    int launch_split12_v2_async(const void* sign_mantissa, const void* groups, int base_exp, const void* activations, void* output, int M, int K, void* stream);
 }
 
 #define B 4
@@ -153,10 +156,17 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
     PROF_EVENT_DECL();
     PROF_EVENT_CREATE();
 
-    // Single-pass BF16 matvec: structured 12-bit v2 with inline patch correction
+    // Prefer split12 (byte-aligned, zero amplification) when available, else structured12
     #define MATVEC_B1(w, bf16_in, fp32_out) do { \
-        launch_structured12_v2_async((w).packed, (w).base_exp, bf16_in, fp32_out, (w).M, (w).K, stream, \
-            (w).row_offsets, (w).patch_cols, (w).patch_correct, (w).patch_wrong); \
+        if ((w).split_sm) { \
+            launch_split12_v2_async((w).split_sm, (w).split_gr, (w).base_exp, bf16_in, fp32_out, (w).M, (w).K, stream); \
+            if ((w).num_patches > 0 && (w).row_offsets) \
+                launch_patches_v2_async((w).row_offsets, (w).patch_cols, (w).patch_correct, (w).patch_wrong, \
+                                        bf16_in, fp32_out, (w).M, stream); \
+        } else { \
+            launch_structured12_v2_async((w).packed, (w).base_exp, bf16_in, fp32_out, (w).M, (w).K, stream, \
+                (w).row_offsets, (w).patch_cols, (w).patch_correct, (w).patch_wrong); \
+        } \
     } while(0)
 
     for (int layer = 0; layer < cfg.n_layer; layer++) {
