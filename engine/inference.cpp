@@ -4,47 +4,36 @@
 #include <cmath>
 #include <hip/hip_runtime.h>
 
+// Suppress nodiscard warnings from HIP API calls (hipMalloc, hipFree, etc.)
+#pragma clang diagnostic ignored "-Wunused-result"
+
 extern "C" {
-    void launch_rms_norm(const float* x, const float* weight, float* y, int n, float eps, hipStream_t stream);
-    void launch_embed_lookup(const int16_t* embd_table, const int* token_ids, float* output, int n_embd, int batch_size, hipStream_t stream);
-    // Batched ops
-    void launch_rms_norm_batch(const float* x, const float* weight, float* y, int n, float eps, int batch_size, hipStream_t stream);
+    // Kernel launch wrappers (kernels.hip)
+    void launch_embed_lookup(const int16_t* embd_table, const int* token_ids, float* output, int n_embd, int batch_size, int n_vocab, hipStream_t stream);
     void launch_rms_norm_bf16_batch(const float* x, const float* weight, int16_t* y, int n, float eps, int batch_size, hipStream_t stream);
     void launch_add_rms_norm_bf16_batch(float* x, const float* residual, const float* weight, int16_t* y, int n, float eps, int batch_size, hipStream_t stream);
-    void launch_silu_mul_batch(const float* gate, const float* up, float* out, int n, int batch_size, hipStream_t stream);
     void launch_silu_mul_bf16_batch(const float* gate, const float* up, int16_t* out, int n, int batch_size, hipStream_t stream);
     void launch_add_batch(float* y, const float* x, int n, int batch_size, hipStream_t stream);
-    void launch_memcpy_batch(float* dst, const float* src, int n, int batch_size, hipStream_t stream);
     void launch_rope_batch(float* q, float* k, const int* positions, int head_dim, int n_head, int n_head_kv, int q_stride, int k_stride, float theta, int batch_size, hipStream_t stream);
     void launch_store_kv_batch(const float* k, const float* v, int16_t* kv_k, int16_t* kv_v, const int* positions, int kv_dim, int max_seq, int batch_size, hipStream_t stream);
     void launch_attention_all_heads(const float* q, const int16_t* k_cache, const int16_t* v_cache, int16_t* output, int n_head, int n_head_kv, int head_dim, int seq_len, int max_seq, float scale, hipStream_t stream);
     void launch_attention_all_heads_batch(const float* q, const int16_t* kv_k, const int16_t* kv_v, int16_t* output, const int* positions, int n_head, int n_head_kv, int head_dim, int max_seq, float scale, int batch_size, int kv_stride, hipStream_t stream);
     void launch_flash_attention(const float* q, const int16_t* k_cache, const int16_t* v_cache, int16_t* output, int n_head, int n_head_kv, int head_dim, int seq_len, int max_seq, float scale, hipStream_t stream);
     void launch_flash_attention_batch(const float* q, const int16_t* kv_k, const int16_t* kv_v, int16_t* output, const int* positions, int n_head, int n_head_kv, int head_dim, int max_seq, float scale, int batch_size, int kv_stride, hipStream_t stream);
-    void launch_rope(float* q, float* k, int head_dim, int n_head, int n_head_kv, int position, float theta, hipStream_t stream);
-    void launch_store_kv(const float* k, const float* v, int16_t* kv_k, int16_t* kv_v, int pos, int n_head_kv, int head_dim, int max_seq, hipStream_t stream);
     void launch_rope_store_kv(float* q, float* k, const float* v, int16_t* kv_k, int16_t* kv_v, int head_dim, int n_head, int n_head_kv, int position, int max_seq, float theta, hipStream_t stream);
 
-    // FP32→BF16 conversion
-    void launch_fp32_to_bf16(const float* input, int16_t* output, int n, hipStream_t stream);
-
-    // Two-pass BF16: v2 matvec (no escape) + BF16 patch correction
+    // Matvec launch wrappers (decompress_v2.hip)
     int launch_patches_v2_async(const void* row_offsets, const void* patch_cols, const void* correct_vals, const void* wrong_vals, const void* activations, void* output, int M, void* stream);
-
-    // Structured 12-bit: arithmetic decode (no LDS codebook)
     int launch_structured12_v2_async(const void* packed, int base_exp, const void* activations, void* output, int M, int K, void* stream, const void* patch_row_offsets, const void* patch_cols, const void* patch_correct_vals, const void* patch_wrong_vals);
     int launch_structured12_v2_dual_async(const void* packed_a, int base_exp_a, const void* packed_b, int base_exp_b, const void* activations, void* output_a, void* output_b, int M, int K, void* stream);
     int launch_structured12_batch4_async(const void* packed, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, int M, int K, void* stream);
     int launch_structured12_batch8_async(const void* packed, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* a4, const void* a5, const void* a6, const void* a7, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, void* o4, void* o5, void* o6, void* o7, int M, int K, void* stream);
-
-    // Split12 format: byte-aligned arrays
     int launch_split12_v2_async(const void* sign_mantissa, const void* groups, int base_exp, const void* activations, void* output, int M, int K, void* stream);
     int launch_split12_v2_dual_async(const void* sm_a, const void* gr_a, int base_exp_a, const void* sm_b, const void* gr_b, int base_exp_b, const void* activations, void* output_a, void* output_b, int M, int K, void* stream);
     int launch_split12_batch4_async(const void* sm, const void* gr, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, int M, int K, void* stream);
     int launch_split12_batch8_async(const void* sm, const void* gr, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* a4, const void* a5, const void* a6, const void* a7, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, void* o4, void* o5, void* o6, void* o7, int M, int K, void* stream);
 }
 
-#define B 4
 #define SEQ(buf, s, sz) ((buf) + (s) * (sz))
 #define SEQI(buf, s, sz) ((buf) + (s) * (sz))  // int16_t version
 
@@ -107,10 +96,14 @@ void free_inference_state(InferenceState* state) {
     delete[] state->positions;
     hipFree(state->hidden); hipFree(state->hidden2); hipFree(state->attn_out);
     hipFree(state->q_buf); hipFree(state->k_buf); hipFree(state->v_buf);
-    hipFree(state->ffn_gate); hipFree(state->ffn_up); hipFree(state->ffn_down);
-    hipFree(state->logits); hipFree(state->attn_scores_buf);
+    hipFree(state->ffn_gate); hipFree(state->ffn_up);
+    if (state->ffn_down) hipFree(state->ffn_down);
+    hipFree(state->logits);
+    if (state->attn_scores_buf) hipFree(state->attn_scores_buf);
     hipFree(state->d_positions); hipFree(state->d_tokens);
     hipFree(state->bf16_act); hipFree(state->bf16_act2);
+    if (state->stream2) hipStreamDestroy(state->stream2);
+    if (state->sync_event) hipEventDestroy(state->sync_event);
     delete state;
 }
 
@@ -155,7 +148,7 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
     int pos = state->positions[0];
 
     hipMemcpyAsync(state->d_tokens, token_ids, sizeof(int), hipMemcpyHostToDevice, stream);
-    launch_embed_lookup(m->token_embd, state->d_tokens, state->hidden, n, 1, stream);
+    launch_embed_lookup(m->token_embd, state->d_tokens, state->hidden, n, 1, cfg.n_vocab, stream);
 
     // Ping-pong between hidden and hidden2 to avoid unnecessary copies
     float* cur = state->hidden;
@@ -310,10 +303,11 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
     hipStream_t stream = 0;
     int n = cfg.n_embd, n_ff = cfg.n_ff, head_dim = n / cfg.n_head;
     int kv_dim = cfg.n_head_kv * head_dim;
+    const int BS = 4;
 
-    hipMemcpyAsync(state->d_positions, state->positions, B * sizeof(int), hipMemcpyHostToDevice, stream);
-    hipMemcpyAsync(state->d_tokens, token_ids, B * sizeof(int), hipMemcpyHostToDevice, stream);
-    launch_embed_lookup(m->token_embd, state->d_tokens, state->hidden, n, B, stream);
+    hipMemcpyAsync(state->d_positions, state->positions, BS * sizeof(int), hipMemcpyHostToDevice, stream);
+    hipMemcpyAsync(state->d_tokens, token_ids, BS * sizeof(int), hipMemcpyHostToDevice, stream);
+    launch_embed_lookup(m->token_embd, state->d_tokens, state->hidden, n, BS, cfg.n_vocab, stream);
 
     float* cur = state->hidden;
     float* res = state->hidden2;
@@ -325,9 +319,9 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
     for (int layer = 0; layer < cfg.n_layer; layer++) {
         auto& L = m->layers[layer];
 
-        // Fused RMSNorm → BF16 for Q/K/V (layer 0 only; subsequent fused with prev add)
+        // Fused RMSNorm -> BF16 for Q/K/V (layer 0 only; subsequent fused with prev add)
         if (layer == 0)
-            launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, B, stream);
+            launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
         launch_structured12_batch4_async(L.wq.packed, L.wq.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.wq.escape_row_base, L.wq.escape_counts, L.wq.escape_vals,
@@ -346,21 +340,21 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
 
         size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
         launch_rope_batch(state->q_buf, state->k_buf, state->d_positions,
-                          head_dim, cfg.n_head, cfg.n_head_kv, n, kv_dim, cfg.rope_theta, B, stream);
+                          head_dim, cfg.n_head, cfg.n_head_kv, n, kv_dim, cfg.rope_theta, BS, stream);
         launch_store_kv_batch(state->k_buf, state->v_buf,
                               m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
-                              state->d_positions, kv_dim, m->max_seq_len, B, stream);
+                              state->d_positions, kv_dim, m->max_seq_len, BS, stream);
 
         int max_pos = 0;
-        for (int s = 0; s < B; s++) max_pos = std::max(max_pos, state->positions[s]);
+        for (int s = 0; s < BS; s++) max_pos = std::max(max_pos, state->positions[s]);
         if (max_pos < 1024)
             launch_attention_all_heads_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
                 bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
-                max_pos + 1, scale, B, 0, stream);
+                max_pos + 1, scale, BS, 0, stream);
         else
             launch_flash_attention_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
                 bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
-                max_pos + 1, scale, B, 0, stream);
+                max_pos + 1, scale, BS, 0, stream);
 
         // wo: attention now writes BF16 directly to bf16_a
         launch_structured12_batch4_async(L.wo.packed, L.wo.base_exp,
@@ -368,8 +362,8 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
             L.wo.escape_row_base, L.wo.escape_counts, L.wo.escape_vals,
             SEQ(res,0,n), SEQ(res,1,n), SEQ(res,2,n), SEQ(res,3,n),
             L.wo.M, L.wo.K, stream);
-        // Fused add + RMSNorm → BF16 (res += cur, then bf16_a = norm(res))
-        launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, B, stream);
+        // Fused add + RMSNorm -> BF16 (res += cur, then bf16_a = norm(res))
+        launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
         launch_structured12_batch4_async(L.w_gate.packed, L.w_gate.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.w_gate.escape_row_base, L.w_gate.escape_counts, L.w_gate.escape_vals,
@@ -380,8 +374,8 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
             L.w_up.escape_row_base, L.w_up.escape_counts, L.w_up.escape_vals,
             SEQ(state->ffn_up,0,n_ff), SEQ(state->ffn_up,1,n_ff), SEQ(state->ffn_up,2,n_ff), SEQ(state->ffn_up,3,n_ff),
             L.w_up.M, L.w_up.K, stream);
-        // Fused SiLU*mul → BF16 for w_down (saves 1 launch)
-        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, B, stream);
+        // Fused SiLU*mul -> BF16 for w_down (saves 1 launch)
+        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, BS, stream);
         launch_structured12_batch4_async(L.w_down.packed, L.w_down.base_exp,
             SEQI(bf16_b,0,n_ff), SEQI(bf16_b,1,n_ff), SEQI(bf16_b,2,n_ff), SEQI(bf16_b,3,n_ff),
             L.w_down.escape_row_base, L.w_down.escape_counts, L.w_down.escape_vals,
@@ -391,10 +385,10 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
         // Fuse add + next layer's RMSNorm (saves 1 kernel launch per layer)
         if (layer + 1 < cfg.n_layer) {
             auto& nextL = m->layers[layer + 1];
-            launch_add_rms_norm_bf16_batch(cur, res, nextL.attn_norm, bf16_a, n, cfg.rms_norm_eps, B, stream);
+            launch_add_rms_norm_bf16_batch(cur, res, nextL.attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
         } else {
             // Fuse last layer's add with output RMSNorm
-            launch_add_rms_norm_bf16_batch(cur, res, m->output_norm, bf16_a, n, cfg.rms_norm_eps, B, stream);
+            launch_add_rms_norm_bf16_batch(cur, res, m->output_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
         }
     }
 
@@ -405,7 +399,7 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
         SEQ(state->logits,0,cfg.n_vocab), SEQ(state->logits,1,cfg.n_vocab),
         SEQ(state->logits,2,cfg.n_vocab), SEQ(state->logits,3,cfg.n_vocab),
         m->output_proj.M, m->output_proj.K, stream);
-    for (int s = 0; s < B; s++) state->positions[s]++;
+    for (int s = 0; s < BS; s++) state->positions[s]++;
 }
 
 // B=8 forward — fully batched, minimal kernel launches
@@ -419,7 +413,7 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
 
     hipMemcpyAsync(state->d_positions, state->positions, BS * sizeof(int), hipMemcpyHostToDevice, stream);
     hipMemcpyAsync(state->d_tokens, token_ids, BS * sizeof(int), hipMemcpyHostToDevice, stream);
-    launch_embed_lookup(m->token_embd, state->d_tokens, state->hidden, n, BS, stream);
+    launch_embed_lookup(m->token_embd, state->d_tokens, state->hidden, n, BS, cfg.n_vocab, stream);
 
     float* cur = state->hidden;
     float* res = state->hidden2;

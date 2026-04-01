@@ -1,6 +1,9 @@
 #include "sampler.h"
 #include <hip/hip_runtime.h>
 
+// Suppress nodiscard warnings from HIP API calls
+#pragma clang diagnostic ignored "-Wunused-result"
+
 extern "C" void launch_argmax(const float* logits, int* result, int n, hipStream_t stream);
 extern "C" void launch_argmax_batch(const float* logits, int* results, int n_vocab, int batch_size, hipStream_t stream);
 

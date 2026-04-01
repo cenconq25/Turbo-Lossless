@@ -7,6 +7,9 @@
 #include <cstdint>
 #include <cmath>
 
+// Suppress nodiscard warnings from HIP API calls
+#pragma clang diagnostic ignored "-Wunused-result"
+
 // ============================================================
 // BF16 ↔ Float conversion helpers
 // ============================================================
@@ -136,13 +139,17 @@ __global__ void embed_lookup_kernel(
     const int16_t* __restrict__ embd_table,  // [n_vocab, n_embd] BF16
     const int* __restrict__ token_ids,        // [batch_size]
     float* __restrict__ output,               // [batch_size, n_embd]
-    int n_embd, int batch_size)
+    int n_embd, int batch_size, int n_vocab)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int seq = blockIdx.y;
     if (seq >= batch_size || idx >= n_embd) return;
 
     int token_id = token_ids[seq];
+    if (token_id < 0 || token_id >= n_vocab) {
+        output[seq * n_embd + idx] = 0.0f;
+        return;
+    }
     output[seq * n_embd + idx] = bf16_to_float(embd_table[token_id * n_embd + idx]);
 }
 
@@ -230,10 +237,10 @@ void launch_rope(float* q, float* k, int head_dim, int n_head, int n_head_kv,
 }
 
 void launch_embed_lookup(const int16_t* embd_table, const int* token_ids,
-                         float* output, int n_embd, int batch_size, hipStream_t stream) {
+                         float* output, int n_embd, int batch_size, int n_vocab, hipStream_t stream) {
     dim3 threads(256);
     dim3 blocks((n_embd + 255) / 256, batch_size);
-    embed_lookup_kernel<<<blocks, threads, 0, stream>>>(embd_table, token_ids, output, n_embd, batch_size);
+    embed_lookup_kernel<<<blocks, threads, 0, stream>>>(embd_table, token_ids, output, n_embd, batch_size, n_vocab);
 }
 
 void launch_argmax(const float* logits, int* result, int n, hipStream_t stream) {

@@ -5,6 +5,9 @@
 #include <fstream>
 #include <sstream>
 
+// Suppress nodiscard warnings from HIP API calls (hipMalloc, hipFree, etc.)
+#pragma clang diagnostic ignored "-Wunused-result"
+
 // Read entire binary file into host memory
 static std::vector<uint8_t> read_file(const std::string& path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
@@ -46,11 +49,16 @@ static bool load_compressed(const std::string& dir, const std::string& prefix, C
     w.packed = upload_gpu<int32_t>(packed.data(), packed.size() / sizeof(int32_t));
 
     // Codebook (not needed for structured 12-bit, but load if present for backward compat)
-    auto cb = read_file(dir + "/" + prefix + ".codebook.bin");
-    if (!cb.empty())
-        w.codebook = upload_gpu<int16_t>(cb.data(), cb.size() / sizeof(int16_t));
-    else
-        w.codebook = nullptr;
+    {
+        std::string cb_path = dir + "/" + prefix + ".codebook.bin";
+        std::ifstream cbf(cb_path, std::ios::binary);
+        if (cbf) {
+            auto cb = read_file(cb_path);
+            w.codebook = upload_gpu<int16_t>(cb.data(), cb.size() / sizeof(int16_t));
+        } else {
+            w.codebook = nullptr;  // structured12 mode — no codebook needed
+        }
+    }
 
     // CSR escape data
     auto ro = read_file(dir + "/" + prefix + ".row_off.bin");
@@ -261,8 +269,41 @@ Model* load_model(const std::string& model_path, int device_id) {
     return m;
 }
 
+static void free_compressed_weight(CompressedWeight& w) {
+    if (w.packed)           hipFree(w.packed);
+    if (w.codebook)         hipFree(w.codebook);
+    if (w.row_offsets)      hipFree(w.row_offsets);
+    if (w.patch_cols)       hipFree(w.patch_cols);
+    if (w.patch_correct)    hipFree(w.patch_correct);
+    if (w.patch_wrong)      hipFree(w.patch_wrong);
+    if (w.escape_row_base)  hipFree(w.escape_row_base);
+    if (w.escape_counts)    hipFree(w.escape_counts);
+    if (w.escape_vals)      hipFree(w.escape_vals);
+    if (w.split_sm)         hipFree(w.split_sm);
+    if (w.split_gr)         hipFree(w.split_gr);
+}
+
 void free_model(Model* model) {
     if (!model) return;
-    // TODO: free all GPU allocations
+
+    if (model->token_embd)  hipFree(model->token_embd);
+    if (model->output_norm) hipFree(model->output_norm);
+    free_compressed_weight(model->output_proj);
+
+    for (auto& layer : model->layers) {
+        if (layer.attn_norm) hipFree(layer.attn_norm);
+        if (layer.ffn_norm)  hipFree(layer.ffn_norm);
+        free_compressed_weight(layer.wq);
+        free_compressed_weight(layer.wk);
+        free_compressed_weight(layer.wv);
+        free_compressed_weight(layer.wo);
+        free_compressed_weight(layer.w_gate);
+        free_compressed_weight(layer.w_up);
+        free_compressed_weight(layer.w_down);
+    }
+
+    if (model->kv_cache_k) hipFree(model->kv_cache_k);
+    if (model->kv_cache_v) hipFree(model->kv_cache_v);
+
     delete model;
 }
