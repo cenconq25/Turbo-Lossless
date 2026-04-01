@@ -40,21 +40,33 @@ extern "C" {
     // Split12 format: byte-aligned arrays
     int launch_split12_v2_async(const void* sign_mantissa, const void* groups, int base_exp, const void* activations, void* output, int M, int K, void* stream);
     int launch_split12_v2_dual_async(const void* sm_a, const void* gr_a, int base_exp_a, const void* sm_b, const void* gr_b, int base_exp_b, const void* activations, void* output_a, void* output_b, int M, int K, void* stream);
+    int launch_split12_batch4_async(const void* sm, const void* gr, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, int M, int K, void* stream);
+    int launch_split12_batch8_async(const void* sm, const void* gr, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* a4, const void* a5, const void* a6, const void* a7, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, void* o4, void* o5, void* o6, void* o7, int M, int K, void* stream);
 }
 
 #define B 4
 #define SEQ(buf, s, sz) ((buf) + (s) * (sz))
 #define SEQI(buf, s, sz) ((buf) + (s) * (sz))  // int16_t version
 
-// B=4 batch4 matvec helper: structured 12-bit (no LDS codebook)
+// B=4 batch4 matvec: prefer split12 (zero amplification) when available
 #define BATCH4_MATVEC(w, bf16_in, out_buf, n_in, n_out, strm) do { \
-    launch_structured12_batch4_async((w).packed, (w).base_exp, \
-        SEQI(bf16_in,0,n_in), SEQI(bf16_in,1,n_in), \
-        SEQI(bf16_in,2,n_in), SEQI(bf16_in,3,n_in), \
-        (w).escape_row_base, (w).escape_counts, (w).escape_vals, \
-        SEQ(out_buf,0,n_out), SEQ(out_buf,1,n_out), \
-        SEQ(out_buf,2,n_out), SEQ(out_buf,3,n_out), \
-        (w).M, (w).K, strm); \
+    if ((w).split_sm) { \
+        launch_split12_batch4_async((w).split_sm, (w).split_gr, (w).base_exp, \
+            SEQI(bf16_in,0,n_in), SEQI(bf16_in,1,n_in), \
+            SEQI(bf16_in,2,n_in), SEQI(bf16_in,3,n_in), \
+            (w).escape_row_base, (w).escape_counts, (w).escape_vals, \
+            SEQ(out_buf,0,n_out), SEQ(out_buf,1,n_out), \
+            SEQ(out_buf,2,n_out), SEQ(out_buf,3,n_out), \
+            (w).M, (w).K, strm); \
+    } else { \
+        launch_structured12_batch4_async((w).packed, (w).base_exp, \
+            SEQI(bf16_in,0,n_in), SEQI(bf16_in,1,n_in), \
+            SEQI(bf16_in,2,n_in), SEQI(bf16_in,3,n_in), \
+            (w).escape_row_base, (w).escape_counts, (w).escape_vals, \
+            SEQ(out_buf,0,n_out), SEQ(out_buf,1,n_out), \
+            SEQ(out_buf,2,n_out), SEQ(out_buf,3,n_out), \
+            (w).M, (w).K, strm); \
+    } \
 } while(0)
 
 InferenceState* create_inference_state(Model* model, int batch_size, int max_seq_len) {
@@ -263,19 +275,33 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
     #undef MATVEC_B1
 }
 
-// B=8 batch8 matvec helper: structured 12-bit (no LDS codebook)
+// B=8 batch8 matvec: prefer split12 when available
 #define BATCH8_MATVEC(w, bf16_in, out_buf, n_in, n_out, strm) do { \
-    launch_structured12_batch8_async((w).packed, (w).base_exp, \
-        SEQI(bf16_in,0,n_in), SEQI(bf16_in,1,n_in), \
-        SEQI(bf16_in,2,n_in), SEQI(bf16_in,3,n_in), \
-        SEQI(bf16_in,4,n_in), SEQI(bf16_in,5,n_in), \
-        SEQI(bf16_in,6,n_in), SEQI(bf16_in,7,n_in), \
-        (w).escape_row_base, (w).escape_counts, (w).escape_vals, \
-        SEQ(out_buf,0,n_out), SEQ(out_buf,1,n_out), \
-        SEQ(out_buf,2,n_out), SEQ(out_buf,3,n_out), \
-        SEQ(out_buf,4,n_out), SEQ(out_buf,5,n_out), \
-        SEQ(out_buf,6,n_out), SEQ(out_buf,7,n_out), \
-        (w).M, (w).K, strm); \
+    if ((w).split_sm) { \
+        launch_split12_batch8_async((w).split_sm, (w).split_gr, (w).base_exp, \
+            SEQI(bf16_in,0,n_in), SEQI(bf16_in,1,n_in), \
+            SEQI(bf16_in,2,n_in), SEQI(bf16_in,3,n_in), \
+            SEQI(bf16_in,4,n_in), SEQI(bf16_in,5,n_in), \
+            SEQI(bf16_in,6,n_in), SEQI(bf16_in,7,n_in), \
+            (w).escape_row_base, (w).escape_counts, (w).escape_vals, \
+            SEQ(out_buf,0,n_out), SEQ(out_buf,1,n_out), \
+            SEQ(out_buf,2,n_out), SEQ(out_buf,3,n_out), \
+            SEQ(out_buf,4,n_out), SEQ(out_buf,5,n_out), \
+            SEQ(out_buf,6,n_out), SEQ(out_buf,7,n_out), \
+            (w).M, (w).K, strm); \
+    } else { \
+        launch_structured12_batch8_async((w).packed, (w).base_exp, \
+            SEQI(bf16_in,0,n_in), SEQI(bf16_in,1,n_in), \
+            SEQI(bf16_in,2,n_in), SEQI(bf16_in,3,n_in), \
+            SEQI(bf16_in,4,n_in), SEQI(bf16_in,5,n_in), \
+            SEQI(bf16_in,6,n_in), SEQI(bf16_in,7,n_in), \
+            (w).escape_row_base, (w).escape_counts, (w).escape_vals, \
+            SEQ(out_buf,0,n_out), SEQ(out_buf,1,n_out), \
+            SEQ(out_buf,2,n_out), SEQ(out_buf,3,n_out), \
+            SEQ(out_buf,4,n_out), SEQ(out_buf,5,n_out), \
+            SEQ(out_buf,6,n_out), SEQ(out_buf,7,n_out), \
+            (w).M, (w).K, strm); \
+    } \
 } while(0)
 
 // B=4 forward — fully batched, minimal kernel launches
