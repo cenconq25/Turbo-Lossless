@@ -2408,6 +2408,148 @@ __global__ void split12_matvec_v2_multirow(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Split12 dual matvec: process 2 tensors (gate + up) sharing activation reads
+// Each block handles 1 row for BOTH tensors. Activation loaded once, 2x FMA.
+// Saves ~25% HBM bandwidth on the two largest FFN tensors.
+// ---------------------------------------------------------------------------
+__launch_bounds__(WORKGROUP_SIZE)
+__global__ void split12_matvec_v2_dual(
+    const uint8_t* __restrict__ sm_a, const uint8_t* __restrict__ gr_a, int base_exp_a,  // tensor A (gate)
+    const uint8_t* __restrict__ sm_b, const uint8_t* __restrict__ gr_b, int base_exp_b,  // tensor B (up)
+    const int16_t* __restrict__ activations,    // shared BF16 input
+    float*         __restrict__ output_a,
+    float*         __restrict__ output_b,
+    int M, int K)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    __shared__ float warp_sums_a[4];
+    __shared__ float warp_sums_b[4];
+
+    float sa0 = 0.0f, sa1 = 0.0f, sa2 = 0.0f, sa3 = 0.0f;
+    float sb0 = 0.0f, sb1 = 0.0f, sb2 = 0.0f, sb3 = 0.0f;
+
+    // Pointer setup: row-major layout for both tensors
+    const uint8_t* sma_ptr = sm_a + (int64_t)row * K + tid;
+    const uint8_t* gra_ptr = gr_a + (int64_t)row * K / 2 + tid / 2;
+    const uint8_t* smb_ptr = sm_b + (int64_t)row * K + tid;
+    const uint8_t* grb_ptr = gr_b + (int64_t)row * K / 2 + tid / 2;
+    const char*    act_ptr = (const char*)(activations + tid);
+
+    const int is_odd = tid & 1;
+
+    int col = tid;
+    for (; col + WORKGROUP_SIZE * 3 < K; col += WORKGROUP_SIZE * 4) {
+        // Load activations ONCE (shared between both tensors)
+        float af0 = bf16_to_float(*(const int16_t*)(act_ptr));
+        float af1 = bf16_to_float(*(const int16_t*)(act_ptr + 512));
+        float af2 = bf16_to_float(*(const int16_t*)(act_ptr + 1024));
+        float af3 = bf16_to_float(*(const int16_t*)(act_ptr + 1536));
+
+        // Tensor A: load sign+mantissa and groups
+        uint8_t sma0 = sma_ptr[0];
+        uint8_t sma1 = sma_ptr[256];
+        uint8_t sma2 = sma_ptr[512];
+        uint8_t sma3 = sma_ptr[768];
+        uint8_t gba0 = gra_ptr[0];
+        uint8_t gba1 = gra_ptr[128];
+        uint8_t gba2 = gra_ptr[256];
+        uint8_t gba3 = gra_ptr[384];
+
+        uint32_t ga0 = is_odd ? (gba0 >> 4) : (gba0 & 0xF);
+        uint32_t ga1 = is_odd ? (gba1 >> 4) : (gba1 & 0xF);
+        uint32_t ga2 = is_odd ? (gba2 >> 4) : (gba2 & 0xF);
+        uint32_t ga3 = is_odd ? (gba3 >> 4) : (gba3 & 0xF);
+
+        union { uint32_t u; float f; } ca0, ca1, ca2, ca3;
+        ca0.u = (((uint32_t)(sma0 >> 7)) << 15 | ((uint32_t)(base_exp_a + ga0)) << 7 | (sma0 & 0x7F)) << 16;
+        ca1.u = (((uint32_t)(sma1 >> 7)) << 15 | ((uint32_t)(base_exp_a + ga1)) << 7 | (sma1 & 0x7F)) << 16;
+        ca2.u = (((uint32_t)(sma2 >> 7)) << 15 | ((uint32_t)(base_exp_a + ga2)) << 7 | (sma2 & 0x7F)) << 16;
+        ca3.u = (((uint32_t)(sma3 >> 7)) << 15 | ((uint32_t)(base_exp_a + ga3)) << 7 | (sma3 & 0x7F)) << 16;
+
+        sa0 += ca0.f * af0;
+        sa1 += ca1.f * af1;
+        sa2 += ca2.f * af2;
+        sa3 += ca3.f * af3;
+
+        // Tensor B: load sign+mantissa and groups
+        uint8_t smb0 = smb_ptr[0];
+        uint8_t smb1 = smb_ptr[256];
+        uint8_t smb2 = smb_ptr[512];
+        uint8_t smb3 = smb_ptr[768];
+        uint8_t gbb0 = grb_ptr[0];
+        uint8_t gbb1 = grb_ptr[128];
+        uint8_t gbb2 = grb_ptr[256];
+        uint8_t gbb3 = grb_ptr[384];
+
+        uint32_t gb0 = is_odd ? (gbb0 >> 4) : (gbb0 & 0xF);
+        uint32_t gb1 = is_odd ? (gbb1 >> 4) : (gbb1 & 0xF);
+        uint32_t gb2 = is_odd ? (gbb2 >> 4) : (gbb2 & 0xF);
+        uint32_t gb3 = is_odd ? (gbb3 >> 4) : (gbb3 & 0xF);
+
+        union { uint32_t u; float f; } cb0, cb1, cb2, cb3;
+        cb0.u = (((uint32_t)(smb0 >> 7)) << 15 | ((uint32_t)(base_exp_b + gb0)) << 7 | (smb0 & 0x7F)) << 16;
+        cb1.u = (((uint32_t)(smb1 >> 7)) << 15 | ((uint32_t)(base_exp_b + gb1)) << 7 | (smb1 & 0x7F)) << 16;
+        cb2.u = (((uint32_t)(smb2 >> 7)) << 15 | ((uint32_t)(base_exp_b + gb2)) << 7 | (smb2 & 0x7F)) << 16;
+        cb3.u = (((uint32_t)(smb3 >> 7)) << 15 | ((uint32_t)(base_exp_b + gb3)) << 7 | (smb3 & 0x7F)) << 16;
+
+        sb0 += cb0.f * af0;
+        sb1 += cb1.f * af1;
+        sb2 += cb2.f * af2;
+        sb3 += cb3.f * af3;
+
+        sma_ptr += 1024;
+        gra_ptr += 512;
+        smb_ptr += 1024;
+        grb_ptr += 512;
+        act_ptr += 2048;
+    }
+    // Tail loop
+    for (; col < K; col += WORKGROUP_SIZE) {
+        float af = bf16_to_float(*(const int16_t*)(act_ptr));
+
+        uint8_t sma = sma_ptr[0];
+        uint8_t gba = gra_ptr[0];
+        uint32_t ga = is_odd ? (gba >> 4) : (gba & 0xF);
+        union { uint32_t u; float f; } ca;
+        ca.u = (((uint32_t)(sma >> 7)) << 15 | ((uint32_t)(base_exp_a + ga)) << 7 | (sma & 0x7F)) << 16;
+        sa0 += ca.f * af;
+
+        uint8_t smb = smb_ptr[0];
+        uint8_t gbb = grb_ptr[0];
+        uint32_t gb = is_odd ? (gbb >> 4) : (gbb & 0xF);
+        union { uint32_t u; float f; } cb;
+        cb.u = (((uint32_t)(smb >> 7)) << 15 | ((uint32_t)(base_exp_b + gb)) << 7 | (smb & 0x7F)) << 16;
+        sb0 += cb.f * af;
+
+        sma_ptr += 256;
+        gra_ptr += 128;
+        smb_ptr += 256;
+        grb_ptr += 128;
+        act_ptr += 512;
+    }
+
+    // Reduction for tensor A
+    float sum_a = sa0 + sa1 + sa2 + sa3;
+    // Reduction for tensor B
+    float sum_b = sb0 + sb1 + sb2 + sb3;
+
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        sum_a += __shfl_down(sum_a, off, WARP_SIZE);
+        sum_b += __shfl_down(sum_b, off, WARP_SIZE);
+    }
+    if ((tid & (WARP_SIZE - 1)) == 0) {
+        warp_sums_a[tid >> 6] = sum_a;
+        warp_sums_b[tid >> 6] = sum_b;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        output_a[row] = warp_sums_a[0] + warp_sums_a[1] + warp_sums_a[2] + warp_sums_a[3];
+        output_b[row] = warp_sums_b[0] + warp_sums_b[1] + warp_sums_b[2] + warp_sums_b[3];
+    }
+}
+
 extern "C" {
 
 int launch_split12_v2_async(
@@ -2427,6 +2569,23 @@ int launch_split12_v2_async(
             (const uint8_t*)sign_mantissa, (const uint8_t*)groups, base_exp,
             (const int16_t*)activations, (float*)output, M, K);
     }
+    return 0;
+}
+
+int launch_split12_v2_dual_async(
+    const void* sm_a, const void* gr_a, int base_exp_a,
+    const void* sm_b, const void* gr_b, int base_exp_b,
+    const void* activations,
+    void* output_a, void* output_b,
+    int M, int K, void* stream)
+{
+    hipLaunchKernelGGL(split12_matvec_v2_dual,
+        dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
+        (const uint8_t*)sm_a, (const uint8_t*)gr_a, base_exp_a,
+        (const uint8_t*)sm_b, (const uint8_t*)gr_b, base_exp_b,
+        (const int16_t*)activations,
+        (float*)output_a, (float*)output_b,
+        M, K);
     return 0;
 }
 

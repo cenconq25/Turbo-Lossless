@@ -39,6 +39,7 @@ extern "C" {
 
     // Split12 format: byte-aligned arrays
     int launch_split12_v2_async(const void* sign_mantissa, const void* groups, int base_exp, const void* activations, void* output, int M, int K, void* stream);
+    int launch_split12_v2_dual_async(const void* sm_a, const void* gr_a, int base_exp_a, const void* sm_b, const void* gr_b, int base_exp_b, const void* activations, void* output_a, void* output_b, int M, int K, void* stream);
 }
 
 #define B 4
@@ -210,12 +211,21 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
 
         PROF_START(stream);
         // Fused dual kernel: gate + up share activation reads (1 launch instead of 2)
-        launch_structured12_v2_dual_async(
-            L.w_gate.packed, L.w_gate.base_exp,
-            L.w_up.packed, L.w_up.base_exp,
-            bf16_a,
-            state->ffn_gate, state->ffn_up,
-            L.w_gate.M, L.w_gate.K, stream);
+        if (L.w_gate.split_sm && L.w_up.split_sm) {
+            launch_split12_v2_dual_async(
+                L.w_gate.split_sm, L.w_gate.split_gr, L.w_gate.base_exp,
+                L.w_up.split_sm, L.w_up.split_gr, L.w_up.base_exp,
+                bf16_a,
+                state->ffn_gate, state->ffn_up,
+                L.w_gate.M, L.w_gate.K, stream);
+        } else {
+            launch_structured12_v2_dual_async(
+                L.w_gate.packed, L.w_gate.base_exp,
+                L.w_up.packed, L.w_up.base_exp,
+                bf16_a,
+                state->ffn_gate, state->ffn_up,
+                L.w_gate.M, L.w_gate.K, stream);
+        }
         // Apply patch corrections for both tensors
         if (L.w_gate.num_patches > 0 && L.w_gate.row_offsets)
             launch_patches_v2_async(L.w_gate.row_offsets, L.w_gate.patch_cols, L.w_gate.patch_correct, L.w_gate.patch_wrong,
