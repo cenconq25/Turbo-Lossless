@@ -17,10 +17,10 @@ extern "C" {
     void launch_memcpy_batch(float* dst, const float* src, int n, int batch_size, hipStream_t stream);
     void launch_rope_batch(float* q, float* k, const int* positions, int head_dim, int n_head, int n_head_kv, int q_stride, int k_stride, float theta, int batch_size, hipStream_t stream);
     void launch_store_kv_batch(const float* k, const float* v, int16_t* kv_k, int16_t* kv_v, const int* positions, int kv_dim, int max_seq, int batch_size, hipStream_t stream);
-    void launch_attention_all_heads(const float* q, const int16_t* k_cache, const int16_t* v_cache, float* output, int n_head, int n_head_kv, int head_dim, int seq_len, int max_seq, float scale, hipStream_t stream);
-    void launch_attention_all_heads_batch(const float* q, const int16_t* kv_k, const int16_t* kv_v, float* output, const int* positions, int n_head, int n_head_kv, int head_dim, int max_seq, float scale, int batch_size, int kv_stride, hipStream_t stream);
-    void launch_flash_attention(const float* q, const int16_t* k_cache, const int16_t* v_cache, float* output, int n_head, int n_head_kv, int head_dim, int seq_len, int max_seq, float scale, hipStream_t stream);
-    void launch_flash_attention_batch(const float* q, const int16_t* kv_k, const int16_t* kv_v, float* output, const int* positions, int n_head, int n_head_kv, int head_dim, int max_seq, float scale, int batch_size, int kv_stride, hipStream_t stream);
+    void launch_attention_all_heads(const float* q, const int16_t* k_cache, const int16_t* v_cache, int16_t* output, int n_head, int n_head_kv, int head_dim, int seq_len, int max_seq, float scale, hipStream_t stream);
+    void launch_attention_all_heads_batch(const float* q, const int16_t* kv_k, const int16_t* kv_v, int16_t* output, const int* positions, int n_head, int n_head_kv, int head_dim, int max_seq, float scale, int batch_size, int kv_stride, hipStream_t stream);
+    void launch_flash_attention(const float* q, const int16_t* k_cache, const int16_t* v_cache, int16_t* output, int n_head, int n_head_kv, int head_dim, int seq_len, int max_seq, float scale, hipStream_t stream);
+    void launch_flash_attention_batch(const float* q, const int16_t* kv_k, const int16_t* kv_v, int16_t* output, const int* positions, int n_head, int n_head_kv, int head_dim, int max_seq, float scale, int batch_size, int kv_stride, hipStream_t stream);
     void launch_rope(float* q, float* k, int head_dim, int n_head, int n_head_kv, int position, float theta, hipStream_t stream);
     void launch_store_kv(const float* k, const float* v, int16_t* kv_k, int16_t* kv_v, int pos, int n_head_kv, int head_dim, int max_seq, hipStream_t stream);
 
@@ -205,12 +205,11 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
                         pos, cfg.n_head_kv, head_dim, m->max_seq_len, stream);
         if (pos < 1024)
             launch_attention_all_heads(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
-                state->attn_out, cfg.n_head, cfg.n_head_kv, head_dim, pos+1, m->max_seq_len, scale, stream);
+                bf16_a, cfg.n_head, cfg.n_head_kv, head_dim, pos+1, m->max_seq_len, scale, stream);
         else
             launch_flash_attention(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
-                state->attn_out, cfg.n_head, cfg.n_head_kv, head_dim, pos+1, m->max_seq_len, scale, stream);
+                bf16_a, cfg.n_head, cfg.n_head_kv, head_dim, pos+1, m->max_seq_len, scale, stream);
 
-        launch_fp32_to_bf16(state->attn_out, bf16_a, n, stream);
         PROF_END_ATTN(stream);
 
         PROF_START(stream);
@@ -356,15 +355,14 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
         for (int s = 0; s < B; s++) max_pos = std::max(max_pos, state->positions[s]);
         if (max_pos < 1024)
             launch_attention_all_heads_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
-                state->attn_out, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
+                bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
                 max_pos + 1, scale, B, 0, stream);
         else
             launch_flash_attention_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
-                state->attn_out, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
+                bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
                 max_pos + 1, scale, B, 0, stream);
 
-        // wo: convert attn_out to BF16
-        launch_fp32_to_bf16(state->attn_out, bf16_a, B * n, stream);
+        // wo: attention now writes BF16 directly to bf16_a
         launch_structured12_batch4_async(L.wo.packed, L.wo.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.wo.escape_row_base, L.wo.escape_counts, L.wo.escape_vals,
@@ -469,15 +467,14 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
         for (int s = 0; s < BS; s++) max_pos = std::max(max_pos, state->positions[s]);
         if (max_pos < 1024)
             launch_attention_all_heads_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
-                state->attn_out, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
+                bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
                 max_pos + 1, scale, BS, 0, stream);
         else
             launch_flash_attention_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
-                state->attn_out, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
+                bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
                 max_pos + 1, scale, BS, 0, stream);
 
-        // wo: convert attn_out to BF16
-        launch_fp32_to_bf16(state->attn_out, bf16_a, BS * n, stream);
+        // wo: attention now writes BF16 directly to bf16_a
         launch_structured12_batch8_async(L.wo.packed, L.wo.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             SEQI(bf16_a,4,n), SEQI(bf16_a,5,n), SEQI(bf16_a,6,n), SEQI(bf16_a,7,n),

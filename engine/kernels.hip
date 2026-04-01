@@ -563,7 +563,7 @@ __global__ void attention_all_heads_kernel(
     const float* __restrict__ q,
     const int16_t* __restrict__ k_cache,
     const int16_t* __restrict__ v_cache,
-    float* __restrict__ output,
+    int16_t* __restrict__ output,
     int seq_len, int max_seq, int n_head_kv, int head_dim,
     int gqa_ratio, float scale)
 {
@@ -639,13 +639,13 @@ __global__ void attention_all_heads_kernel(
         int v_off = kv_head * head_dim + d;
         for (int t = 0; t < seq_len; t++)
             acc += scores[t] * bf16_to_float(v_cache[t * n_head_kv * head_dim + v_off]);
-        output[head * head_dim + d] = acc;
+        output[head * head_dim + d] = float_to_bf16(acc);
     }
 }
 
 extern "C" {
 void launch_attention_all_heads(const float* q, const int16_t* k_cache, const int16_t* v_cache,
-    float* output, int n_head, int n_head_kv, int head_dim, int seq_len, int max_seq,
+    int16_t* output, int n_head, int n_head_kv, int head_dim, int seq_len, int max_seq,
     float scale, hipStream_t stream)
 {
     int gqa_ratio = n_head / n_head_kv;
@@ -664,7 +664,7 @@ __global__ void attention_all_heads_batch_kernel(
     const float* __restrict__ q,           // [batch_size * n_head * head_dim]
     const int16_t* __restrict__ kv_cache_k, // [n_layer * max_seq * n_head_kv * head_dim] (shared)
     const int16_t* __restrict__ kv_cache_v,
-    float* __restrict__ output,            // [batch_size * n_head * head_dim]
+    int16_t* __restrict__ output,          // [batch_size * n_head * head_dim] BF16
     const int* __restrict__ positions,     // [batch_size] current position per sequence
     int n_head, int n_head_kv, int head_dim,
     int max_seq, int gqa_ratio, float scale,
@@ -736,14 +736,14 @@ __global__ void attention_all_heads_batch_kernel(
         int v_off = kv_head * head_dim + d;
         for (int t = 0; t < seq_len; t++)
             acc += scores[t] * bf16_to_float(v[t * n_head_kv * head_dim + v_off]);
-        output[seq * n_total + head * head_dim + d] = acc;
+        output[seq * n_total + head * head_dim + d] = float_to_bf16(acc);
     }
 }
 
 extern "C" {
 void launch_attention_all_heads_batch(
     const float* q, const int16_t* kv_k, const int16_t* kv_v,
-    float* output, const int* positions,
+    int16_t* output, const int* positions,
     int n_head, int n_head_kv, int head_dim,
     int max_seq, float scale, int batch_size, int kv_stride,
     hipStream_t stream)
@@ -852,7 +852,7 @@ __global__ void flash_attention_kernel(
     const float* __restrict__ q,
     const int16_t* __restrict__ k_cache,
     const int16_t* __restrict__ v_cache,
-    float* __restrict__ output,
+    int16_t* __restrict__ output,
     int seq_len, int n_head_kv, int head_dim,
     int gqa_ratio, float scale)
 {
@@ -953,7 +953,7 @@ __global__ void flash_attention_kernel(
     }
 
     // Final normalization
-    output[head * head_dim + tid] = O_acc / l_prev;
+    output[head * head_dim + tid] = float_to_bf16(O_acc / l_prev);
 }
 
 // Flash Attention Batch — B sequences × N heads
@@ -961,7 +961,7 @@ __global__ void flash_attention_batch_kernel(
     const float* __restrict__ q,
     const int16_t* __restrict__ kv_cache_k,
     const int16_t* __restrict__ kv_cache_v,
-    float* __restrict__ output,
+    int16_t* __restrict__ output,
     const int* __restrict__ positions,
     int n_head, int n_head_kv, int head_dim,
     int max_seq, int gqa_ratio, float scale,
@@ -1057,12 +1057,12 @@ __global__ void flash_attention_batch_kernel(
         __syncthreads();
     }
 
-    output[seq * n_total + head * head_dim + tid] = O_acc / l_prev;
+    output[seq * n_total + head * head_dim + tid] = float_to_bf16(O_acc / l_prev);
 }
 
 extern "C" {
 void launch_flash_attention(const float* q, const int16_t* k_cache, const int16_t* v_cache,
-    float* output, int n_head, int n_head_kv, int head_dim, int seq_len, int max_seq,
+    int16_t* output, int n_head, int n_head_kv, int head_dim, int seq_len, int max_seq,
     float scale, hipStream_t stream)
 {
     int gqa_ratio = n_head / n_head_kv;
@@ -1073,7 +1073,7 @@ void launch_flash_attention(const float* q, const int16_t* k_cache, const int16_
 }
 
 void launch_flash_attention_batch(const float* q, const int16_t* kv_k, const int16_t* kv_v,
-    float* output, const int* positions,
+    int16_t* output, const int* positions,
     int n_head, int n_head_kv, int head_dim,
     int max_seq, float scale, int batch_size, int kv_stride,
     hipStream_t stream)
