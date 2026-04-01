@@ -285,6 +285,88 @@ void launch_store_kv(const float* k, const float* v,
 }
 
 // ============================================================
+// Fused RoPE + Store KV (B=1 only): saves one kernel launch
+// ============================================================
+__global__ void rope_store_kv_kernel(
+    float* __restrict__ q,              // [n_head, head_dim]
+    float* __restrict__ k,              // [n_head_kv, head_dim]
+    const float* __restrict__ v_in,     // [n_head_kv * head_dim] FP32
+    int16_t* __restrict__ kv_cache_k,   // [max_seq, n_head_kv, head_dim] BF16
+    int16_t* __restrict__ kv_cache_v,
+    const float* __restrict__ freqs,    // [half_dim] precomputed
+    int head_dim, int n_head, int n_head_kv,
+    int position, int max_seq)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int half_dim = head_dim / 2;
+    int kv_total = n_head_kv * head_dim;
+    int cache_base = position * kv_total;
+
+    // RoPE on Q heads
+    if (idx < n_head * half_dim) {
+        int head = idx / half_dim;
+        int d = idx % half_dim;
+        float angle = position * freqs[d];
+        float cos_a, sin_a;
+        __sincosf(angle, &sin_a, &cos_a);
+
+        int base = head * head_dim;
+        float x0 = q[base + d];
+        float x1 = q[base + d + half_dim];
+        q[base + d]            = x0 * cos_a - x1 * sin_a;
+        q[base + d + half_dim] = x0 * sin_a + x1 * cos_a;
+    }
+
+    // RoPE on K heads + store rotated K to cache (no race: same thread rotates and stores)
+    if (idx < n_head_kv * half_dim) {
+        int head = idx / half_dim;
+        int d = idx % half_dim;
+        float angle = position * freqs[d];
+        float cos_a, sin_a;
+        __sincosf(angle, &sin_a, &cos_a);
+
+        int base = head * head_dim;
+        float x0 = k[base + d];
+        float x1 = k[base + d + half_dim];
+        float r0 = x0 * cos_a - x1 * sin_a;
+        float r1 = x0 * sin_a + x1 * cos_a;
+        // Write back to K buffer (needed by attention kernel)
+        k[base + d]            = r0;
+        k[base + d + half_dim] = r1;
+        // Store rotated K directly to cache (avoids race with separate store)
+        kv_cache_k[cache_base + base + d]            = float_to_bf16(r0);
+        kv_cache_k[cache_base + base + d + half_dim] = float_to_bf16(r1);
+    }
+
+    // Store V to cache (no rotation, just FP32->BF16 conversion)
+    if (idx < kv_total) {
+        kv_cache_v[cache_base + idx] = float_to_bf16(v_in[idx]);
+    }
+}
+
+extern "C" {
+
+void launch_rope_store_kv(float* q, float* k, const float* v,
+    int16_t* kv_k, int16_t* kv_v,
+    int head_dim, int n_head, int n_head_kv, int position,
+    int max_seq, float theta, hipStream_t stream)
+{
+    launch_rope_init(head_dim, theta);
+    int half_dim = head_dim / 2;
+    // Need enough threads for: max(n_head * half_dim, n_head_kv * head_dim)
+    int rope_threads = max(n_head, n_head_kv) * half_dim;
+    int kv_threads = n_head_kv * head_dim;
+    int max_threads = max(rope_threads, kv_threads);
+    int threads = 256;
+    int blocks = (max_threads + threads - 1) / threads;
+    rope_store_kv_kernel<<<blocks, threads, 0, stream>>>(
+        q, k, v, kv_k, kv_v, d_rope_freqs,
+        head_dim, n_head, n_head_kv, position, max_seq);
+}
+
+}
+
+// ============================================================
 // FP32 → BF16 conversion kernel (GPU, replaces CPU conversion)
 // ============================================================
 __global__ void fp32_to_bf16_kernel(

@@ -23,6 +23,7 @@ extern "C" {
     void launch_flash_attention_batch(const float* q, const int16_t* kv_k, const int16_t* kv_v, int16_t* output, const int* positions, int n_head, int n_head_kv, int head_dim, int max_seq, float scale, int batch_size, int kv_stride, hipStream_t stream);
     void launch_rope(float* q, float* k, int head_dim, int n_head, int n_head_kv, int position, float theta, hipStream_t stream);
     void launch_store_kv(const float* k, const float* v, int16_t* kv_k, int16_t* kv_v, int pos, int n_head_kv, int head_dim, int max_seq, hipStream_t stream);
+    void launch_rope_store_kv(float* q, float* k, const float* v, int16_t* kv_k, int16_t* kv_v, int head_dim, int n_head, int n_head_kv, int position, int max_seq, float theta, hipStream_t stream);
 
     // FP32→BF16 conversion
     void launch_fp32_to_bf16(const float* input, int16_t* output, int n, hipStream_t stream);
@@ -198,11 +199,11 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
         PROF_END_MV(stream);
 
         PROF_START(stream);
-        launch_rope(state->q_buf, state->k_buf, head_dim, cfg.n_head, cfg.n_head_kv, pos, cfg.rope_theta, stream);
-
         size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
-        launch_store_kv(state->k_buf, state->v_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
-                        pos, cfg.n_head_kv, head_dim, m->max_seq_len, stream);
+        launch_rope_store_kv(state->q_buf, state->k_buf, state->v_buf,
+                             m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+                             head_dim, cfg.n_head, cfg.n_head_kv, pos,
+                             m->max_seq_len, cfg.rope_theta, stream);
         if (pos < 1024)
             launch_attention_all_heads(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
                 bf16_a, cfg.n_head, cfg.n_head_kv, head_dim, pos+1, m->max_seq_len, scale, stream);
