@@ -69,14 +69,14 @@ B=8:  decode -> 8x FMA    (2.4x faster than BF16)
 
 | Batch | llama.cpp BF16 | vLLM BF16 | Turbo 12-bit | Compression | VRAM |
 |------:|---------------:|----------:|-------------:|:-----------:|-----:|
-| B=1 | 55.6 tok/s | 54.7 tok/s | **62.0 tok/s** | **1.36x** | 13.5 vs **~10 GB** |
-| B=4 | — | 208.9 tok/s | **156.0 tok/s** | **1.36x** | **~10 GB** |
-| B=8 | — | 414.6 tok/s | **162.2 tok/s** | **1.36x** | **~10 GB** |
-| B=16 | — | 687.9 tok/s | **171.0 tok/s** | **1.36x** | **~10 GB** |
-| B=32 | — | 694.2 tok/s | 169.8 tok/s | **1.36x** | **~10 GB** |
-| B=64 | — | 867.1 tok/s | 169.3 tok/s | **1.36x** | **~10 GB** |
+| B=1 | 55.6 tok/s | 54.7 tok/s | **65.0 tok/s** | **1.36x** | 13.5 vs **~10 GB** |
+| B=4 | — | 208.9 tok/s | **121.3 tok/s** | **1.36x** | **~10 GB** |
+| B=8 | — | 414.6 tok/s | **163.6 tok/s** | **1.36x** | **~10 GB** |
+| B=16 | — | 687.9 tok/s | **216.0 tok/s** | **1.36x** | **~10 GB** |
+| B=32 | — | 694.2 tok/s | **371.5 tok/s** | **1.36x** | **~10 GB** |
+| B=64 | — | 867.1 tok/s | **518.2 tok/s** | **1.36x** | **~10 GB** |
 
-Turbo peaks at **B=16 (171 tok/s)** — memory bandwidth saturated. vLLM scales higher at large B via optimized GEMM batching (cuBLAS), but uses **1.35x more VRAM**.
+B=1: **beats** llama.cpp and vLLM (bandwidth-bound, less data). B>=16: decode+cuBLAS tensor core path. vLLM still faster at high B due to zero decode overhead. Uses **1.35x less VRAM**.
 
 #### Llama 3.1 8B Instruct (8.03B params, escape rate 0.021%)
 
