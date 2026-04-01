@@ -1,6 +1,6 @@
 # Turbo Lossless: BF16 Compression Engine
 
-100% bit-perfect lossless compression for LLM weights. BF16 in, BF16 out — no precision loss, 1.33x smaller, 2.23x faster inference.
+100% bit-perfect lossless compression for LLM weights. BF16 in, BF16 out — no precision loss, 1.33x smaller, 2.41x faster inference.
 
 ## How It Works
 
@@ -87,11 +87,11 @@ Single kernel launch, no separate decompress step, NO LDS codebook:
 
 | Mode | tok/s total | tok/s/user | VRAM | vs llama.cpp BF16 (32.2) |
 |------|------------:|-----------:|-----:|:-------------------------|
-| B=1 | 26.1 | 26.1 | ~10 GB | 0.81x |
-| B=4 | 61.5 | 15.4 | 10.3 GB | **1.91x faster** |
-| **B=8** | **71.7** | **9.0** | **10.3 GB** | **2.23x faster, 1.32x less VRAM** |
-| B=16 | 70.7 | 4.4 | ~10.5 GB | 2.20x (plateau) |
-| B=32 | 71.0 | 2.2 | ~11 GB | 2.20x (plateau) |
+| B=1 | 27.5 | 27.5 | ~10 GB | 0.85x |
+| B=4 | 64.3 | 16.1 | 10.3 GB | **2.00x faster** |
+| **B=8** | **77.6** | **9.7** | **10.3 GB** | **2.41x faster, 1.32x less VRAM** |
+| B=16 | ~77 | ~4.8 | ~10.5 GB | 2.39x (plateau) |
+| B=32 | ~77 | ~2.4 | ~11 GB | 2.39x (plateau) |
 
 B=8 is the throughput ceiling — beyond B=8, weight decode is fully HBM bandwidth saturated. B=16/32 run as multiple B=8 passes with no additional amortization.
 
@@ -99,11 +99,11 @@ B=8 is the throughput ceiling — beyond B=8, weight decode is fully HBM bandwid
 
 | GPU | BW (TB/s) | Est. tok/s | vs native BF16 |
 |-----|----------:|-----------:|:--------------:|
-| MI50 (measured) | 1.0 | **72** | 2.23x |
-| A100 80GB | 2.0 | ~150 | 2.23x |
-| H100 80GB | 3.4 | ~250 | 2.23x |
-| MI300X | 5.3 | ~380 | 2.23x |
-| B200 | 8.0 | ~580 | 2.23x |
+| MI50 (measured) | 1.0 | **78** | 2.41x |
+| A100 80GB | 2.0 | ~160 | 2.41x |
+| H100 80GB | 3.4 | ~270 | 2.41x |
+| MI300X | 5.3 | ~410 | 2.41x |
+| B200 | 8.0 | ~620 | 2.41x |
 
 ---
 
