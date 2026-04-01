@@ -93,7 +93,18 @@ Single kernel launch, no separate decompress step, NO LDS codebook:
 | B=16 | ~77 | ~4.8 | ~10.5 GB | 2.39x (plateau) |
 | B=32 | ~77 | ~2.4 | ~11 GB | 2.39x (plateau) |
 
-B=8 is the throughput ceiling — beyond B=8, weight decode is fully HBM bandwidth saturated. B=16/32 run as multiple B=8 passes with no additional amortization.
+**Beats llama.cpp BF16 at B≥2.** At B=1, our 12-bit decode overhead makes us 15% slower. At B≥2, decode amortization more than compensates — we read 25% less data from HBM.
+
+### vs llama.cpp BF16 (same GPU, same model)
+
+| Batch | llama.cpp BF16 | Turbo Lossless | Winner | VRAM |
+|------:|---------------:|---------------:|:------:|-----:|
+| B=1 | **33.2** | 28.0 | llama.cpp +19% | 14.5 vs **10.3 GB** |
+| B=2 | 44.4 | **55.5** | **Turbo +25%** | 14.5 vs **10.3 GB** |
+| B=4 | 50.9 | **63.1** | **Turbo +24%** | 14.5 vs **10.3 GB** |
+| **B=8** | 58.7 | **77.4** | **Turbo +32%** | 14.5 vs **10.3 GB** |
+
+Turbo uses 29% less VRAM at all batch sizes while being faster at B≥2.
 
 ### Hardware Projection (B=8)
 
