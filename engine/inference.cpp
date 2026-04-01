@@ -31,16 +31,12 @@ extern "C" {
     int launch_split12_batch8_async(const void* sm, const void* gr, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* a4, const void* a5, const void* a6, const void* a7, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, void* o4, void* o5, void* o6, void* o7, int M, int K, void* stream);
 
 #ifdef TURBO_NVIDIA
-    // NVIDIA Blackwell kernels (nvidia_kernels.cu + nvidia_batch_kernels.cu)
+    // NVIDIA kernels (nvidia_kernels.cu)
     int nv_launch_split12_v2_async(const void* sm, const void* gr, int base_exp, const void* act, void* out, int M, int K, void* stream);
     int nv_launch_patches_async(const void* row_off, const void* cols, const void* correct, const void* wrong, const void* act, void* out, int M, void* stream);
-    int nv_launch_split12_gemm_tc_async(const void* sm, const void* gr, int base_exp, const void* act, int act_stride, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* out, int out_stride, int M, int K, int B, void* stream);
     int nv_launch_split12_fused_gemm_async(const void* sm, const void* gr, int base_exp, const void* act, int act_stride, void* out, int out_stride, int M, int K, int B, void* stream);
-    int nv_launch_split12_cublas_batch_async(const void* sm, const void* gr, int base_exp, const void* act, int act_stride, void* out, int out_stride, void* bf16_weight_buf, int buf_half_elems, int M, int K, int B, void* stream);
     int nv_launch_patches_batch_async(const void* row_off, const void* cols, const void* correct, const void* wrong, const void* act, int act_stride, void* out, int out_stride, int M, int B, void* stream);
-    // Legacy per-row batch kernels
-    int launch_split12_tiled_batch_async(const void* sm, const void* gr, int base_exp, const void* activations, int act_stride, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* output, int out_stride, int M, int K, int B, void* stream);
-    int launch_packed12_tiled_batch_async(const void* packed, int base_exp, const void* activations, int act_stride, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* output, int out_stride, int M, int K, int B, void* stream);
+    int nv_launch_split12_cublas_batch_async(const void* sm, const void* gr, int base_exp, const void* act, int act_stride, void* out, int out_stride, void* bf16_weight_buf, int buf_half_elems, int M, int K, int B, void* stream);
 #endif
 }
 

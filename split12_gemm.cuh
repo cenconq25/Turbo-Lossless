@@ -27,7 +27,7 @@ using namespace nvcuda;
 
 // Tile dimensions
 #define S12_TILE_M 64      // 4 warp rows × 16
-#define S12_TILE_K 64      // 4 K-slices × 16 (MMA_K) — optimal for 48 KB smem
+#define S12_TILE_K 64      // 4 K-slices × 16 (MMA_K)
 #define S12_TILE_N_MAX 64  // max batch tile (adaptive)
 #define S12_N_WARPS 4      // warps per block
 #define S12_BLOCK (S12_N_WARPS * 32)  // 128 threads
@@ -215,18 +215,29 @@ __global__ void split12_fused_gemm(
             uint32_t a_regs[4];
             int k0 = kk + twg * 2, k1 = kk + 8 + twg * 2;
 
-            a_regs[0] = decode_split12_pair(
-                sm_read[row0 * S12_TILE_K + k0],     sm_read[row0 * S12_TILE_K + k0 + 1],
-                GR_SM(gr_read, row0, k0),             GR_SM(gr_read, row0, k0 + 1), base_exp);
-            a_regs[1] = decode_split12_pair(
-                sm_read[row1 * S12_TILE_K + k0],     sm_read[row1 * S12_TILE_K + k0 + 1],
-                GR_SM(gr_read, row1, k0),             GR_SM(gr_read, row1, k0 + 1), base_exp);
-            a_regs[2] = decode_split12_pair(
-                sm_read[row0 * S12_TILE_K + k1],     sm_read[row0 * S12_TILE_K + k1 + 1],
-                GR_SM(gr_read, row0, k1),             GR_SM(gr_read, row0, k1 + 1), base_exp);
-            a_regs[3] = decode_split12_pair(
-                sm_read[row1 * S12_TILE_K + k1],     sm_read[row1 * S12_TILE_K + k1 + 1],
-                GR_SM(gr_read, row1, k1),             GR_SM(gr_read, row1, k1 + 1), base_exp);
+            // Optimized decode: precompute pointers, extract nibbles without conditionals
+            // k0 = kk + twg*2 is always EVEN (twg*2 = 0,2,4,6 + kk which is multiple of 16)
+            // So k0 is even → low nibble, k0+1 is odd → high nibble
+            // k1 = kk + 8 + twg*2: also even → same pattern
+            {
+                const uint8_t* sr0 = sm_read + row0 * S12_TILE_K;
+                const uint8_t* sr1 = sm_read + row1 * S12_TILE_K;
+                const uint8_t* gr0 = gr_read + row0 * (S12_TILE_K/2);
+                const uint8_t* gr1 = gr_read + row1 * (S12_TILE_K/2);
+
+                // k0 is even: group byte at k0/2, low nibble = even element, high = odd
+                uint8_t gb0_r0 = gr0[k0/2], gb1_r0 = gr0[k1/2];
+                uint8_t gb0_r1 = gr1[k0/2], gb1_r1 = gr1[k1/2];
+
+                a_regs[0] = decode_split12_pair(sr0[k0], sr0[k0+1],
+                    gb0_r0 & 0xF, gb0_r0 >> 4, base_exp);
+                a_regs[1] = decode_split12_pair(sr1[k0], sr1[k0+1],
+                    gb0_r1 & 0xF, gb0_r1 >> 4, base_exp);
+                a_regs[2] = decode_split12_pair(sr0[k1], sr0[k1+1],
+                    gb1_r0 & 0xF, gb1_r0 >> 4, base_exp);
+                a_regs[3] = decode_split12_pair(sr1[k1], sr1[k1+1],
+                    gb1_r1 & 0xF, gb1_r1 >> 4, base_exp);
+            }
 
             // Full PTX: load B from shared memory + mma.sync for each N-tile
             // B fragment layout for m16n8k16: B[K=16][N=8], col-major
@@ -242,10 +253,9 @@ __global__ void split12_fused_gemm(
                 int bk0 = b_twg * 2;
 
                 uint32_t b_regs[2];
-                __nv_bfloat162 bp0 = make_bfloat162(b_ptr[bk0], b_ptr[bk0 + 1]);
-                __nv_bfloat162 bp1 = make_bfloat162(b_ptr[8 + bk0], b_ptr[8 + bk0 + 1]);
-                b_regs[0] = *reinterpret_cast<uint32_t*>(&bp0);
-                b_regs[1] = *reinterpret_cast<uint32_t*>(&bp1);
+                // Load B as 4-byte (uint32) aligned reads — one load per bf16x2 pair
+                b_regs[0] = *reinterpret_cast<const uint32_t*>(&b_ptr[bk0]);
+                b_regs[1] = *reinterpret_cast<const uint32_t*>(&b_ptr[8 + bk0]);
 
                 mma_m16n8k16(c_regs[n_tile], a_regs, b_regs);
             }
