@@ -76,15 +76,11 @@ extern "C" {
             (w).escape_row_base, (w).escape_counts, (w).escape_vals, \
             out_buf, n_out, \
             (w).M, (w).K, bs, strm); \
-        /* Patch correction for escapes — one launch per batch item */ \
-        if ((w).num_patches > 0 && (w).row_offsets) { \
-            for (int _b = 0; _b < bs; _b++) \
-                nv_launch_patches_async((w).row_offsets, (w).patch_cols, \
-                    (w).patch_correct, (w).patch_wrong, \
-                    (const int16_t*)bf16_in + _b * n_in, \
-                    (float*)out_buf + _b * n_out, (w).M, strm); \
-        } \
-    } /* split12 required for NVIDIA tensor core path */ \
+        if ((w).num_patches > 0 && (w).row_offsets) \
+            nv_launch_patches_batch_async((w).row_offsets, (w).patch_cols, \
+                (w).patch_correct, (w).patch_wrong, \
+                bf16_in, n_in, out_buf, n_out, (w).M, bs, strm); \
+    } \
 } while(0)
 
 // CUBLAS_MATVEC: decode split12 → BF16 buffer → cuBLAS GEMM + batched patches

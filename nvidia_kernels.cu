@@ -39,10 +39,11 @@ static int s_ping = 0;                        // toggle 0/1 for buffer selection
 #define WMMA_N 16
 #define WMMA_K 16
 
-// Tiled GEMM parameters
-#define TILE_M  64   // output rows per block
-#define TILE_N  16   // batch items per block (= WMMA_N, expands via grid)
-#define TILE_K  16   // K columns per WMMA operation
+// Tiled GEMM parameters (optimized for Blackwell sm_120)
+#define TILE_M  64   // output rows per block (4 WMMA sub-tiles)
+#define TILE_N  16   // batch items per block (1 WMMA sub-tile, grid over B)
+#define TILE_K  128  // K columns per tile iteration (8 WMMA ops per warp)
+#define TC_BLOCK 128 // 4 warps for tensor core kernel
 
 // ============================================================
 // Helpers
@@ -256,7 +257,7 @@ __global__ void nv_apply_patches(
 // Activation tile: TILE_K × TILE_N __nv_bfloat16 = 16 × 16 × 2 = 512 B
 // Total per tile iteration: ~2.5 KB (fits easily in 48 KB shared memory)
 
-__launch_bounds__(BLOCK_DIM)
+__launch_bounds__(TC_BLOCK)
 __global__ void nv_split12_gemm_tc(
     const uint8_t* __restrict__ sign_mantissa,  // [M * K]
     const uint8_t* __restrict__ groups,          // [M * K / 2]
@@ -301,98 +302,79 @@ __global__ void nv_split12_gemm_tc(
     //   4 WMMA operations needed: rows [0:16], [16:32], [32:48], [48:64] × [0:16]
     //   Assign to warps 0,1,2,3. Warps 4-7 help with data loading.
 
-    // Accumulator fragments (one per warp that computes)
+    // 4 warps, each handles one 16-row vertical sub-tile
+    // warp 0→rows 0-15, warp 1→16-31, warp 2→32-47, warp 3→48-63
     wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
     wmma::fill_fragment(acc_frag, 0.0f);
 
-    // Which 16-row sub-tile this warp handles
-    int warp_tile_row = warp_id;  // warp 0→rows 0-15, warp 1→16-31, etc.
-    bool warp_computes = (warp_id < (TILE_M / WMMA_M));  // warps 0-3 compute
-
-    // K-tile loop
+    // K-tile loop: TILE_K=128, 8 WMMA ops per warp per tile
     for (int k_start = 0; k_start < K; k_start += TILE_K) {
         int k_count = min(TILE_K, K - k_start);
 
-        // Phase 1: Cooperative decode of weight tile → shared memory BF16
-        // 256 threads decode TILE_M × TILE_K = 64 × 16 = 1024 elements
-        // Each thread decodes ~4 elements
-        for (int i = tid; i < TILE_M * k_count; i += BLOCK_DIM) {
-            int m_local = i / k_count;
-            int k_local = i % k_count;
+        // Phase 1: All 128 threads cooperatively decode TILE_M × TILE_K weights
+        // 64 × 128 = 8192 elements, ~64 per thread
+        for (int i = tid; i < TILE_M * TILE_K; i += TC_BLOCK) {
+            int m_local = i / TILE_K;
+            int k_local = i % TILE_K;
             int row = tile_m_start + m_local;
             int col = k_start + k_local;
 
-            if (row < M) {
+            __nv_bfloat16 val = __float2bfloat16(0.0f);
+            if (row < M && k_local < k_count) {
                 uint8_t sm = sign_mantissa[(int64_t)row * K + col];
                 uint8_t gb = groups[(int64_t)row * K / 2 + col / 2];
                 uint32_t group = (col & 1) ? (gb >> 4) : (gb & 0xF);
-
-                __nv_bfloat16 val;
-                if (__builtin_expect(group != 0, 1)) {
-                    val = decode_split12_bf16(sm, group, base_exp);
-                } else {
-                    // Escape: use correct BF16 value
-                    // For simplicity, decode as base_exp+0 (will be corrected by patch kernel)
-                    val = decode_split12_bf16(sm, 0, base_exp);
-                }
-                w_tile[m_local * TILE_K + k_local] = val;
-            } else {
-                w_tile[m_local * TILE_K + k_local] = __float2bfloat16(0.0f);
+                val = decode_split12_bf16(sm, group, base_exp);
+                // group=0 escapes decoded as base_exp+0 (corrected by patch kernel)
             }
+            w_tile[m_local * TILE_K + k_local] = val;
         }
 
-        // Phase 2: Cooperative load of activation tile → shared memory BF16
-        // TILE_K × TILE_N = 16 × 16 = 256 elements (1 per thread)
-        for (int i = tid; i < k_count * cols_this_tile; i += BLOCK_DIM) {
-            int k_local = i / cols_this_tile;
-            int n_local = i % cols_this_tile;
+        // Phase 2: Load TILE_K × TILE_N activations (128 × 16 = 2048 elements)
+        for (int i = tid; i < TILE_K * TILE_N; i += TC_BLOCK) {
+            int k_local = i / TILE_N;
+            int n_local = i % TILE_N;
             int b_idx = tile_n_start + n_local;
-            // Column-major for WMMA B fragment
-            a_tile[n_local * TILE_K + k_local] =
-                *reinterpret_cast<const __nv_bfloat16*>(&activations[b_idx * act_stride + k_start + k_local]);
-        }
-        // Zero-pad if needed
-        if (k_count < TILE_K) {
-            for (int i = tid; i < TILE_M * (TILE_K - k_count); i += BLOCK_DIM) {
-                int m_local = i / (TILE_K - k_count);
-                int k_local = k_count + i % (TILE_K - k_count);
-                w_tile[m_local * TILE_K + k_local] = __float2bfloat16(0.0f);
+            int col = k_start + k_local;
+
+            __nv_bfloat16 val = __float2bfloat16(0.0f);
+            if (k_local < k_count && b_idx < B_total) {
+                val = *reinterpret_cast<const __nv_bfloat16*>(
+                    &activations[b_idx * act_stride + col]);
             }
-            for (int i = tid; i < (TILE_K - k_count) * cols_this_tile; i += BLOCK_DIM) {
-                int k_local = k_count + i / cols_this_tile;
-                int n_local = i % cols_this_tile;
-                a_tile[n_local * TILE_K + k_local] = __float2bfloat16(0.0f);
-            }
+            // Column-major layout for WMMA B fragment
+            a_tile[n_local * TILE_K + k_local] = val;
         }
         __syncthreads();
 
-        // Phase 3: WMMA — tensor core matrix multiply
-        if (warp_computes && warp_tile_row * WMMA_M < rows_this_tile) {
-            wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;
-            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::col_major> b_frag;
+        // Phase 3: 8 WMMA operations per warp (TILE_K/WMMA_K = 128/16 = 8)
+        if (warp_id < 4 && warp_id * WMMA_M < rows_this_tile) {
+            for (int kk = 0; kk < TILE_K; kk += WMMA_K) {
+                wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;
+                wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::col_major> b_frag;
 
-            // Load weight sub-tile [16×16] from shared memory
-            wmma::load_matrix_sync(a_frag, w_tile + warp_tile_row * WMMA_M * TILE_K, TILE_K);
-            // Load activation tile [16×16] from shared memory
-            wmma::load_matrix_sync(b_frag, a_tile, TILE_K);
-            // Tensor core FMA
-            wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+                // Load 16×16 weight sub-block from shared memory
+                wmma::load_matrix_sync(a_frag, w_tile + warp_id * WMMA_M * TILE_K + kk, TILE_K);
+                // Load 16×16 activation sub-block from shared memory
+                wmma::load_matrix_sync(b_frag, a_tile + kk, TILE_K);
+                // Tensor core FMA: acc += A × B
+                wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+            }
         }
         __syncthreads();
     }
 
-    // Phase 4: Store accumulators to shared memory (ALL warps participate in sync)
-    float* out_smem = (float*)smem;  // reuse shared memory (needs TILE_M * TILE_N * 4 bytes)
+    // Phase 4: Store accumulators to shared memory then to global
+    float* out_smem = (float*)smem;
 
-    // Each computing warp stores its 16×16 accumulator to its own region
-    if (warp_computes && warp_tile_row * WMMA_M < rows_this_tile) {
-        wmma::store_matrix_sync(out_smem + warp_tile_row * WMMA_M * TILE_N,
+    if (warp_id < 4 && warp_id * WMMA_M < rows_this_tile) {
+        wmma::store_matrix_sync(out_smem + warp_id * WMMA_M * TILE_N,
                                 acc_frag, TILE_N, wmma::mem_row_major);
     }
-    __syncthreads();  // ALL warps hit this sync (not inside if)
+    __syncthreads();
 
-    // ALL threads cooperatively write from shared memory to global (full TILE_M × TILE_N)
-    for (int i = tid; i < rows_this_tile * cols_this_tile; i += BLOCK_DIM) {
+    // All threads write to global output
+    for (int i = tid; i < rows_this_tile * cols_this_tile; i += TC_BLOCK) {
         int m_local = i / cols_this_tile;
         int n_local = i % cols_this_tile;
         int row = tile_m_start + m_local;
@@ -529,12 +511,12 @@ int nv_launch_split12_gemm_tc_async(
     int M, int K, int B, void* stream)
 {
     dim3 grid((M + TILE_M - 1) / TILE_M, (B + TILE_N - 1) / TILE_N);
-    int smem_tiles = TILE_M * TILE_K * sizeof(__nv_bfloat16) +  // weight tile (2 KB)
-                     TILE_K * TILE_N * sizeof(__nv_bfloat16);    // activation tile (512 B)
+    int smem_tiles = TILE_M * TILE_K * sizeof(__nv_bfloat16) +  // weight tile (16 KB)
+                     TILE_K * TILE_N * sizeof(__nv_bfloat16);    // activation tile (4 KB)
     int smem_store = TILE_M * TILE_N * sizeof(float);            // output store (4 KB)
-    int smem = max(smem_tiles, smem_store);  // reused between phases
+    int smem = max(smem_tiles, smem_store);
 
-    nv_split12_gemm_tc<<<grid, BLOCK_DIM, smem, (cudaStream_t)stream>>>(
+    nv_split12_gemm_tc<<<grid, TC_BLOCK, smem, (cudaStream_t)stream>>>(
         (const uint8_t*)sm, (const uint8_t*)gr, base_exp,
         (const int16_t*)act, act_stride,
         (const int32_t*)esc_row_base, (const uint8_t*)esc_counts,
