@@ -27,7 +27,7 @@ using namespace nvcuda;
 
 // Tile dimensions
 #define S12_TILE_M 64      // 4 warp rows × 16
-#define S12_TILE_K 64      // 4 K-slices × 16 (MMA_K)
+#define S12_TILE_K 64      // 4 K-slices × 16 (MMA_K) — optimal for 48 KB smem
 #define S12_TILE_N_MAX 64  // max batch tile (adaptive)
 #define S12_N_WARPS 4      // warps per block
 #define S12_BLOCK (S12_N_WARPS * 32)  // 128 threads
