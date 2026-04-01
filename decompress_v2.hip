@@ -1466,6 +1466,57 @@ __global__ void structured12_matvec_v2_fp32act(
 }
 
 // ---------------------------------------------------------------------------
+// Structured 12-bit B=1 blocked-access matvec — each thread reads consecutive elements
+// Eliminates read amplification: loads are contiguous across threads (0% waste)
+// Current strided approach: ~1.33x read amplification (128 byte cache line / 96 useful)
+// ---------------------------------------------------------------------------
+__launch_bounds__(WORKGROUP_SIZE)
+__global__ void structured12_matvec_v2_blocked(
+    const uint32_t* __restrict__ packed,
+    int base_exp,
+    const int16_t*  __restrict__ activations,
+    float*          __restrict__ output,
+    int M, int K)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    __shared__ float warp_sums[4];
+
+    // Each thread processes K/256 consecutive elements
+    const int epe = K / WORKGROUP_SIZE;  // elements per thread (16 for K=4096)
+    const int start_elem = tid * epe;
+
+    // Base bit position for this thread's block of elements
+    int64_t row_bits = (int64_t)row * K * 12;
+    int64_t my_bits = row_bits + (int64_t)start_elem * 12;
+    const uint32_t* my_packed = packed + (int)(my_bits / 32);
+    int bit_off = (int)(my_bits % 32);
+
+    // Pre-load all packed words for this thread's block
+    // epe elements = epe*12 bits. With bit_off, need (bit_off + epe*12 + 31)/32 words
+    // For epe=16: 192 bits + up to 31 = 223 bits → 7 words max
+    // For epe=56: 672 bits + 31 = 703 bits → 22 words max
+    // Use loop for generality
+
+    float sum = 0.0f;
+    int bp = bit_off;
+    for (int e = 0; e < epe; e++) {
+        int w = bp >> 5;
+        int s = bp & 31;
+        uint64_t combined = (uint64_t)my_packed[w] | ((uint64_t)my_packed[w+1] << 32);
+        uint32_t raw = (uint32_t)(combined >> s) & 0xFFF;
+        sum += structured12_decode(raw, base_exp) * bf16_to_float(activations[start_elem + e]);
+        bp += 12;
+    }
+
+    // Warp reduction
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) sum += __shfl_down(sum, off, WARP_SIZE);
+    if ((tid & (WARP_SIZE-1)) == 0) warp_sums[tid >> 6] = sum;
+    __syncthreads();
+    if (tid == 0) output[row] = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+}
+
+// ---------------------------------------------------------------------------
 // Structured 12-bit B=1 two-pass matvec (no escape handling — patches applied separately)
 // ---------------------------------------------------------------------------
 __launch_bounds__(WORKGROUP_SIZE)

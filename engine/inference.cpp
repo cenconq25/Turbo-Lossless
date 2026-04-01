@@ -114,12 +114,19 @@ static float s_prof_matvec = 0, s_prof_nonmv = 0;
     float _ms; hipEventElapsedTime(&_ms, _pE0, _pE1); s_prof_matvec += _ms; } } while(0)
 #define PROF_END_NM(strm) do { if (s_profile) { hipEventRecord(_pE1, strm); hipEventSynchronize(_pE1); \
     float _ms; hipEventElapsedTime(&_ms, _pE0, _pE1); s_prof_nonmv += _ms; } } while(0)
+static float s_prof_attn = 0, s_prof_norm = 0, s_prof_silu = 0, s_prof_misc = 0;
+#define PROF_END_ATTN(strm) do { if (s_profile) { hipEventRecord(_pE1, strm); hipEventSynchronize(_pE1); \
+    float _ms; hipEventElapsedTime(&_ms, _pE0, _pE1); s_prof_attn += _ms; s_prof_nonmv += _ms; } } while(0)
+#define PROF_END_NORM(strm) do { if (s_profile) { hipEventRecord(_pE1, strm); hipEventSynchronize(_pE1); \
+    float _ms; hipEventElapsedTime(&_ms, _pE0, _pE1); s_prof_norm += _ms; s_prof_nonmv += _ms; } } while(0)
+#define PROF_END_SILU(strm) do { if (s_profile) { hipEventRecord(_pE1, strm); hipEventSynchronize(_pE1); \
+    float _ms; hipEventElapsedTime(&_ms, _pE0, _pE1); s_prof_silu += _ms; s_prof_nonmv += _ms; } } while(0)
 #define PROF_TOKEN() do { if (s_profile && ++s_profile_tokens % 10 == 0) { \
     float total = s_prof_matvec + s_prof_nonmv; \
-    printf("  [PROFILE] %d tokens: matvec %.1fms (%.0f%%), non-matvec %.1fms (%.0f%%), total %.1fms (%.1f tok/s)\n", \
-        s_profile_tokens, s_prof_matvec, 100*s_prof_matvec/total, s_prof_nonmv, 100*s_prof_nonmv/total, \
-        total, 10000.0f/total); \
-    s_prof_matvec = s_prof_nonmv = 0; } } while(0)
+    printf("  [PROFILE] %d tok: mv %.1f (%.0f%%) | attn %.1f norm %.1f silu %.1f misc %.1f | total %.1f (%.1f t/s)\n", \
+        s_profile_tokens, s_prof_matvec, 100*s_prof_matvec/total, s_prof_attn, s_prof_norm, s_prof_silu, \
+        s_prof_nonmv - s_prof_attn - s_prof_norm - s_prof_silu, total, 10000.0f/total); \
+    s_prof_matvec = s_prof_nonmv = s_prof_attn = s_prof_norm = s_prof_silu = s_prof_misc = 0; } } while(0)
 
 // B=1 forward — optimized: no redundant memcpy, single sync at end
 static void forward_b1(InferenceState* state, const int* token_ids) {
@@ -160,7 +167,7 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
         PROF_START(stream);
         if (layer == 0)
             launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
-        PROF_END_NM(stream);
+        PROF_END_NORM(stream);
 
         PROF_START(stream);
         MATVEC_B1(L.wq, bf16_a, state->q_buf);
@@ -182,7 +189,7 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
                 state->attn_out, cfg.n_head, cfg.n_head_kv, head_dim, pos+1, m->max_seq_len, scale, stream);
 
         launch_fp32_to_bf16(state->attn_out, bf16_a, n, stream);
-        PROF_END_NM(stream);
+        PROF_END_ATTN(stream);
 
         PROF_START(stream);
         MATVEC_B1(L.wo, bf16_a, res);
@@ -190,7 +197,7 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
 
         PROF_START(stream);
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
-        PROF_END_NM(stream);
+        PROF_END_NORM(stream);
 
         PROF_START(stream);
         MATVEC_B1(L.w_gate, bf16_a, state->ffn_gate);
@@ -199,7 +206,7 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
 
         PROF_START(stream);
         launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, cfg.n_ff, 1, stream);
-        PROF_END_NM(stream);
+        PROF_END_SILU(stream);
 
         PROF_START(stream);
         MATVEC_B1(L.w_down, bf16_b, cur);
@@ -210,10 +217,9 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
             auto& nextL = m->layers[layer + 1];
             launch_add_rms_norm_bf16_batch(cur, res, nextL.attn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
         } else {
-            // Fuse last layer's add with output RMSNorm (saves 2 launches → 0)
             launch_add_rms_norm_bf16_batch(cur, res, m->output_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
         }
-        PROF_END_NM(stream);
+        PROF_END_NORM(stream);
     }
 
     // Output projection (bf16_a already set by fused add+norm above)
