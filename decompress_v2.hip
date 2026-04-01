@@ -2556,9 +2556,8 @@ int launch_split12_v2_async(
     const void* sign_mantissa, const void* groups, int base_exp,
     const void* activations, void* output, int M, int K, void* stream)
 {
-    // Use multirow (2 rows/block) when M >= 2
     if (M >= 2) {
-        int grid = (M + 1) / 2;  // ceil(M/2)
+        int grid = (M + 1) / 2;
         hipLaunchKernelGGL(split12_matvec_v2_multirow,
             dim3(grid), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
             (const uint8_t*)sign_mantissa, (const uint8_t*)groups, base_exp,

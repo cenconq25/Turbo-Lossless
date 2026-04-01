@@ -170,7 +170,7 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
     PROF_EVENT_DECL();
     PROF_EVENT_CREATE();
 
-    // Prefer split12 (byte-aligned, zero amplification) when available, else structured12
+    // Split12 matvec + separate patches (inline patches was slower due to extra args)
     #define MATVEC_B1(w, bf16_in, fp32_out) do { \
         if ((w).split_sm) { \
             launch_split12_v2_async((w).split_sm, (w).split_gr, (w).base_exp, bf16_in, fp32_out, (w).M, (w).K, stream); \
@@ -238,7 +238,7 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
                 state->ffn_gate, state->ffn_up,
                 L.w_gate.M, L.w_gate.K, stream);
         }
-        // Apply patch corrections for both tensors
+        // Patch corrections — still separate for dual (inline would need 2 sets of patch args)
         if (L.w_gate.num_patches > 0 && L.w_gate.row_offsets)
             launch_patches_v2_async(L.w_gate.row_offsets, L.w_gate.patch_cols, L.w_gate.patch_correct, L.w_gate.patch_wrong,
                                     bf16_a, state->ffn_gate, L.w_gate.M, stream);
