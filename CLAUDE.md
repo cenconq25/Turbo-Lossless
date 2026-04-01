@@ -15,11 +15,11 @@
 
 ### Engine End-to-End (Mistral 7B Instruct)
 
-| Mode | tok/s total | VRAM | vs llama.cpp BF16 (32.2 tok/s) |
+| Mode | tok/s total | VRAM | vs llama.cpp BF16 (33.0 tok/s) |
 |------|------------:|-----:|:-------------------------------|
-| B=1 | 26.1 | ~10 GB | 0.81x |
-| B=4 | 61.5 | 10.3 GB | 1.91x faster |
-| **B=8** | **71.7** | **10.3 GB** | **2.23x faster, 1.32x less VRAM** |
+| B=1 | 32.0 | ~10 GB | 0.97x (near parity!) |
+| B=4 | 63.0 | 10.3 GB | 1.91x faster |
+| **B=8** | **76.1** | **10.3 GB** | **2.31x faster, 1.32x less VRAM** |
 
 ### Compression
 
