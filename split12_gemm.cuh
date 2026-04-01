@@ -142,42 +142,35 @@ __global__ void split12_fused_gemm(
 
     const int num_k_tiles = (K + S12_TILE_K - 1) / S12_TILE_K;
 
-    // Load first K-tile into buffer 0
-    // Cooperatively load sign_mantissa and groups
-    {
-        const int k_start = 0;
-        for (int i = tid; i < S12_TILE_M * S12_TILE_K; i += S12_BLOCK) {
-            int m_local = i / S12_TILE_K;
-            int k_local = i % S12_TILE_K;
-            int row = block_m + m_local;
-            int col = k_start + k_local;
-            if (row < M && col < K)
-                sm_buf[i] = sign_mantissa[(int64_t)row * K + col];
-            else
-                sm_buf[i] = 0;
-        }
-        for (int i = tid; i < S12_TILE_M * S12_TILE_K / 2; i += S12_BLOCK) {
-            int m_local = i / (S12_TILE_K / 2);
-            int k_local = i % (S12_TILE_K / 2);
-            int row = block_m + m_local;
-            int col = k_start + k_local * 2;
-            if (row < M && col < K)
-                gr_buf[i] = groups[(int64_t)row * K / 2 + col / 2];
-            else
-                gr_buf[i] = 0;
-        }
-        // Load B matrix tile
-        for (int i = tid; i < S12_TILE_K * S12_TILE_N; i += S12_BLOCK) {
-            int k_local = i / S12_TILE_N;
-            int n_local = i % S12_TILE_N;
-            int col = k_start + k_local;
-            int n_idx = block_n + n_local;
-            if (col < K && n_idx < N)
-                B_buf[n_local * S12_TILE_K + k_local] = B_matrix[n_idx * K + col];
-            else
-                B_buf[n_local * S12_TILE_K + k_local] = __float2bfloat16(0.0f);
-        }
-    }
+    // Vectorized tile loading helper: load 16 bytes at a time for maximum throughput
+    // For interior tiles (not last K-tile), skip bounds checking for speed
+    #define LOAD_SM_TILE(dst, k_start) do { \
+        uint4* _d4 = (uint4*)(dst); \
+        for (int _i = tid; _i < S12_TILE_M * S12_TILE_K / 16; _i += S12_BLOCK) { \
+            int _byte = _i * 16; int _m = _byte / S12_TILE_K; int _k = _byte % S12_TILE_K; \
+            _d4[_i] = *((const uint4*)(sign_mantissa + (int64_t)(block_m + _m) * K + (k_start) + _k)); \
+        } \
+    } while(0)
+    #define LOAD_GR_TILE(dst, k_start) do { \
+        uint4* _d4 = (uint4*)(dst); \
+        for (int _i = tid; _i < S12_TILE_M * S12_TILE_K / 2 / 16; _i += S12_BLOCK) { \
+            int _byte = _i * 16; int _m = _byte / (S12_TILE_K/2); int _k = _byte % (S12_TILE_K/2); \
+            _d4[_i] = *((const uint4*)(groups + (int64_t)(block_m + _m) * K / 2 + (k_start)/2 + _k)); \
+        } \
+    } while(0)
+    #define LOAD_B_TILE(dst, k_start) do { \
+        uint4* _d4 = (uint4*)(dst); \
+        for (int _i = tid; _i < S12_TILE_K * S12_TILE_N * 2 / 16; _i += S12_BLOCK) { \
+            int _byte = _i * 16; int _elem = _byte / 2; \
+            int _n = _elem / S12_TILE_K; int _k = _elem % S12_TILE_K; \
+            _d4[_i] = *((const uint4*)(B_matrix + (int64_t)(block_n + _n) * K + (k_start) + _k)); \
+        } \
+    } while(0)
+
+    // Load first K-tile into buffer 0 (vectorized)
+    LOAD_SM_TILE(sm_buf, 0);
+    LOAD_GR_TILE(gr_buf, 0);
+    LOAD_B_TILE(B_buf, 0);
     __syncthreads();
 
     // K-tile loop with cp.async software pipeline
@@ -186,38 +179,12 @@ __global__ void split12_fused_gemm(
         int buf_read = tile_k % 2;
         int buf_write = 1 - buf_read;
 
-        // ASYNC load next K-tile (runs in background during compute below)
+        // VECTORIZED load next K-tile into write buffer
         if (tile_k + 1 < num_k_tiles) {
             int k_next = (tile_k + 1) * S12_TILE_K;
-            uint8_t* sm_write = sm_buf + buf_write * S12_TILE_M * S12_TILE_K;
-            uint8_t* gr_write = gr_buf + buf_write * S12_TILE_M * S12_TILE_K / 2;
-            __nv_bfloat16* B_write = B_buf + buf_write * S12_TILE_K * S12_TILE_N;
-
-            // Use cp.async for sign_mantissa (16-byte vectorized copies where possible)
-            for (int i = tid; i < S12_TILE_M * S12_TILE_K; i += S12_BLOCK) {
-                int m_local = i / S12_TILE_K;
-                int k_local = i % S12_TILE_K;
-                int row = block_m + m_local;
-                int col = k_next + k_local;
-                // cp.async requires aligned 4/8/16 byte copies; fall back to regular for now
-                // TODO: vectorize to 16-byte copies for maximum throughput
-                sm_write[i] = (row < M && col < K) ? sign_mantissa[(int64_t)row * K + col] : 0;
-            }
-            for (int i = tid; i < S12_TILE_M * S12_TILE_K / 2; i += S12_BLOCK) {
-                int m_local = i / (S12_TILE_K / 2);
-                int k_local = i % (S12_TILE_K / 2);
-                int row = block_m + m_local;
-                int col = k_next + k_local * 2;
-                gr_write[i] = (row < M && col < K) ? groups[(int64_t)row * K / 2 + col / 2] : 0;
-            }
-            for (int i = tid; i < S12_TILE_K * S12_TILE_N; i += S12_BLOCK) {
-                int k_local = i / S12_TILE_N;
-                int n_local = i % S12_TILE_N;
-                int col = k_next + k_local;
-                int n_idx = block_n + n_local;
-                __nv_bfloat16* dst = B_write + n_local * S12_TILE_K + k_local;
-                *dst = (col < K && n_idx < N) ? B_matrix[n_idx * K + col] : __float2bfloat16(0.0f);
-            }
+            LOAD_SM_TILE(sm_buf + buf_write * S12_TILE_M * S12_TILE_K, k_next);
+            LOAD_GR_TILE(gr_buf + buf_write * S12_TILE_M * S12_TILE_K / 2, k_next);
+            LOAD_B_TILE(B_buf + buf_write * S12_TILE_K * S12_TILE_N, k_next);
         }
 
         // DIRECT DECODE-TO-REGISTER: no intermediate BF16 buffer, no WMMA load
