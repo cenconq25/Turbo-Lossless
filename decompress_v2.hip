@@ -1565,6 +1565,149 @@ __global__ void structured12_matvec_v2(
 }
 
 // ---------------------------------------------------------------------------
+// Structured 12-bit B=1 matvec with buffer_load_dwordx2 (GFX9 SRD)
+// Uses buffer resource descriptors for packed data + activation loads.
+// Issue 4 packed loads + 4 activation loads, then single s_waitcnt.
+// ---------------------------------------------------------------------------
+__launch_bounds__(WORKGROUP_SIZE)
+__global__ void structured12_matvec_v2_bufload(
+    uint32_t psrd0, uint32_t psrd1, uint32_t psrd2, uint32_t psrd3,  // packed SRD
+    uint32_t asrd0, uint32_t asrd1, uint32_t asrd2, uint32_t asrd3,  // activation SRD
+    int base_exp,
+    float*          __restrict__ output,
+    int M, int K)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    __shared__ float warp_sums[4];
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+
+    // Compute initial byte offset into packed data for this thread
+    int64_t row_bit_start = (int64_t)row * K * 12;
+    int bp = (int)(row_bit_start % 32) + tid * 12;
+    const int shift = bp & 31;
+    // pack_off = byte offset of the dword containing our first bit
+    uint32_t pack_off = (uint32_t)((row_bit_start / 32) * 4 + (bp >> 5) * 4);
+    // act_off = byte offset for activation (int16_t) for this thread's column
+    uint32_t act_off = (uint32_t)(tid * 2);
+
+    int col = tid;
+    for (; col + WORKGROUP_SIZE * 3 < K; col += WORKGROUP_SIZE * 4) {
+        // Issue all 4 packed loads + 4 activation loads, then wait once
+        uint32_t plo0, phi0, plo1, phi1, plo2, phi2, plo3, phi3;
+        uint32_t a0, a1, a2, a3;
+
+        asm volatile(
+            // Set up packed SRD in s[20:23]
+            "s_mov_b32 s20, %[ps0]\n"
+            "s_mov_b32 s21, %[ps1]\n"
+            "s_mov_b32 s22, %[ps2]\n"
+            "s_mov_b32 s23, %[ps3]\n"
+            // Set up activation SRD in s[24:27]
+            "s_mov_b32 s24, %[as0]\n"
+            "s_mov_b32 s25, %[as1]\n"
+            "s_mov_b32 s26, %[as2]\n"
+            "s_mov_b32 s27, %[as3]\n"
+            // Issue 4 packed loads (dwordx2 each)
+            "buffer_load_dwordx2 v[0:1], %[po0], s[20:23], 0 offen\n"
+            "buffer_load_dwordx2 v[2:3], %[po1], s[20:23], 0 offen\n"
+            "buffer_load_dwordx2 v[4:5], %[po2], s[20:23], 0 offen\n"
+            "buffer_load_dwordx2 v[6:7], %[po3], s[20:23], 0 offen\n"
+            // Issue 4 activation loads (ushort each, zero-extended to 32-bit)
+            "buffer_load_ushort v[8], %[ao0], s[24:27], 0 offen\n"
+            "buffer_load_ushort v[9], %[ao1], s[24:27], 0 offen\n"
+            "buffer_load_ushort v[10], %[ao2], s[24:27], 0 offen\n"
+            "buffer_load_ushort v[11], %[ao3], s[24:27], 0 offen\n"
+            // Wait for ALL loads
+            "s_waitcnt vmcnt(0)\n"
+            // Move results out
+            "v_mov_b32 %[r0l], v0\n"
+            "v_mov_b32 %[r0h], v1\n"
+            "v_mov_b32 %[r1l], v2\n"
+            "v_mov_b32 %[r1h], v3\n"
+            "v_mov_b32 %[r2l], v4\n"
+            "v_mov_b32 %[r2h], v5\n"
+            "v_mov_b32 %[r3l], v6\n"
+            "v_mov_b32 %[r3h], v7\n"
+            "v_mov_b32 %[ra0], v8\n"
+            "v_mov_b32 %[ra1], v9\n"
+            "v_mov_b32 %[ra2], v10\n"
+            "v_mov_b32 %[ra3], v11\n"
+            : [r0l]"=v"(plo0), [r0h]"=v"(phi0),
+              [r1l]"=v"(plo1), [r1h]"=v"(phi1),
+              [r2l]"=v"(plo2), [r2h]"=v"(phi2),
+              [r3l]"=v"(plo3), [r3h]"=v"(phi3),
+              [ra0]"=v"(a0), [ra1]"=v"(a1), [ra2]"=v"(a2), [ra3]"=v"(a3)
+            : [ps0]"s"(psrd0), [ps1]"s"(psrd1), [ps2]"s"(psrd2), [ps3]"s"(psrd3),
+              [as0]"s"(asrd0), [as1]"s"(asrd1), [as2]"s"(asrd2), [as3]"s"(asrd3),
+              [po0]"v"(pack_off), [po1]"v"(pack_off + 384u),
+              [po2]"v"(pack_off + 768u), [po3]"v"(pack_off + 1152u),
+              [ao0]"v"(act_off), [ao1]"v"(act_off + 512u),
+              [ao2]"v"(act_off + 1024u), [ao3]"v"(act_off + 1536u)
+            : "v0","v1","v2","v3","v4","v5","v6","v7",
+              "v8","v9","v10","v11",
+              "s20","s21","s22","s23","s24","s25","s26","s27","memory"
+        );
+
+        // Decode packed 12-bit values
+        uint32_t d0 = (uint32_t)(((uint64_t)plo0 | ((uint64_t)phi0 << 32)) >> shift) & 0xFFF;
+        uint32_t d1 = (uint32_t)(((uint64_t)plo1 | ((uint64_t)phi1 << 32)) >> shift) & 0xFFF;
+        uint32_t d2 = (uint32_t)(((uint64_t)plo2 | ((uint64_t)phi2 << 32)) >> shift) & 0xFFF;
+        uint32_t d3 = (uint32_t)(((uint64_t)plo3 | ((uint64_t)phi3 << 32)) >> shift) & 0xFFF;
+
+        // Decode activations from raw uint16 to float
+        float af0 = bf16_to_float((int16_t)a0);
+        float af1 = bf16_to_float((int16_t)a1);
+        float af2 = bf16_to_float((int16_t)a2);
+        float af3 = bf16_to_float((int16_t)a3);
+
+        sum0 += structured12_decode(d0, base_exp) * af0;
+        sum1 += structured12_decode(d1, base_exp) * af1;
+        sum2 += structured12_decode(d2, base_exp) * af2;
+        sum3 += structured12_decode(d3, base_exp) * af3;
+
+        pack_off += 1536u;
+        act_off += 2048u;
+    }
+    // Remainder loop
+    for (; col < K; col += WORKGROUP_SIZE) {
+        uint32_t plo, phi;
+        uint32_t aval;
+        asm volatile(
+            "s_mov_b32 s20, %[ps0]\n"
+            "s_mov_b32 s21, %[ps1]\n"
+            "s_mov_b32 s22, %[ps2]\n"
+            "s_mov_b32 s23, %[ps3]\n"
+            "s_mov_b32 s24, %[as0]\n"
+            "s_mov_b32 s25, %[as1]\n"
+            "s_mov_b32 s26, %[as2]\n"
+            "s_mov_b32 s27, %[as3]\n"
+            "buffer_load_dwordx2 v[0:1], %[po], s[20:23], 0 offen\n"
+            "buffer_load_ushort v[2], %[ao], s[24:27], 0 offen\n"
+            "s_waitcnt vmcnt(0)\n"
+            "v_mov_b32 %[rl], v0\n"
+            "v_mov_b32 %[rh], v1\n"
+            "v_mov_b32 %[ra], v2\n"
+            : [rl]"=v"(plo), [rh]"=v"(phi), [ra]"=v"(aval)
+            : [ps0]"s"(psrd0), [ps1]"s"(psrd1), [ps2]"s"(psrd2), [ps3]"s"(psrd3),
+              [as0]"s"(asrd0), [as1]"s"(asrd1), [as2]"s"(asrd2), [as3]"s"(asrd3),
+              [po]"v"(pack_off), [ao]"v"(act_off)
+            : "v0","v1","v2","s20","s21","s22","s23","s24","s25","s26","s27","memory"
+        );
+        uint32_t d = (uint32_t)(((uint64_t)plo | ((uint64_t)phi << 32)) >> shift) & 0xFFF;
+        sum0 += structured12_decode(d, base_exp) * bf16_to_float((int16_t)aval);
+        pack_off += 384u;
+        act_off += 512u;
+    }
+
+    float sum = sum0 + sum1 + sum2 + sum3;
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) sum += __shfl_down(sum, off, WARP_SIZE);
+    if ((tid & (WARP_SIZE-1)) == 0) warp_sums[tid >> 6] = sum;
+    __syncthreads();
+    if (tid == 0) output[row] = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+}
+
+// ---------------------------------------------------------------------------
 // Structured 12-bit B=1 fused matvec (single-pass with escape counts)
 // Replaces two-pass (v2 + patches) — saves 224 kernel launches per forward
 // ---------------------------------------------------------------------------
@@ -1780,10 +1923,27 @@ int launch_structured12_v2_async(
     const void* packed, int base_exp,
     const void* activations, void* output, int M, int K, void* stream)
 {
-    hipLaunchKernelGGL(structured12_matvec_v2,
+    // Compute SRDs for packed data buffer
+    uint64_t pack_addr = (uint64_t)packed;
+    uint32_t psrd0 = (uint32_t)(pack_addr);
+    uint32_t psrd1 = (uint32_t)(pack_addr >> 32) & 0xFFFF;
+    // Size: M rows * K cols * 12 bits / 8 + some slack for the dwordx2 reads
+    uint32_t psrd2 = (uint32_t)((int64_t)M * K * 12 / 8 + 8);
+    uint32_t psrd3 = 0x00020000;  // DATA_FORMAT=4, raw buffer (NUM_FORMAT=0)
+
+    // Compute SRDs for activation buffer
+    uint64_t act_addr = (uint64_t)activations;
+    uint32_t asrd0 = (uint32_t)(act_addr);
+    uint32_t asrd1 = (uint32_t)(act_addr >> 32) & 0xFFFF;
+    uint32_t asrd2 = (uint32_t)(K * 2);  // K int16 elements = K*2 bytes
+    uint32_t asrd3 = 0x00020000;
+
+    hipLaunchKernelGGL(structured12_matvec_v2_bufload,
         dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
-        (const uint32_t*)packed, base_exp,
-        (const int16_t*)activations, (float*)output, M, K);
+        psrd0, psrd1, psrd2, psrd3,
+        asrd0, asrd1, asrd2, asrd3,
+        base_exp,
+        (float*)output, M, K);
     return 0;
 }
 
