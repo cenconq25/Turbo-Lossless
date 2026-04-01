@@ -3,8 +3,10 @@
 #include <vector>
 
 struct Tokenizer {
-    void* sp_model;  // sentencepiece handle
+    void* sp_model;    // sentencepiece or HFTokenizer handle
     int bos_id, eos_id;
+    int vocab_size;
+    int type;          // 0=sentencepiece, 1=HF BPE
 };
 
 Tokenizer* load_tokenizer(const std::string& model_path);
