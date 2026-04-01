@@ -2,10 +2,7 @@
 #include "sampler.h"
 #include <cstdio>
 #include <cmath>
-#include <hip/hip_runtime.h>
-
-// Suppress nodiscard warnings from HIP API calls (hipMalloc, hipFree, etc.)
-#pragma clang diagnostic ignored "-Wunused-result"
+#include "../gpu_compat.h"
 
 extern "C" {
     // Kernel launch wrappers (kernels.hip)

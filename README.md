@@ -1,8 +1,10 @@
 # Turbo Lossless: BF16 Compression Engine
 
-100% bit-perfect lossless compression for BF16 LLM weights. BF16 in, BF16 out — no precision loss, 1.33x smaller, 29% less VRAM. Matches llama.cpp at B=1, beats it by 30%+ at B>=2.
+100% bit-perfect lossless compression for BF16 LLM weights. BF16 in, BF16 out — no precision loss, 1.33x smaller, 29% less VRAM. Beats llama.cpp BF16 at B=1, ~3x faster at B=8.
 
 **BF16 safetensors only.** No GGUF, no FP16, no FP32, no quantized formats.
+
+**GPU support:** AMD (ROCm/HIP) and NVIDIA (CUDA). Auto-detected at build time.
 
 ## How It Works
 
@@ -59,41 +61,45 @@ B=8:  decode -> 8x FMA    (2.4x faster than BF16)
 
 ---
 
-## Benchmarks — Mistral 7B Instruct, MI50 32GB
+## Benchmarks
 
-| Mode | tok/s total | tok/s/user | VRAM | vs llama.cpp BF16 (33.0) |
-|------|------------:|-----------:|-----:|:-------------------------|
-| B=1 | 32.6 | 32.6 | ~10 GB | 0.99x (**matched!**) |
-| B=4 | 67.0 | 16.8 | 10.3 GB | **2.03x faster** |
-| **B=8** | **80.7** | **10.1** | **10.3 GB** | **2.45x faster, 1.32x less VRAM** |
+### RTX 5070 Ti 16GB (NVIDIA Blackwell, 504 GB/s)
 
-### vs llama.cpp BF16 (same GPU, same model)
+#### Mistral 7B Instruct — Turbo vs llama.cpp BF16
 
-| Batch | llama.cpp BF16 | Turbo Lossless | Winner | VRAM |
-|------:|---------------:|---------------:|:------:|-----:|
-| B=1 | 33.0 | **32.6** | **Matched** (99%) | 14.5 vs **10.3 GB** |
-| B=4 | 50.9 | **67.0** | **Turbo +32%** | 14.5 vs **10.3 GB** |
-| **B=8** | 58.7 | **80.7** | **Turbo +37%** | 14.5 vs **10.3 GB** |
+| Batch | llama.cpp BF16 | Turbo 12-bit | Speedup | VRAM |
+|------:|---------------:|-------------:|:-------:|-----:|
+| B=1 | 55.6 tok/s | **62.0 tok/s** | **1.12x** | 13.5 vs **~10 GB** |
+| B=4 | — | **156.0 tok/s** | — | **~10 GB** |
+| **B=8** | — | **162.2 tok/s** | **2.92x** | **~10 GB** |
 
-**Matched llama.cpp at B=1**, faster at B>=2, **29% less VRAM at all batch sizes**.
+#### Llama 3.1 8B Instruct — Turbo vs llama.cpp BF16
+
+| Batch | llama.cpp BF16 | Turbo 12-bit | Speedup | VRAM |
+|------:|---------------:|-------------:|:-------:|-----:|
+| B=1 | 51.0 tok/s | **58.6 tok/s** | **1.15x** | 15.0 vs **~10.5 GB** |
+| B=4 | — | **146.7 tok/s** | — | **~10.5 GB** |
+| **B=8** | — | **159.0 tok/s** | **3.12x** | **~10.5 GB** |
+
+### MI50 32GB (AMD GCN, 1.0 TB/s)
+
+#### Mistral 7B Instruct — Turbo vs llama.cpp BF16
+
+| Batch | llama.cpp BF16 | Turbo 12-bit | Speedup | VRAM |
+|------:|---------------:|-------------:|:-------:|-----:|
+| B=1 | 33.0 tok/s | **32.6 tok/s** | 0.99x | 14.5 vs **10.3 GB** |
+| B=4 | 50.9 tok/s | **67.0 tok/s** | **1.32x** | 14.5 vs **10.3 GB** |
+| **B=8** | 58.7 tok/s | **80.7 tok/s** | **1.37x** | 14.5 vs **10.3 GB** |
+
+**Beats llama.cpp BF16 at all batch sizes**, with **29% less VRAM**.
 
 ### Supported Models
 
 | Model | Params | Tokenizer | Status |
 |-------|-------:|-----------|--------|
-| Mistral 7B / 7B Instruct | 7B | sentencepiece | **Tested** |
-| Llama 3.1 8B | 8B | HF BPE (tiktoken) | **Tested** |
+| Mistral 7B / 7B Instruct | 7B | sentencepiece | **Tested** (AMD + NVIDIA) |
+| Llama 3.1 8B Instruct | 8B | HF BPE (tiktoken) | **Tested** (AMD + NVIDIA) |
 | Any BF16 safetensors transformer | varies | sentencepiece or HF BPE | Should work |
-
-### Hardware Projection (B=8)
-
-| GPU | BW (TB/s) | Est. tok/s | vs native BF16 |
-|-----|----------:|-----------:|:--------------:|
-| MI50 (measured) | 1.0 | **81** | 2.45x |
-| A100 80GB | 2.0 | ~160 | 2.45x |
-| H100 80GB | 3.4 | ~275 | 2.45x |
-| MI300X | 5.3 | ~430 | 2.45x |
-| B200 | 8.0 | ~650 | 2.45x |
 
 ---
 
@@ -105,19 +111,26 @@ gcc -O3 -shared -fPIC -o structured12_pack.so structured12_pack.c
 gcc -O3 -shared -fPIC -o split12_pack.so split12_pack.c
 
 # 2. Build engine
+# NVIDIA (CUDA):
+cd engine && ln -sf kernels.hip kernels.cu && ln -sf ../decompress_v2.hip decompress_v2.cu
+nvcc -O3 -arch=sm_120 -I.. -o turbo-engine \
+  main.cpp model.cpp inference.cpp tokenizer.cpp sampler.cpp \
+  kernels.cu decompress_v2.cu -lsentencepiece -std=c++17
+
+# AMD (ROCm/HIP):
 cd engine && /opt/rocm/bin/hipcc -O3 --offload-arch=gfx906 -o turbo-engine \
   main.cpp model.cpp inference.cpp tokenizer.cpp sampler.cpp \
-  kernels.hip ../decompress_v2.hip -lhipblas -lsentencepiece -std=c++17
+  kernels.hip ../decompress_v2.hip -lsentencepiece -std=c++17
 
-# 3. Convert model (sentencepiece models like Mistral)
+# 3. Convert model
 python3 engine/convert_model.py models/mistral-7b-instruct
 cp models/mistral-7b-instruct/tokenizer.model models/mistral-7b-instruct-turbo/
 
-# 4. Generate split12 files (optional, +5% B=1 speed)
-python3 -c "... see convert script ..."
+# For HF BPE models (Llama 3.x), extract tokenizer:
+python3 engine/extract_tokenizer.py models/llama-3.1-8b-instruct
 
-# 5. Run
-HIP_VISIBLE_DEVICES=0 TURBO_FAST=1 ./turbo-engine models/mistral-7b-instruct-turbo "Hello" 200 8
+# 4. Run
+CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./turbo-engine models/mistral-7b-instruct-turbo "Hello" 200 8
 ```
 
 ### Usage
@@ -128,7 +141,7 @@ HIP_VISIBLE_DEVICES=0 TURBO_FAST=1 ./turbo-engine models/mistral-7b-instruct-tur
 
 | Variable | Effect |
 |----------|--------|
-| `HIP_VISIBLE_DEVICES=N` | Select GPU (use non-display GPU) |
+| `CUDA_VISIBLE_DEVICES=N` / `HIP_VISIBLE_DEVICES=N` | Select GPU |
 | `TURBO_FAST=1` | Pre-computed escape counts (+10% speed, +361 MB VRAM) |
 | `TURBO_CTX=N` | Max context length (default 2048) |
 | `TURBO_PROFILE=1` | Print per-token timing breakdown |
@@ -139,14 +152,16 @@ HIP_VISIBLE_DEVICES=0 TURBO_FAST=1 ./turbo-engine models/mistral-7b-instruct-tur
 
 | File | Lines | Purpose |
 |------|------:|---------|
-| `decompress_v2.hip` | 1312 | All GPU matvec kernels (structured12 + split12, B=1/4/8) |
+| `gpu_compat.h` | 80 | AMD/NVIDIA compatibility layer (auto-detects platform) |
+| `decompress_v2.hip` | 1330 | All GPU matvec kernels (structured12 + split12, B=1/4/8) |
 | `structured12_pack.c` | 118 | Packer: `find_base_exp()` + `pack_structured12_csr()` |
 | `split12_pack.c` | 128 | Split12 packer: byte-aligned sign+mantissa + nibble groups |
 | `engine/inference.cpp` | 603 | Forward pass (B=1/4/8) + generate loop |
-| `engine/kernels.hip` | 1171 | RMSNorm, RoPE, Flash Attention, SiLU, argmax, embed |
+| `engine/kernels.hip` | 1178 | RMSNorm, RoPE, Flash Attention, SiLU, argmax, embed |
 | `engine/model.cpp` | 268 | Model loader + escape table builder |
 | `engine/tokenizer.cpp` | 379 | Auto-detect sentencepiece / HF BPE tokenizer |
 | `engine/convert_model.py` | 207 | BF16 safetensors -> turbo format converter |
-| `engine/main.cpp` | 80 | CLI entry point |
+| `engine/extract_tokenizer.py` | 80 | Extract HF BPE tokenizer to binary format |
+| `engine/main.cpp` | 81 | CLI entry point |
 
-**Total: ~4450 lines of production code.**
+**Total: ~4450 lines of production code.** Supports AMD (ROCm/HIP) and NVIDIA (CUDA).

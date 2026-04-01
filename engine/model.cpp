@@ -5,8 +5,6 @@
 #include <fstream>
 #include <sstream>
 
-// Suppress nodiscard warnings from HIP API calls (hipMalloc, hipFree, etc.)
-#pragma clang diagnostic ignored "-Wunused-result"
 
 // Read entire binary file into host memory
 static std::vector<uint8_t> read_file(const std::string& path) {

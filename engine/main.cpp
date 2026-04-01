@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <ctime>
 #include <string>
 #include "model.h"
 #include "inference.h"

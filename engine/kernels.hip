@@ -3,12 +3,11 @@
  * All non-matvec transformer operations for MI50 (gfx906)
  */
 
-#include <hip/hip_runtime.h>
+#include "../gpu_compat.h"
 #include <cstdint>
 #include <cmath>
 
-// Suppress nodiscard warnings from HIP API calls
-#pragma clang diagnostic ignored "-Wunused-result"
+#define WARP_SIZE TURBO_WARP_SIZE
 
 // ============================================================
 // BF16 ↔ Float conversion helpers
@@ -500,17 +499,17 @@ __global__ void rms_norm_bf16_batch_kernel(
         sum_sq += v * v;
     }
     // Warp-level reduction (no sync needed within warp)
-    for (int off = 32; off > 0; off >>= 1)
-        sum_sq += __shfl_xor(sum_sq, off, 64);
-    int warp_id = tid >> 6;
-    int lane = tid & 63;
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+        sum_sq += __shfl_xor(sum_sq, off, WARP_SIZE);
+    int warp_id = tid / WARP_SIZE;
+    int lane = tid & (WARP_SIZE - 1);
     if (lane == 0) sdata[warp_id] = sum_sq;
     __syncthreads();
     // Cross-warp reduction
-    if (tid < (blockDim.x >> 6)) {
+    if (tid < (blockDim.x / WARP_SIZE)) {
         sum_sq = sdata[tid];
-        for (int off = (blockDim.x >> 7); off > 0; off >>= 1)
-            sum_sq += __shfl_xor(sum_sq, off, 64);
+        for (int off = (blockDim.x / (WARP_SIZE * 2)); off > 0; off >>= 1)
+            sum_sq += __shfl_xor(sum_sq, off, WARP_SIZE);
         if (tid == 0) sdata[0] = sum_sq;
     }
     __syncthreads();
@@ -548,17 +547,17 @@ __global__ void add_rms_norm_bf16_batch_kernel(
         sum_sq += v * v;
     }
     // Warp-level reduction first (no sync needed within warp)
-    for (int off = 32; off > 0; off >>= 1)
-        sum_sq += __shfl_xor(sum_sq, off, 64);
-    int warp_id = tid >> 6;
-    int lane = tid & 63;
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+        sum_sq += __shfl_xor(sum_sq, off, WARP_SIZE);
+    int warp_id = tid / WARP_SIZE;
+    int lane = tid & (WARP_SIZE - 1);
     if (lane == 0) sdata[warp_id] = sum_sq;
     __syncthreads();
     // Final reduction across warps (max 16 warps for 1024 threads)
-    if (tid < (blockDim.x >> 6)) {
+    if (tid < (blockDim.x / WARP_SIZE)) {
         sum_sq = sdata[tid];
-        for (int off = (blockDim.x >> 7); off > 0; off >>= 1)
-            sum_sq += __shfl_xor(sum_sq, off, 64);
+        for (int off = (blockDim.x / (WARP_SIZE * 2)); off > 0; off >>= 1)
+            sum_sq += __shfl_xor(sum_sq, off, WARP_SIZE);
         if (tid == 0) sdata[0] = sum_sq;
     }
     __syncthreads();
@@ -600,7 +599,7 @@ void launch_rms_norm_batch(const float* x, const float* weight, float* y,
 void launch_rms_norm_bf16_batch(const float* x, const float* weight, int16_t* y,
                                 int n, float eps, int batch_size, hipStream_t stream) {
     int threads = min(1024, n);
-    int smem = (threads / 64 + 1) * sizeof(float);  // warp-shuffle: only need warp count floats
+    int smem = (threads / WARP_SIZE + 1) * sizeof(float);  // warp-shuffle: only need warp count floats
     rms_norm_bf16_batch_kernel<<<batch_size, threads, smem, stream>>>(
         x, weight, y, n, eps, batch_size);
 }
@@ -608,7 +607,7 @@ void launch_rms_norm_bf16_batch(const float* x, const float* weight, int16_t* y,
 void launch_add_rms_norm_bf16_batch(float* x, const float* residual, const float* weight,
                                      int16_t* y, int n, float eps, int batch_size, hipStream_t stream) {
     int threads = min(1024, n);
-    int smem = (threads / 64 + 1) * sizeof(float);
+    int smem = (threads / WARP_SIZE + 1) * sizeof(float);
     add_rms_norm_bf16_batch_kernel<<<batch_size, threads, smem, stream>>>(
         x, residual, weight, y, n, eps, batch_size);
 }
@@ -680,19 +679,19 @@ __global__ void attention_all_heads_kernel(
 
     // Softmax
     __shared__ float warp_reduce[16];
-    int lane = tid % 64;
-    int warp_id = tid / 64;
+    int lane = tid % WARP_SIZE;
+    int warp_id = tid / WARP_SIZE;
 
     float local_max = -1e30f;
     for (int t = tid; t < seq_len; t += blockDim.x)
         local_max = fmaxf(local_max, scores[t]);
-    for (int off = 32; off > 0; off >>= 1)
-        local_max = fmaxf(local_max, __shfl_xor(local_max, off, 64));
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+        local_max = fmaxf(local_max, __shfl_xor(local_max, off, WARP_SIZE));
     if (lane == 0) warp_reduce[warp_id] = local_max;
     __syncthreads();
     if (tid == 0) {
         float m = warp_reduce[0];
-        for (int i = 1; i < (blockDim.x + 63) / 64; i++)
+        for (int i = 1; i < (blockDim.x + WARP_SIZE - 1) / WARP_SIZE; i++)
             m = fmaxf(m, warp_reduce[i]);
         warp_reduce[0] = m;
     }
@@ -705,13 +704,13 @@ __global__ void attention_all_heads_kernel(
         scores[t] = e;
         local_sum += e;
     }
-    for (int off = 32; off > 0; off >>= 1)
-        local_sum += __shfl_xor(local_sum, off, 64);
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+        local_sum += __shfl_xor(local_sum, off, WARP_SIZE);
     if (lane == 0) warp_reduce[warp_id] = local_sum;
     __syncthreads();
     if (tid == 0) {
         float s = 0;
-        for (int i = 0; i < (blockDim.x + 63) / 64; i++)
+        for (int i = 0; i < (blockDim.x + WARP_SIZE - 1) / WARP_SIZE; i++)
             s += warp_reduce[i];
         warp_reduce[0] = s;
     }
@@ -792,17 +791,17 @@ __global__ void attention_all_heads_batch_kernel(
 
     // Softmax
     __shared__ float warp_reduce[16];
-    int lane = tid % 64;
-    int warp_id = tid / 64;
+    int lane = tid % WARP_SIZE;
+    int warp_id = tid / WARP_SIZE;
 
     float local_max = -1e30f;
     for (int t = tid; t < seq_len; t += blockDim.x)
         local_max = fmaxf(local_max, scores[t]);
-    for (int off = 32; off > 0; off >>= 1)
-        local_max = fmaxf(local_max, __shfl_xor(local_max, off, 64));
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+        local_max = fmaxf(local_max, __shfl_xor(local_max, off, WARP_SIZE));
     if (lane == 0) warp_reduce[warp_id] = local_max;
     __syncthreads();
-    if (tid == 0) { float m = warp_reduce[0]; for (int i=1;i<(blockDim.x+63)/64;i++) m=fmaxf(m,warp_reduce[i]); warp_reduce[0]=m; }
+    if (tid == 0) { float m = warp_reduce[0]; for (int i=1;i<(blockDim.x + WARP_SIZE - 1) / WARP_SIZE;i++) m=fmaxf(m,warp_reduce[i]); warp_reduce[0]=m; }
     __syncthreads();
     float gmax = warp_reduce[0];
 
@@ -810,10 +809,10 @@ __global__ void attention_all_heads_batch_kernel(
     for (int t = tid; t < seq_len; t += blockDim.x) {
         float e = expf(scores[t] - gmax); scores[t] = e; local_sum += e;
     }
-    for (int off = 32; off > 0; off >>= 1) local_sum += __shfl_xor(local_sum, off, 64);
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) local_sum += __shfl_xor(local_sum, off, WARP_SIZE);
     if (lane == 0) warp_reduce[warp_id] = local_sum;
     __syncthreads();
-    if (tid == 0) { float s=0; for (int i=0;i<(blockDim.x+63)/64;i++) s+=warp_reduce[i]; warp_reduce[0]=s; }
+    if (tid == 0) { float s=0; for (int i=0;i<(blockDim.x + WARP_SIZE - 1) / WARP_SIZE;i++) s+=warp_reduce[i]; warp_reduce[0]=s; }
     __syncthreads();
     float inv_sum = 1.0f / warp_reduce[0];
     for (int t = tid; t < seq_len; t += blockDim.x) scores[t] *= inv_sum;
@@ -990,14 +989,14 @@ __global__ void flash_attention_kernel(
         }
         scores[tid] = s;
 
-        // Tile max via warp shuffle (2 wavefronts of 64)
+        // Tile max via warp shuffle
         float t_max = s;
-        int lane = tid & 63, wid = tid >> 6;
-        for (int off = 32; off > 0; off >>= 1)
-            t_max = fmaxf(t_max, __shfl_xor(t_max, off, 64));
+        int lane = tid & (WARP_SIZE - 1), wid = tid / WARP_SIZE;
+        for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+            t_max = fmaxf(t_max, __shfl_xor(t_max, off, WARP_SIZE));
         if (lane == 0) warp_r[wid] = t_max;
         __syncthreads();
-        if (tid == 0) warp_r[0] = fmaxf(warp_r[0], warp_r[1]);
+        if (tid == 0) { for (int w = 1; w < blockDim.x / WARP_SIZE; w++) warp_r[0] = fmaxf(warp_r[0], warp_r[w]); }
         __syncthreads();
         t_max = warp_r[0];
 
@@ -1008,11 +1007,11 @@ __global__ void flash_attention_kernel(
         scores[tid] = p;  // store for V accumulation
 
         float p_sum = p;
-        for (int off = 32; off > 0; off >>= 1)
-            p_sum += __shfl_xor(p_sum, off, 64);
+        for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+            p_sum += __shfl_xor(p_sum, off, WARP_SIZE);
         if (lane == 0) warp_r[wid] = p_sum;
         __syncthreads();
-        if (tid == 0) warp_r[0] += warp_r[1];
+        if (tid == 0) { for (int w = 1; w < blockDim.x / WARP_SIZE; w++) warp_r[0] += warp_r[w]; }
         __syncthreads();
         p_sum = warp_r[0];
 
@@ -1103,12 +1102,12 @@ __global__ void flash_attention_batch_kernel(
         scores[tid] = s;
 
         float t_max = s;
-        int lane = tid & 63, wid = tid >> 6;
-        for (int off = 32; off > 0; off >>= 1)
-            t_max = fmaxf(t_max, __shfl_xor(t_max, off, 64));
+        int lane = tid & (WARP_SIZE - 1), wid = tid / WARP_SIZE;
+        for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+            t_max = fmaxf(t_max, __shfl_xor(t_max, off, WARP_SIZE));
         if (lane == 0) warp_r[wid] = t_max;
         __syncthreads();
-        if (tid == 0) warp_r[0] = fmaxf(warp_r[0], warp_r[1]);
+        if (tid == 0) { for (int w = 1; w < blockDim.x / WARP_SIZE; w++) warp_r[0] = fmaxf(warp_r[0], warp_r[w]); }
         __syncthreads();
         t_max = warp_r[0];
         float m_new = fmaxf(m_prev, t_max);
@@ -1116,11 +1115,11 @@ __global__ void flash_attention_batch_kernel(
         float p = (tid < t_len) ? expf(scores[tid] - m_new) : 0.0f;
         scores[tid] = p;
         float p_sum = p;
-        for (int off = 32; off > 0; off >>= 1)
-            p_sum += __shfl_xor(p_sum, off, 64);
+        for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+            p_sum += __shfl_xor(p_sum, off, WARP_SIZE);
         if (lane == 0) warp_r[wid] = p_sum;
         __syncthreads();
-        if (tid == 0) warp_r[0] += warp_r[1];
+        if (tid == 0) { for (int w = 1; w < blockDim.x / WARP_SIZE; w++) warp_r[0] += warp_r[w]; }
         __syncthreads();
         p_sum = warp_r[0];
 

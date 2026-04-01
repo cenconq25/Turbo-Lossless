@@ -16,11 +16,12 @@
  * Build: hipcc -O3 --offload-arch=gfx906 -shared -fPIC -o decompress_v2.so decompress_v2.hip
  */
 
-#include <hip/hip_runtime.h>
+#include "gpu_compat.h"
 #include <cstdint>
 
-#define WARP_SIZE      64   // MI50 wavefront width
-#define WORKGROUP_SIZE 256  // 4 wavefronts per block
+#define WARP_SIZE      TURBO_WARP_SIZE
+#define WORKGROUP_SIZE TURBO_WORKGROUP_SIZE
+#define NUM_WARPS      TURBO_NUM_WARPS
 
 // BF16 → float32: BF16 is upper 16 bits of IEEE float32
 __device__ __forceinline__
@@ -28,6 +29,23 @@ float bf16_to_float(int16_t raw) {
     union { uint32_t u; float f; } c;
     c.u = ((uint32_t)(uint16_t)raw) << 16;
     return c.f;
+}
+
+// ---------------------------------------------------------------------------
+// Extract 12-bit value from packed bitstream
+// ptr is always 4-byte aligned; shift is constant per thread (< 32)
+// On NVIDIA: use two 4-byte aligned reads (uint64_t load from 4-byte-aligned ptr is UB)
+// On AMD: single 8-byte load works fine with HIP's relaxed alignment rules
+// ---------------------------------------------------------------------------
+__device__ __forceinline__
+uint32_t extract_packed12(const char* ptr, int shift) {
+#ifdef TURBO_NVIDIA
+    uint32_t lo = *(const uint32_t*)ptr;
+    uint32_t hi = *(const uint32_t*)(ptr + 4);
+    return (uint32_t)(((uint64_t)hi << 32 | lo) >> shift) & 0xFFF;
+#else
+    return (uint32_t)(*(const uint64_t*)ptr >> shift) & 0xFFF;
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -110,7 +128,7 @@ __global__ void structured12_matvec_v2(
 {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
-    __shared__ float warp_sums[4];
+    __shared__ float warp_sums[NUM_WARPS];
     float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
 
     const uint32_t* row_packed = packed + (int64_t)row * K * 12 / 32;
@@ -121,10 +139,10 @@ __global__ void structured12_matvec_v2(
 
     int col = tid;
     for (; col + WORKGROUP_SIZE * 3 < K; col += WORKGROUP_SIZE * 4) {
-        uint32_t d0 = (uint32_t)(*(const uint64_t*)(pack_ptr) >> shift) & 0xFFF;
-        uint32_t d1 = (uint32_t)(*(const uint64_t*)(pack_ptr + 384) >> shift) & 0xFFF;
-        uint32_t d2 = (uint32_t)(*(const uint64_t*)(pack_ptr + 768) >> shift) & 0xFFF;
-        uint32_t d3 = (uint32_t)(*(const uint64_t*)(pack_ptr + 1152) >> shift) & 0xFFF;
+        uint32_t d0 = extract_packed12(pack_ptr, shift);
+        uint32_t d1 = extract_packed12(pack_ptr + 384, shift);
+        uint32_t d2 = extract_packed12(pack_ptr + 768, shift);
+        uint32_t d3 = extract_packed12(pack_ptr + 1152, shift);
         sum0 += structured12_decode(d0, base_exp) * bf16_to_float(*(const int16_t*)(act_ptr));
         sum1 += structured12_decode(d1, base_exp) * bf16_to_float(*(const int16_t*)(act_ptr + 512));
         sum2 += structured12_decode(d2, base_exp) * bf16_to_float(*(const int16_t*)(act_ptr + 1024));
@@ -133,16 +151,16 @@ __global__ void structured12_matvec_v2(
         act_ptr += 2048;
     }
     for (; col < K; col += WORKGROUP_SIZE) {
-        uint32_t d = (uint32_t)(*(const uint64_t*)(pack_ptr) >> shift) & 0xFFF;
+        uint32_t d = extract_packed12(pack_ptr, shift);
         sum0 += structured12_decode(d, base_exp) * bf16_to_float(*(const int16_t*)(act_ptr));
         pack_ptr += 384;
         act_ptr += 512;
     }
     float sum = sum0 + sum1 + sum2 + sum3;
     for (int off = WARP_SIZE / 2; off > 0; off >>= 1) sum += __shfl_down(sum, off, WARP_SIZE);
-    if ((tid & (WARP_SIZE-1)) == 0) warp_sums[tid >> 6] = sum;
+    if ((tid & (WARP_SIZE-1)) == 0) warp_sums[tid / WARP_SIZE] = sum;
     __syncthreads();
-    if (tid == 0) output[row] = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+    if (tid == 0) { float s = 0; for (int w = 0; w < NUM_WARPS; w++) s += warp_sums[w]; output[row] = s; }
 }
 
 // ---------------------------------------------------------------------------
@@ -161,8 +179,8 @@ __global__ void structured12_matvec_v2_dual(
 {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
-    __shared__ float warp_sums_a[4];
-    __shared__ float warp_sums_b[4];
+    __shared__ float warp_sums_a[NUM_WARPS];
+    __shared__ float warp_sums_b[NUM_WARPS];
 
     float sa0 = 0.0f, sa1 = 0.0f, sa2 = 0.0f, sa3 = 0.0f;
     float sb0 = 0.0f, sb1 = 0.0f, sb2 = 0.0f, sb3 = 0.0f;
@@ -188,20 +206,20 @@ __global__ void structured12_matvec_v2_dual(
         float af3 = bf16_to_float(*(const int16_t*)(act_ptr + 1536));
 
         // Decode weights from tensor A (gate)
-        uint32_t da0 = (uint32_t)(*(const uint64_t*)(pa_ptr) >> shift) & 0xFFF;
-        uint32_t da1 = (uint32_t)(*(const uint64_t*)(pa_ptr + 384) >> shift) & 0xFFF;
-        uint32_t da2 = (uint32_t)(*(const uint64_t*)(pa_ptr + 768) >> shift) & 0xFFF;
-        uint32_t da3 = (uint32_t)(*(const uint64_t*)(pa_ptr + 1152) >> shift) & 0xFFF;
+        uint32_t da0 = extract_packed12(pa_ptr, shift);
+        uint32_t da1 = extract_packed12(pa_ptr + 384, shift);
+        uint32_t da2 = extract_packed12(pa_ptr + 768, shift);
+        uint32_t da3 = extract_packed12(pa_ptr + 1152, shift);
         sa0 += structured12_decode(da0, base_exp_a) * af0;
         sa1 += structured12_decode(da1, base_exp_a) * af1;
         sa2 += structured12_decode(da2, base_exp_a) * af2;
         sa3 += structured12_decode(da3, base_exp_a) * af3;
 
         // Decode weights from tensor B (up)
-        uint32_t db0 = (uint32_t)(*(const uint64_t*)(pb_ptr) >> shift) & 0xFFF;
-        uint32_t db1 = (uint32_t)(*(const uint64_t*)(pb_ptr + 384) >> shift) & 0xFFF;
-        uint32_t db2 = (uint32_t)(*(const uint64_t*)(pb_ptr + 768) >> shift) & 0xFFF;
-        uint32_t db3 = (uint32_t)(*(const uint64_t*)(pb_ptr + 1152) >> shift) & 0xFFF;
+        uint32_t db0 = extract_packed12(pb_ptr, shift);
+        uint32_t db1 = extract_packed12(pb_ptr + 384, shift);
+        uint32_t db2 = extract_packed12(pb_ptr + 768, shift);
+        uint32_t db3 = extract_packed12(pb_ptr + 1152, shift);
         sb0 += structured12_decode(db0, base_exp_b) * af0;
         sb1 += structured12_decode(db1, base_exp_b) * af1;
         sb2 += structured12_decode(db2, base_exp_b) * af2;
@@ -214,8 +232,8 @@ __global__ void structured12_matvec_v2_dual(
     // Remainder
     for (; col < K; col += WORKGROUP_SIZE) {
         float af = bf16_to_float(*(const int16_t*)(act_ptr));
-        uint32_t da = (uint32_t)(*(const uint64_t*)(pa_ptr) >> shift) & 0xFFF;
-        uint32_t db = (uint32_t)(*(const uint64_t*)(pb_ptr) >> shift) & 0xFFF;
+        uint32_t da = extract_packed12(pa_ptr, shift);
+        uint32_t db = extract_packed12(pb_ptr, shift);
         sa0 += structured12_decode(da, base_exp_a) * af;
         sb0 += structured12_decode(db, base_exp_b) * af;
         pa_ptr += 384;
@@ -233,13 +251,14 @@ __global__ void structured12_matvec_v2_dual(
         sum_b += __shfl_down(sum_b, off, WARP_SIZE);
     }
     if ((tid & (WARP_SIZE-1)) == 0) {
-        warp_sums_a[tid >> 6] = sum_a;
-        warp_sums_b[tid >> 6] = sum_b;
+        warp_sums_a[tid / WARP_SIZE] = sum_a;
+        warp_sums_b[tid / WARP_SIZE] = sum_b;
     }
     __syncthreads();
     if (tid == 0) {
-        output_a[row] = warp_sums_a[0] + warp_sums_a[1] + warp_sums_a[2] + warp_sums_a[3];
-        output_b[row] = warp_sums_b[0] + warp_sums_b[1] + warp_sums_b[2] + warp_sums_b[3];
+        float sa = 0, sb = 0;
+        for (int w = 0; w < NUM_WARPS; w++) { sa += warp_sums_a[w]; sb += warp_sums_b[w]; }
+        output_a[row] = sa; output_b[row] = sb;
     }
 }
 
@@ -262,14 +281,14 @@ __global__ void structured12_matvec_batch4(
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
 
-    // NO LDS codebook — only warp_sums (64 bytes) + esc_totals (16 bytes)
-    __shared__ float warp_sums[16];
-    __shared__ int warp_esc_totals[4];
+    // NO LDS codebook — only warp_sums + esc_totals
+    __shared__ float warp_sums[NUM_WARPS * 4];
+    __shared__ int warp_esc_totals[NUM_WARPS];
 
     // Escape count prefix sum via warp shuffles (same as before)
     int my_count = (int)escape_counts[row * WORKGROUP_SIZE + tid];
     int lane = tid & (WARP_SIZE - 1);
-    int warp_id = tid >> 6;
+    int warp_id = tid / WARP_SIZE;
     int prefix = my_count;
     for (int off = 1; off < WARP_SIZE; off <<= 1) {
         int v = __shfl_up(prefix, off, WARP_SIZE);
@@ -292,8 +311,8 @@ __global__ void structured12_matvec_batch4(
 
     int col = tid;
     for (; col + WORKGROUP_SIZE < K; col += WORKGROUP_SIZE * 2) {
-        uint32_t raw0 = (uint32_t)(*(const uint64_t*)(base_ptr) >> shift) & 0xFFF;
-        uint32_t raw1 = (uint32_t)(*(const uint64_t*)(base_ptr + 384) >> shift) & 0xFFF;
+        uint32_t raw0 = extract_packed12(base_ptr, shift);
+        uint32_t raw1 = extract_packed12(base_ptr + 384, shift);
 
         uint32_t g0 = raw0 >> 8, g1 = raw1 >> 8;
         float wt0 = (__builtin_expect(g0 != 0, 1))
@@ -310,7 +329,7 @@ __global__ void structured12_matvec_batch4(
         base_ptr += 768;
     }
     if (col < K) {
-        uint32_t raw = (uint32_t)(*(const uint64_t*)(base_ptr) >> shift) & 0xFFF;
+        uint32_t raw = extract_packed12(base_ptr, shift);
         uint32_t g = raw >> 8;
         float wt = (__builtin_expect(g != 0, 1))
             ? structured12_decode(raw, base_exp)
@@ -329,17 +348,19 @@ __global__ void structured12_matvec_batch4(
         s2 += __shfl_down(s2, off, WARP_SIZE);
         s3 += __shfl_down(s3, off, WARP_SIZE);
     }
-    int wid = tid >> 6;
+    int wid = tid / WARP_SIZE;
     if ((tid & (WARP_SIZE-1)) == 0) {
-        warp_sums[wid]=s0; warp_sums[wid+4]=s1;
-        warp_sums[wid+8]=s2; warp_sums[wid+12]=s3;
+        warp_sums[wid]=s0; warp_sums[wid+NUM_WARPS]=s1;
+        warp_sums[wid+NUM_WARPS*2]=s2; warp_sums[wid+NUM_WARPS*3]=s3;
     }
     __syncthreads();
     if (tid == 0) {
-        out0[row]=warp_sums[0]+warp_sums[1]+warp_sums[2]+warp_sums[3];
-        out1[row]=warp_sums[4]+warp_sums[5]+warp_sums[6]+warp_sums[7];
-        out2[row]=warp_sums[8]+warp_sums[9]+warp_sums[10]+warp_sums[11];
-        out3[row]=warp_sums[12]+warp_sums[13]+warp_sums[14]+warp_sums[15];
+        float r0=0,r1=0,r2=0,r3=0;
+        for (int w = 0; w < NUM_WARPS; w++) {
+            r0 += warp_sums[w]; r1 += warp_sums[w+NUM_WARPS];
+            r2 += warp_sums[w+NUM_WARPS*2]; r3 += warp_sums[w+NUM_WARPS*3];
+        }
+        out0[row]=r0; out1[row]=r1; out2[row]=r2; out3[row]=r3;
     }
 }
 
@@ -366,14 +387,14 @@ __global__ void structured12_matvec_batch8(
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
 
-    // NO LDS codebook — only warp_sums (128 bytes) + esc_totals (16 bytes)
-    __shared__ float warp_sums[32];  // 4 warps x 8 outputs
-    __shared__ int warp_esc_totals[4];
+    // NO LDS codebook — only warp_sums + esc_totals
+    __shared__ float warp_sums[NUM_WARPS * 8];
+    __shared__ int warp_esc_totals[NUM_WARPS];
 
     // Escape count prefix sum via warp shuffles
     int my_count = (int)escape_counts[row * WORKGROUP_SIZE + tid];
     int lane = tid & (WARP_SIZE - 1);
-    int warp_id = tid >> 6;
+    int warp_id = tid / WARP_SIZE;
     int prefix = my_count;
     for (int off = 1; off < WARP_SIZE; off <<= 1) {
         int v = __shfl_up(prefix, off, WARP_SIZE);
@@ -397,8 +418,8 @@ __global__ void structured12_matvec_batch8(
 
     int col = tid;
     for (; col + WORKGROUP_SIZE < K; col += WORKGROUP_SIZE * 2) {
-        uint32_t raw0 = (uint32_t)(*(const uint64_t*)(base_ptr) >> shift) & 0xFFF;
-        uint32_t raw1 = (uint32_t)(*(const uint64_t*)(base_ptr + 384) >> shift) & 0xFFF;
+        uint32_t raw0 = extract_packed12(base_ptr, shift);
+        uint32_t raw1 = extract_packed12(base_ptr + 384, shift);
 
         uint32_t g0 = raw0 >> 8, g1 = raw1 >> 8;
         float wt0 = (__builtin_expect(g0 != 0, 1))
@@ -419,7 +440,7 @@ __global__ void structured12_matvec_batch8(
         base_ptr += 768;
     }
     if (col < K) {
-        uint32_t raw = (uint32_t)(*(const uint64_t*)(base_ptr) >> shift) & 0xFFF;
+        uint32_t raw = extract_packed12(base_ptr, shift);
         uint32_t g = raw >> 8;
         float wt = (__builtin_expect(g != 0, 1))
             ? structured12_decode(raw, base_exp)
@@ -445,27 +466,24 @@ __global__ void structured12_matvec_batch8(
         s6 += __shfl_down(s6, off, WARP_SIZE);
         s7 += __shfl_down(s7, off, WARP_SIZE);
     }
-    int wid = tid >> 6;
+    int wid = tid / WARP_SIZE;
     if ((tid & (WARP_SIZE - 1)) == 0) {
-        warp_sums[wid]       = s0;
-        warp_sums[wid + 4]   = s1;
-        warp_sums[wid + 8]   = s2;
-        warp_sums[wid + 12]  = s3;
-        warp_sums[wid + 16]  = s4;
-        warp_sums[wid + 20]  = s5;
-        warp_sums[wid + 24]  = s6;
-        warp_sums[wid + 28]  = s7;
+        warp_sums[wid]              = s0;
+        warp_sums[wid + NUM_WARPS]   = s1;
+        warp_sums[wid + NUM_WARPS*2] = s2;
+        warp_sums[wid + NUM_WARPS*3] = s3;
+        warp_sums[wid + NUM_WARPS*4] = s4;
+        warp_sums[wid + NUM_WARPS*5] = s5;
+        warp_sums[wid + NUM_WARPS*6] = s6;
+        warp_sums[wid + NUM_WARPS*7] = s7;
     }
     __syncthreads();
     if (tid == 0) {
-        out0[row] = warp_sums[0]+warp_sums[1]+warp_sums[2]+warp_sums[3];
-        out1[row] = warp_sums[4]+warp_sums[5]+warp_sums[6]+warp_sums[7];
-        out2[row] = warp_sums[8]+warp_sums[9]+warp_sums[10]+warp_sums[11];
-        out3[row] = warp_sums[12]+warp_sums[13]+warp_sums[14]+warp_sums[15];
-        out4[row] = warp_sums[16]+warp_sums[17]+warp_sums[18]+warp_sums[19];
-        out5[row] = warp_sums[20]+warp_sums[21]+warp_sums[22]+warp_sums[23];
-        out6[row] = warp_sums[24]+warp_sums[25]+warp_sums[26]+warp_sums[27];
-        out7[row] = warp_sums[28]+warp_sums[29]+warp_sums[30]+warp_sums[31];
+        float r[8] = {0};
+        for (int w = 0; w < NUM_WARPS; w++)
+            for (int o = 0; o < 8; o++) r[o] += warp_sums[w + NUM_WARPS * o];
+        out0[row]=r[0]; out1[row]=r[1]; out2[row]=r[2]; out3[row]=r[3];
+        out4[row]=r[4]; out5[row]=r[5]; out6[row]=r[6]; out7[row]=r[7];
     }
 }
 
@@ -572,7 +590,7 @@ __global__ void split12_matvec_v2(
 {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
-    __shared__ float warp_sums[4];
+    __shared__ float warp_sums[NUM_WARPS];
     float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
 
     // Pointer setup: row-major layout
@@ -637,9 +655,9 @@ __global__ void split12_matvec_v2(
     float sum = sum0 + sum1 + sum2 + sum3;
     for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
         sum += __shfl_down(sum, off, WARP_SIZE);
-    if ((tid & (WARP_SIZE - 1)) == 0) warp_sums[tid >> 6] = sum;
+    if ((tid & (WARP_SIZE - 1)) == 0) warp_sums[tid / WARP_SIZE] = sum;
     __syncthreads();
-    if (tid == 0) output[row] = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+    if (tid == 0) { float s = 0; for (int w = 0; w < NUM_WARPS; w++) s += warp_sums[w]; output[row] = s; }
 }
 
 // ---------------------------------------------------------------------------
@@ -659,7 +677,7 @@ __global__ void split12_matvec_v2_multirow(
     const int row0 = blockIdx.x * 2;
     const int row1 = row0 + 1;
     const int tid = threadIdx.x;
-    __shared__ float warp_sums[8]; // 4 per row
+    __shared__ float warp_sums[NUM_WARPS * 2];
 
     // Row 0 accumulators
     float sum_a0 = 0.0f, sum_a1 = 0.0f, sum_a2 = 0.0f, sum_a3 = 0.0f;
@@ -777,19 +795,21 @@ __global__ void split12_matvec_v2_multirow(
     float sum0 = sum_a0 + sum_a1 + sum_a2 + sum_a3;
     for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
         sum0 += __shfl_down(sum0, off, WARP_SIZE);
-    if ((tid & (WARP_SIZE - 1)) == 0) warp_sums[tid >> 6] = sum0;
+    if ((tid & (WARP_SIZE - 1)) == 0) warp_sums[tid / WARP_SIZE] = sum0;
 
     // Warp reduction for row 1
     float sum1 = sum_b0 + sum_b1 + sum_b2 + sum_b3;
     for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
         sum1 += __shfl_down(sum1, off, WARP_SIZE);
-    if ((tid & (WARP_SIZE - 1)) == 0) warp_sums[4 + (tid >> 6)] = sum1;
+    if ((tid & (WARP_SIZE - 1)) == 0) warp_sums[NUM_WARPS + (tid / WARP_SIZE)] = sum1;
 
     __syncthreads();
     if (tid == 0) {
-        output[row0] = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+        float s0 = 0, s1 = 0;
+        for (int w = 0; w < NUM_WARPS; w++) { s0 += warp_sums[w]; s1 += warp_sums[NUM_WARPS + w]; }
+        output[row0] = s0;
         if (has_row1)
-            output[row1] = warp_sums[4] + warp_sums[5] + warp_sums[6] + warp_sums[7];
+            output[row1] = s1;
     }
 }
 
@@ -809,8 +829,8 @@ __global__ void split12_matvec_v2_dual(
 {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
-    __shared__ float warp_sums_a[4];
-    __shared__ float warp_sums_b[4];
+    __shared__ float warp_sums_a[NUM_WARPS];
+    __shared__ float warp_sums_b[NUM_WARPS];
 
     float sa0 = 0.0f, sa1 = 0.0f, sa2 = 0.0f, sa3 = 0.0f;
     float sb0 = 0.0f, sb1 = 0.0f, sb2 = 0.0f, sb3 = 0.0f;
@@ -925,13 +945,14 @@ __global__ void split12_matvec_v2_dual(
         sum_b += __shfl_down(sum_b, off, WARP_SIZE);
     }
     if ((tid & (WARP_SIZE - 1)) == 0) {
-        warp_sums_a[tid >> 6] = sum_a;
-        warp_sums_b[tid >> 6] = sum_b;
+        warp_sums_a[tid / WARP_SIZE] = sum_a;
+        warp_sums_b[tid / WARP_SIZE] = sum_b;
     }
     __syncthreads();
     if (tid == 0) {
-        output_a[row] = warp_sums_a[0] + warp_sums_a[1] + warp_sums_a[2] + warp_sums_a[3];
-        output_b[row] = warp_sums_b[0] + warp_sums_b[1] + warp_sums_b[2] + warp_sums_b[3];
+        float sa = 0, sb = 0;
+        for (int w = 0; w < NUM_WARPS; w++) { sa += warp_sums_a[w]; sb += warp_sums_b[w]; }
+        output_a[row] = sa; output_b[row] = sb;
     }
 }
 
@@ -997,13 +1018,13 @@ __global__ void split12_matvec_batch4(
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
 
-    __shared__ float warp_sums[16];
-    __shared__ int warp_esc_totals[4];
+    __shared__ float warp_sums[NUM_WARPS * 4];
+    __shared__ int warp_esc_totals[NUM_WARPS];
 
     // Escape count prefix sum via warp shuffles
     int my_count = (int)escape_counts[row * WORKGROUP_SIZE + tid];
     int lane = tid & (WARP_SIZE - 1);
-    int warp_id = tid >> 6;
+    int warp_id = tid / WARP_SIZE;
     int prefix = my_count;
     for (int off = 1; off < WARP_SIZE; off <<= 1) {
         int v = __shfl_up(prefix, off, WARP_SIZE);
@@ -1094,17 +1115,19 @@ __global__ void split12_matvec_batch4(
         s2 += __shfl_down(s2, off, WARP_SIZE);
         s3 += __shfl_down(s3, off, WARP_SIZE);
     }
-    int wid = tid >> 6;
+    int wid = tid / WARP_SIZE;
     if ((tid & (WARP_SIZE-1)) == 0) {
-        warp_sums[wid]=s0; warp_sums[wid+4]=s1;
-        warp_sums[wid+8]=s2; warp_sums[wid+12]=s3;
+        warp_sums[wid]=s0; warp_sums[wid+NUM_WARPS]=s1;
+        warp_sums[wid+NUM_WARPS*2]=s2; warp_sums[wid+NUM_WARPS*3]=s3;
     }
     __syncthreads();
     if (tid == 0) {
-        out0[row]=warp_sums[0]+warp_sums[1]+warp_sums[2]+warp_sums[3];
-        out1[row]=warp_sums[4]+warp_sums[5]+warp_sums[6]+warp_sums[7];
-        out2[row]=warp_sums[8]+warp_sums[9]+warp_sums[10]+warp_sums[11];
-        out3[row]=warp_sums[12]+warp_sums[13]+warp_sums[14]+warp_sums[15];
+        float r0=0,r1=0,r2=0,r3=0;
+        for (int w = 0; w < NUM_WARPS; w++) {
+            r0 += warp_sums[w]; r1 += warp_sums[w+NUM_WARPS];
+            r2 += warp_sums[w+NUM_WARPS*2]; r3 += warp_sums[w+NUM_WARPS*3];
+        }
+        out0[row]=r0; out1[row]=r1; out2[row]=r2; out3[row]=r3;
     }
 }
 
@@ -1133,13 +1156,13 @@ __global__ void split12_matvec_batch8(
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
 
-    __shared__ float warp_sums[32];  // 4 warps x 8 outputs
-    __shared__ int warp_esc_totals[4];
+    __shared__ float warp_sums[NUM_WARPS * 8];
+    __shared__ int warp_esc_totals[NUM_WARPS];
 
     // Escape count prefix sum via warp shuffles
     int my_count = (int)escape_counts[row * WORKGROUP_SIZE + tid];
     int lane = tid & (WARP_SIZE - 1);
-    int warp_id = tid >> 6;
+    int warp_id = tid / WARP_SIZE;
     int prefix = my_count;
     for (int off = 1; off < WARP_SIZE; off <<= 1) {
         int v = __shfl_up(prefix, off, WARP_SIZE);
@@ -1242,27 +1265,24 @@ __global__ void split12_matvec_batch8(
         s6 += __shfl_down(s6, off, WARP_SIZE);
         s7 += __shfl_down(s7, off, WARP_SIZE);
     }
-    int wid = tid >> 6;
+    int wid = tid / WARP_SIZE;
     if ((tid & (WARP_SIZE-1)) == 0) {
-        warp_sums[wid]       = s0;
-        warp_sums[wid + 4]   = s1;
-        warp_sums[wid + 8]   = s2;
-        warp_sums[wid + 12]  = s3;
-        warp_sums[wid + 16]  = s4;
-        warp_sums[wid + 20]  = s5;
-        warp_sums[wid + 24]  = s6;
-        warp_sums[wid + 28]  = s7;
+        warp_sums[wid]              = s0;
+        warp_sums[wid + NUM_WARPS]   = s1;
+        warp_sums[wid + NUM_WARPS*2] = s2;
+        warp_sums[wid + NUM_WARPS*3] = s3;
+        warp_sums[wid + NUM_WARPS*4] = s4;
+        warp_sums[wid + NUM_WARPS*5] = s5;
+        warp_sums[wid + NUM_WARPS*6] = s6;
+        warp_sums[wid + NUM_WARPS*7] = s7;
     }
     __syncthreads();
     if (tid == 0) {
-        out0[row] = warp_sums[0]+warp_sums[1]+warp_sums[2]+warp_sums[3];
-        out1[row] = warp_sums[4]+warp_sums[5]+warp_sums[6]+warp_sums[7];
-        out2[row] = warp_sums[8]+warp_sums[9]+warp_sums[10]+warp_sums[11];
-        out3[row] = warp_sums[12]+warp_sums[13]+warp_sums[14]+warp_sums[15];
-        out4[row] = warp_sums[16]+warp_sums[17]+warp_sums[18]+warp_sums[19];
-        out5[row] = warp_sums[20]+warp_sums[21]+warp_sums[22]+warp_sums[23];
-        out6[row] = warp_sums[24]+warp_sums[25]+warp_sums[26]+warp_sums[27];
-        out7[row] = warp_sums[28]+warp_sums[29]+warp_sums[30]+warp_sums[31];
+        float r[8] = {0};
+        for (int w = 0; w < NUM_WARPS; w++)
+            for (int o = 0; o < 8; o++) r[o] += warp_sums[w + NUM_WARPS * o];
+        out0[row]=r[0]; out1[row]=r[1]; out2[row]=r[2]; out3[row]=r[3];
+        out4[row]=r[4]; out5[row]=r[5]; out6[row]=r[6]; out7[row]=r[7];
     }
 }
 

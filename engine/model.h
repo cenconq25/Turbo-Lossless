@@ -1,5 +1,5 @@
 #pragma once
-#include <hip/hip_runtime.h>
+#include "../gpu_compat.h"
 #include <string>
 #include <vector>
 #include <cstdint>

@@ -1,5 +1,5 @@
 #pragma once
-#include <hip/hip_runtime.h>
+#include "../gpu_compat.h"
 
 // Pre-allocate sampler buffers
 void init_sampler(int max_batch = 1);
