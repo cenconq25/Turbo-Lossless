@@ -31,7 +31,8 @@ struct InferenceState {
     int16_t* bf16_act2;     // second buffer for ffn (gate input differs from attn input)
 
 #ifdef TURBO_NVIDIA
-    void* weight_buf;       // [max_M * max_K] BF16 temp for cuBLAS decode+GEMM path
+    void* weight_buf;       // [2 × max_M * max_K] BF16 ping-pong for cuBLAS decode+GEMM
+    int weight_buf_half;    // elements per half-buffer (max_M × max_K)
 #endif
 };
 

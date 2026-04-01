@@ -20,8 +20,12 @@
 
 using namespace nvcuda;
 
-// cuBLAS handle (lazy-initialized)
+// cuBLAS handle and decode stream for ping-pong double buffering
 static cublasHandle_t s_cublas_handle = nullptr;
+static cudaStream_t s_decode_stream = nullptr;
+static cudaEvent_t s_decode_done = nullptr;   // decode completed, GEMM can start
+static cudaEvent_t s_gemm_done = nullptr;     // GEMM completed, buffer can be reused
+static int s_ping = 0;                        // toggle 0/1 for buffer selection
 
 // ============================================================
 // Constants
@@ -548,26 +552,49 @@ int nv_launch_split12_gemm_tc_async(
 // This is the fastest batch path — matches cuBLAS performance with 1.33x less DRAM reads
 int nv_launch_split12_cublas_batch_async(
     const void* sign_mantissa, const void* groups, int base_exp,
-    const void* activations, int act_stride,  // [B × K] BF16
-    void* output, int out_stride,             // [B × M] FP32
-    void* bf16_weight_buf,                    // [M × K] temp buffer for decoded BF16 weights
+    const void* activations, int act_stride,
+    void* output, int out_stride,
+    void* bf16_weight_buf,       // [2 × buf_half_elems] ping-pong BF16 buffers
+    int buf_half_elems,          // elements per half-buffer (max_M × max_K)
     int M, int K, int B, void* stream)
 {
     cudaStream_t s = (cudaStream_t)stream;
 
-    // Step 1: Decode split12 → BF16 weight buffer
-    int total = M * K;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
-    nv_decode_split12_to_bf16<<<blocks, threads, 0, s>>>(
-        (const uint8_t*)sign_mantissa, (const uint8_t*)groups, base_exp,
-        (__nv_bfloat16*)bf16_weight_buf, M, K);
-
-    // Step 2: cuBLAS GEMM — C = A × B^T where A = activations [B×K], B = weights [M×K]
-    // Output C = [B×M] in FP32
+    // Lazy-init decode stream + events for ping-pong double buffering
+    if (!s_decode_stream) {
+        cudaStreamCreateWithFlags(&s_decode_stream, cudaStreamNonBlocking);
+        cudaEventCreateWithFlags(&s_decode_done, cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&s_gemm_done, cudaEventDisableTiming);
+    }
     if (!s_cublas_handle) {
         cublasCreate(&s_cublas_handle);
     }
+
+    // Ping-pong double buffering: two halves of equal size
+    __nv_bfloat16* buf0 = (__nv_bfloat16*)bf16_weight_buf;
+    __nv_bfloat16* buf1 = buf0 + buf_half_elems;
+    __nv_bfloat16* cur_buf = s_ping ? buf1 : buf0;
+
+    // Wait for previous GEMM to finish using the current buffer (if any)
+    if (s_ping == 0 && s_gemm_done) {
+        // First call or buffer 0: no wait needed on first call
+    }
+    // Decode stream waits for main stream to be done with this buffer
+    cudaStreamWaitEvent(s_decode_stream, s_gemm_done, 0);
+
+    // Step 1: Decode split12 → BF16 on decode stream (overlaps with previous GEMM on other buffer)
+    int total = M * K;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    nv_decode_split12_to_bf16<<<blocks, threads, 0, s_decode_stream>>>(
+        (const uint8_t*)sign_mantissa, (const uint8_t*)groups, base_exp,
+        cur_buf, M, K);
+    cudaEventRecord(s_decode_done, s_decode_stream);
+
+    // Main stream waits for decode to complete
+    cudaStreamWaitEvent(s, s_decode_done, 0);
+
+    // Step 2: cuBLAS GEMM on main stream (tensor cores)
     cublasSetStream(s_cublas_handle, s);
 
     // Matrix layout (row-major to cuBLAS column-major):
@@ -584,11 +611,17 @@ int nv_launch_split12_cublas_batch_async(
         CUBLAS_OP_N,    // no-op on A: [K×B]
         M, B, K,        // m, n, k
         &alpha,
-        bf16_weight_buf, CUDA_R_16BF, K,          // W: [K×M] col-major, lda=K
-        activations, CUDA_R_16BF, act_stride,      // A: [K×B] col-major, lda=act_stride
+        cur_buf, CUDA_R_16BF, K,                   // W: [K×M] col-major, lda=K
+        activations, CUDA_R_16BF, act_stride,       // A: [K×B] col-major, lda=act_stride
         &beta,
-        output, CUDA_R_32F, out_stride,            // C: [M×B] col-major, lda=out_stride
+        output, CUDA_R_32F, out_stride,             // C: [M×B] col-major, lda=out_stride
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    // Record GEMM completion so decode stream knows when buffer is free
+    cudaEventRecord(s_gemm_done, s);
+
+    // Toggle ping-pong for next call
+    s_ping ^= 1;
 
     // Escape correction handled by caller
     return 0;
