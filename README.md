@@ -67,29 +67,29 @@ B=8:  decode -> 8x FMA    (2.4x faster than BF16)
 
 #### Mistral 7B Instruct (7.25B params, escape rate 0.031%)
 
-| Batch | llama.cpp BF16 | Turbo 12-bit | Speedup | Compression | VRAM |
-|------:|---------------:|-------------:|:-------:|:-----------:|-----:|
-| B=1 | 55.6 tok/s | **62.0 tok/s** | **1.12x** | **1.36x** | 13.5 vs **~10 GB** |
-| B=4 | — | **156.0 tok/s** | — | **1.36x** | **~10 GB** |
-| B=8 | — | **162.2 tok/s** | **2.92x** | **1.36x** | **~10 GB** |
-| B=16 | — | **171.0 tok/s** | **3.08x** | **1.36x** | **~10 GB** |
-| B=32 | — | 169.8 tok/s | 3.06x | **1.36x** | **~10 GB** |
-| B=64 | — | 169.3 tok/s | 3.05x | **1.36x** | **~10 GB** |
+| Batch | llama.cpp BF16 | vLLM BF16 | Turbo 12-bit | Compression | VRAM |
+|------:|---------------:|----------:|-------------:|:-----------:|-----:|
+| B=1 | 55.6 tok/s | 54.7 tok/s | **62.0 tok/s** | **1.36x** | 13.5 vs **~10 GB** |
+| B=4 | — | 208.9 tok/s | **156.0 tok/s** | **1.36x** | **~10 GB** |
+| B=8 | — | 414.6 tok/s | **162.2 tok/s** | **1.36x** | **~10 GB** |
+| B=16 | — | 687.9 tok/s | **171.0 tok/s** | **1.36x** | **~10 GB** |
+| B=32 | — | 694.2 tok/s | 169.8 tok/s | **1.36x** | **~10 GB** |
+| B=64 | — | 867.1 tok/s | 169.3 tok/s | **1.36x** | **~10 GB** |
 
-Throughput peaks at **B=16 (171 tok/s)** then plateaus — memory bandwidth saturated.
+Turbo peaks at **B=16 (171 tok/s)** — memory bandwidth saturated. vLLM scales higher at large B via optimized GEMM batching (cuBLAS), but uses **1.35x more VRAM**.
 
 #### Llama 3.1 8B Instruct (8.03B params, escape rate 0.021%)
 
-| Batch | llama.cpp BF16 | Turbo 12-bit | Speedup | Compression | VRAM |
-|------:|---------------:|-------------:|:-------:|:-----------:|-----:|
-| B=1 | 51.0 tok/s | **58.6 tok/s** | **1.15x** | **1.42x** | 15.0 vs **~10.5 GB** |
-| B=4 | — | **146.7 tok/s** | — | **1.42x** | **~10.5 GB** |
-| B=8 | — | **159.0 tok/s** | **3.12x** | **1.42x** | **~10.5 GB** |
-| B=16 | — | **162.9 tok/s** | **3.19x** | **1.42x** | **~10.5 GB** |
-| B=32 | — | 162.0 tok/s | 3.18x | **1.42x** | **~10.5 GB** |
-| B=64 | — | 161.7 tok/s | 3.17x | **1.42x** | **~10.5 GB** |
+| Batch | llama.cpp BF16 | vLLM BF16 | Turbo 12-bit | Compression | VRAM |
+|------:|---------------:|----------:|-------------:|:-----------:|-----:|
+| B=1 | 51.0 tok/s | OOM | **58.6 tok/s** | **1.42x** | 15.0 vs **~10.5 GB** |
+| B=4 | — | OOM | **146.7 tok/s** | **1.42x** | **~10.5 GB** |
+| B=8 | — | OOM | **159.0 tok/s** | **1.42x** | **~10.5 GB** |
+| B=16 | — | OOM | **162.9 tok/s** | **1.42x** | **~10.5 GB** |
+| B=32 | — | OOM | 162.0 tok/s | **1.42x** | **~10.5 GB** |
+| B=64 | — | OOM | 161.7 tok/s | **1.42x** | **~10.5 GB** |
 
-Throughput peaks at **B=16 (163 tok/s)** then plateaus. No OOM up to B=1024.
+vLLM **cannot load** Llama 3.1 8B BF16 on a 16GB card (needs ~16 GB weights + overhead). Turbo runs it comfortably at **~10.5 GB** with room to spare. No OOM up to B=1024.
 
 ### MI50 32GB (AMD GCN, 1.0 TB/s)
 
