@@ -31,7 +31,11 @@ extern "C" {
     int launch_split12_batch8_async(const void* sm, const void* gr, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* a4, const void* a5, const void* a6, const void* a7, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, void* o4, void* o5, void* o6, void* o7, int M, int K, void* stream);
 
 #ifdef TURBO_NVIDIA
-    // NVIDIA tiled batch kernels (nvidia_batch_kernels.cu)
+    // NVIDIA Blackwell kernels (nvidia_kernels.cu + nvidia_batch_kernels.cu)
+    int nv_launch_split12_v2_async(const void* sm, const void* gr, int base_exp, const void* act, void* out, int M, int K, void* stream);
+    int nv_launch_patches_async(const void* row_off, const void* cols, const void* correct, const void* wrong, const void* act, void* out, int M, void* stream);
+    int nv_launch_split12_gemm_tc_async(const void* sm, const void* gr, int base_exp, const void* act, int act_stride, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* out, int out_stride, int M, int K, int B, void* stream);
+    // Legacy per-row batch kernels
     int launch_split12_tiled_batch_async(const void* sm, const void* gr, int base_exp, const void* activations, int act_stride, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* output, int out_stride, int M, int K, int B, void* stream);
     int launch_packed12_tiled_batch_async(const void* packed, int base_exp, const void* activations, int act_stride, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* output, int out_stride, int M, int K, int B, void* stream);
 #endif
@@ -61,22 +65,24 @@ extern "C" {
     } \
 } while(0)
 
-// NVIDIA tiled batch matvec: single kernel for any B, shared-memory activation caching
+// NVIDIA tensor core GEMM: decode → shared mem → WMMA (sm_80+ Ampere/Hopper/Ada/Blackwell)
 #ifdef TURBO_NVIDIA
-#define TILED_MATVEC(w, bf16_in, out_buf, n_in, n_out, bs, strm) do { \
+#define TC_MATVEC(w, bf16_in, out_buf, n_in, n_out, bs, strm) do { \
     if ((w).split_sm) { \
-        launch_split12_tiled_batch_async((w).split_sm, (w).split_gr, (w).base_exp, \
+        nv_launch_split12_gemm_tc_async((w).split_sm, (w).split_gr, (w).base_exp, \
             bf16_in, n_in, \
             (w).escape_row_base, (w).escape_counts, (w).escape_vals, \
             out_buf, n_out, \
             (w).M, (w).K, bs, strm); \
-    } else { \
-        launch_packed12_tiled_batch_async((w).packed, (w).base_exp, \
-            bf16_in, n_in, \
-            (w).escape_row_base, (w).escape_counts, (w).escape_vals, \
-            out_buf, n_out, \
-            (w).M, (w).K, bs, strm); \
-    } \
+        /* Patch correction for escapes — one launch per batch item */ \
+        if ((w).num_patches > 0 && (w).row_offsets) { \
+            for (int _b = 0; _b < bs; _b++) \
+                nv_launch_patches_async((w).row_offsets, (w).patch_cols, \
+                    (w).patch_correct, (w).patch_wrong, \
+                    (const int16_t*)bf16_in + _b * n_in, \
+                    (float*)out_buf + _b * n_out, (w).M, strm); \
+        } \
+    } /* split12 required for NVIDIA tensor core path */ \
 } while(0)
 #endif
 
@@ -541,9 +547,9 @@ static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
         if (layer == 0)
             launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
 
-        TILED_MATVEC(L.wq, bf16_a, state->q_buf, n, n, BS, stream);
-        TILED_MATVEC(L.wk, bf16_a, state->k_buf, n, kv_dim, BS, stream);
-        TILED_MATVEC(L.wv, bf16_a, state->v_buf, n, kv_dim, BS, stream);
+        TC_MATVEC(L.wq, bf16_a, state->q_buf, n, n, BS, stream);
+        TC_MATVEC(L.wk, bf16_a, state->k_buf, n, kv_dim, BS, stream);
+        TC_MATVEC(L.wv, bf16_a, state->v_buf, n, kv_dim, BS, stream);
 
         size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
         launch_rope_batch(state->q_buf, state->k_buf, state->d_positions,
@@ -563,12 +569,12 @@ static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
                 bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
                 max_pos + 1, scale, BS, 0, stream);
 
-        TILED_MATVEC(L.wo, bf16_a, res, n, n, BS, stream);
+        TC_MATVEC(L.wo, bf16_a, res, n, n, BS, stream);
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
-        TILED_MATVEC(L.w_gate, bf16_a, state->ffn_gate, n, n_ff, BS, stream);
-        TILED_MATVEC(L.w_up, bf16_a, state->ffn_up, n, n_ff, BS, stream);
+        TC_MATVEC(L.w_gate, bf16_a, state->ffn_gate, n, n_ff, BS, stream);
+        TC_MATVEC(L.w_up, bf16_a, state->ffn_up, n, n_ff, BS, stream);
         launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, BS, stream);
-        TILED_MATVEC(L.w_down, bf16_b, cur, n_ff, n, BS, stream);
+        TC_MATVEC(L.w_down, bf16_b, cur, n_ff, n, BS, stream);
 
         if (layer + 1 < cfg.n_layer)
             launch_add_rms_norm_bf16_batch(cur, res, m->layers[layer + 1].attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
@@ -576,7 +582,7 @@ static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
             launch_add_rms_norm_bf16_batch(cur, res, m->output_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
     }
 
-    TILED_MATVEC(m->output_proj, bf16_a, state->logits, n, cfg.n_vocab, BS, stream);
+    TC_MATVEC(m->output_proj, bf16_a, state->logits, n, cfg.n_vocab, BS, stream);
     for (int s = 0; s < BS; s++) state->positions[s]++;
 }
 #endif
