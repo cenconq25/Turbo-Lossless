@@ -410,14 +410,22 @@ __global__ void rms_norm_bf16_batch_kernel(
         float v = x[offset + i];
         sum_sq += v * v;
     }
-    sdata[tid] = sum_sq;
+    // Warp-level reduction (no sync needed within warp)
+    for (int off = 32; off > 0; off >>= 1)
+        sum_sq += __shfl_xor(sum_sq, off, 64);
+    int warp_id = tid >> 6;
+    int lane = tid & 63;
+    if (lane == 0) sdata[warp_id] = sum_sq;
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        __syncthreads();
+    // Cross-warp reduction
+    if (tid < (blockDim.x >> 6)) {
+        sum_sq = sdata[tid];
+        for (int off = (blockDim.x >> 7); off > 0; off >>= 1)
+            sum_sq += __shfl_xor(sum_sq, off, 64);
+        if (tid == 0) sdata[0] = sum_sq;
     }
-    float rms = rsqrtf(sdata[0] / n + eps);
     __syncthreads();
+    float rms = rsqrtf(sdata[0] / n + eps);
 
     for (int i = tid; i < n; i += blockDim.x) {
         y[offset + i] = float_to_bf16(x[offset + i] * rms * weight[i]);
@@ -442,23 +450,33 @@ __global__ void add_rms_norm_bf16_batch_kernel(
     int tid = threadIdx.x;
     int offset = batch * n;
 
-    // Pass 1: add residual and compute sum of squares
+    // Pass 1: add residual, write back, compute sum of squares
+    // Use warp shuffles for first reduction level (no __syncthreads needed)
     float sum_sq = 0.0f;
     for (int i = tid; i < n; i += blockDim.x) {
         float v = x[offset + i] + residual[offset + i];
         x[offset + i] = v;  // write back sum for residual path
         sum_sq += v * v;
     }
-    sdata[tid] = sum_sq;
+    // Warp-level reduction first (no sync needed within warp)
+    for (int off = 32; off > 0; off >>= 1)
+        sum_sq += __shfl_xor(sum_sq, off, 64);
+    int warp_id = tid >> 6;
+    int lane = tid & 63;
+    if (lane == 0) sdata[warp_id] = sum_sq;
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        __syncthreads();
+    // Final reduction across warps (max 16 warps for 1024 threads)
+    if (tid < (blockDim.x >> 6)) {
+        sum_sq = sdata[tid];
+        for (int off = (blockDim.x >> 7); off > 0; off >>= 1)
+            sum_sq += __shfl_xor(sum_sq, off, 64);
+        if (tid == 0) sdata[0] = sum_sq;
     }
-    float rms = rsqrtf(sdata[0] / n + eps);
     __syncthreads();
+    float rms = rsqrtf(sdata[0] / n + eps);
 
     // Pass 2: normalize, scale, convert to BF16
+    // x[offset + i] was written in pass 1 — re-read from L2 (should be cached)
     for (int i = tid; i < n; i += blockDim.x) {
         y[offset + i] = float_to_bf16(x[offset + i] * rms * weight[i]);
     }
@@ -493,14 +511,16 @@ void launch_rms_norm_batch(const float* x, const float* weight, float* y,
 void launch_rms_norm_bf16_batch(const float* x, const float* weight, int16_t* y,
                                 int n, float eps, int batch_size, hipStream_t stream) {
     int threads = min(1024, n);
-    rms_norm_bf16_batch_kernel<<<batch_size, threads, threads * sizeof(float), stream>>>(
+    int smem = (threads / 64 + 1) * sizeof(float);  // warp-shuffle: only need warp count floats
+    rms_norm_bf16_batch_kernel<<<batch_size, threads, smem, stream>>>(
         x, weight, y, n, eps, batch_size);
 }
 
 void launch_add_rms_norm_bf16_batch(float* x, const float* residual, const float* weight,
                                      int16_t* y, int n, float eps, int batch_size, hipStream_t stream) {
     int threads = min(1024, n);
-    add_rms_norm_bf16_batch_kernel<<<batch_size, threads, threads * sizeof(float), stream>>>(
+    int smem = (threads / 64 + 1) * sizeof(float);
+    add_rms_norm_bf16_batch_kernel<<<batch_size, threads, smem, stream>>>(
         x, residual, weight, y, n, eps, batch_size);
 }
 
