@@ -35,6 +35,7 @@ extern "C" {
     int nv_launch_split12_v2_async(const void* sm, const void* gr, int base_exp, const void* act, void* out, int M, int K, void* stream);
     int nv_launch_patches_async(const void* row_off, const void* cols, const void* correct, const void* wrong, const void* act, void* out, int M, void* stream);
     int nv_launch_split12_gemm_tc_async(const void* sm, const void* gr, int base_exp, const void* act, int act_stride, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* out, int out_stride, int M, int K, int B, void* stream);
+    int nv_launch_split12_fused_gemm_async(const void* sm, const void* gr, int base_exp, const void* act, int act_stride, void* out, int out_stride, int M, int K, int B, void* stream);
     int nv_launch_split12_cublas_batch_async(const void* sm, const void* gr, int base_exp, const void* act, int act_stride, void* out, int out_stride, void* bf16_weight_buf, int buf_half_elems, int M, int K, int B, void* stream);
     int nv_launch_patches_batch_async(const void* row_off, const void* cols, const void* correct, const void* wrong, const void* act, int act_stride, void* out, int out_stride, int M, int B, void* stream);
     // Legacy per-row batch kernels
@@ -69,13 +70,10 @@ extern "C" {
 
 // NVIDIA tensor core GEMM: decode → shared mem → WMMA (sm_80+ Ampere/Hopper/Ada/Blackwell)
 #ifdef TURBO_NVIDIA
-#define TC_MATVEC(w, bf16_in, out_buf, n_in, n_out, bs, strm) do { \
+#define FUSED_MATVEC(w, bf16_in, out_buf, n_in, n_out, bs, strm) do { \
     if ((w).split_sm) { \
-        nv_launch_split12_gemm_tc_async((w).split_sm, (w).split_gr, (w).base_exp, \
-            bf16_in, n_in, \
-            (w).escape_row_base, (w).escape_counts, (w).escape_vals, \
-            out_buf, n_out, \
-            (w).M, (w).K, bs, strm); \
+        nv_launch_split12_fused_gemm_async((w).split_sm, (w).split_gr, (w).base_exp, \
+            bf16_in, n_in, out_buf, n_out, (w).M, (w).K, bs, strm); \
         if ((w).num_patches > 0 && (w).row_offsets) \
             nv_launch_patches_batch_async((w).row_offsets, (w).patch_cols, \
                 (w).patch_correct, (w).patch_wrong, \

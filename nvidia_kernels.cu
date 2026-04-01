@@ -417,6 +417,11 @@ __global__ void nv_apply_patches_batch(
 }
 
 // ============================================================
+// Fused Decode+GEMM via PTX mma.sync (ZipGEMM-inspired)
+// ============================================================
+#include "split12_gemm.cuh"
+
+// ============================================================
 // Decode + cuBLAS GEMM: fastest batch path
 // Step 1: Decode split12 weights to BF16 in a temp buffer (GPU kernel)
 // Step 2: cuBLAS BF16 GEMM (tensor cores, 176 TFLOPS)
@@ -502,7 +507,37 @@ int nv_launch_patches_batch_async(
     return 0;
 }
 
-// Batched tensor core GEMM
+// Fused decode+GEMM via PTX mma.sync (ZipGEMM-inspired, NO DRAM round-trip)
+int nv_launch_split12_fused_gemm_async(
+    const void* sm, const void* gr, int base_exp,
+    const void* act, int act_stride,
+    void* out, int out_stride,
+    int M, int K, int B, void* stream)
+{
+    // Activations need to be in [N × K] layout (col-major for B operand)
+    // Our activations are [B × K] with stride=act_stride=K, which is row-major
+    // For the fused kernel, B_matrix[n][k] = activations[n * K + k]
+    // Output: C[m][n] = sum_k(W[m][k] * A[n][k]), stored as C[m * N + n]
+    // But inference.cpp expects C[b * out_stride + m]... need to match layout
+
+    // TILE_N=16, WARP_COL_TENSORS=2 (each warp handles 2 MMA N-tiles of 8)
+    constexpr int TN = 16;
+    constexpr int WCT = 2;
+    dim3 grid((M + S12_TILE_M - 1) / S12_TILE_M, (B + TN - 1) / TN);
+
+    // Shared memory: sm_buf(2×64×64) + gr_buf(2×64×32) + B_buf(2×64×16×2)
+    int smem = S12_TILE_M * S12_TILE_K * 2
+             + S12_TILE_M * S12_TILE_K / 2 * 2
+             + S12_TILE_K * TN * sizeof(__nv_bfloat16) * 2;
+
+    split12_fused_gemm<TN, WCT><<<grid, S12_BLOCK, smem, (cudaStream_t)stream>>>(
+        (const uint8_t*)sm, (const uint8_t*)gr, base_exp,
+        (const __nv_bfloat16*)act, (float*)out, M, K, B);
+
+    return 0;
+}
+
+// Legacy batched tensor core GEMM (WMMA-based, slower)
 int nv_launch_split12_gemm_tc_async(
     const void* sm, const void* gr, int base_exp,
     const void* act, int act_stride,
