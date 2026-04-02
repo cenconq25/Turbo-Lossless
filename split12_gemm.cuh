@@ -19,9 +19,9 @@
 #define MMA_N 8
 #define MMA_K 16
 
-#define S12_TILE_M 64
-#define S12_TILE_K 64       // 4 K-slices of 16 — matches ZipServ
-#define S12_N_WARPS 4
+#define S12_TILE_M 128      // 8 warp rows × 16 — 2x compute parallelism
+#define S12_TILE_K 64       // 4 K-slices
+#define S12_N_WARPS 8       // 256 threads — 2x loading + compute throughput
 #define S12_BLOCK (S12_N_WARPS * 32)
 
 // ============================================================
@@ -181,46 +181,36 @@ __global__ void split12_fused_gemm(
         gr_r = gr_buf + br*S12_TILE_M*S12_TILE_K/2;
         B_r = B_buf + br*S12_TILE_K*S12_TILE_N;
 
-        // === INTERLEAVED K-slices (the ZipServ pattern) ===
+        // === GENERALIZED INTERLEAVED K-slices (ZipServ pattern) ===
+        // decode(slice i+1) → mma(slice i) — overlaps ALU with tensor core
+        // Works for any TILE_K (4 slices for TILE_K=64, 8 for 128, etc.)
+        #define N_SLICES (S12_TILE_K / MMA_K)
 
-        // Decode slice 1 → buf 1, THEN mma slice 0 from buf 0
-        decode_a_slice(a[1], sm_r, gr_r, r0, r1, twg, 1*MMA_K, base_exp);
         #pragma unroll
-        for(int n=0;n<WCT;n++){
-            const __nv_bfloat16* bp=B_r+(n*MMA_N+bg)*S12_TILE_K+1*MMA_K;
-            b[n][1][0]=*reinterpret_cast<const uint32_t*>(&bp[bt*2]);
-            b[n][1][1]=*reinterpret_cast<const uint32_t*>(&bp[8+bt*2]);
+        for (int ks = 1; ks < N_SLICES; ks++) {
+            int cur = ks % 2, prev = 1 - cur;
+            // Decode slice ks into buf[cur]
+            decode_a_slice(a[cur], sm_r, gr_r, r0, r1, twg, ks*MMA_K, base_exp);
+            #pragma unroll
+            for(int n=0;n<WCT;n++){
+                const __nv_bfloat16* bp=B_r+(n*MMA_N+bg)*S12_TILE_K+ks*MMA_K;
+                b[n][cur][0]=*reinterpret_cast<const uint32_t*>(&bp[bt*2]);
+                b[n][cur][1]=*reinterpret_cast<const uint32_t*>(&bp[8+bt*2]);
+            }
+            // MMA slice ks-1 from buf[prev]
+            #pragma unroll
+            for(int n=0;n<WCT;n++) mma_m16n8k16(c[n], a[prev], b[n][prev]);
         }
-        #pragma unroll
-        for(int n=0;n<WCT;n++) mma_m16n8k16(c[n], a[0], b[n][0]);
 
-        // Decode slice 2 → buf 0, mma slice 1 from buf 1
-        decode_a_slice(a[0], sm_r, gr_r, r0, r1, twg, 2*MMA_K, base_exp);
-        #pragma unroll
-        for(int n=0;n<WCT;n++){
-            const __nv_bfloat16* bp=B_r+(n*MMA_N+bg)*S12_TILE_K+2*MMA_K;
-            b[n][0][0]=*reinterpret_cast<const uint32_t*>(&bp[bt*2]);
-            b[n][0][1]=*reinterpret_cast<const uint32_t*>(&bp[8+bt*2]);
-        }
-        #pragma unroll
-        for(int n=0;n<WCT;n++) mma_m16n8k16(c[n], a[1], b[n][1]);
-
-        // Decode slice 3 → buf 1, mma slice 2 from buf 0
-        decode_a_slice(a[1], sm_r, gr_r, r0, r1, twg, 3*MMA_K, base_exp);
-        #pragma unroll
-        for(int n=0;n<WCT;n++){
-            const __nv_bfloat16* bp=B_r+(n*MMA_N+bg)*S12_TILE_K+3*MMA_K;
-            b[n][1][0]=*reinterpret_cast<const uint32_t*>(&bp[bt*2]);
-            b[n][1][1]=*reinterpret_cast<const uint32_t*>(&bp[8+bt*2]);
-        }
-        #pragma unroll
-        for(int n=0;n<WCT;n++) mma_m16n8k16(c[n], a[0], b[n][0]);
-
-        // Wait for cp.async of next tile, then sync, then mma last slice
+        // Wait for cp.async, sync, then compute last slice
         cp_async_wait<0>();
         __syncthreads();
-        #pragma unroll
-        for(int n=0;n<WCT;n++) mma_m16n8k16(c[n], a[1], b[n][1]);
+        {
+            int last = (N_SLICES - 1) % 2;
+            #pragma unroll
+            for(int n=0;n<WCT;n++) mma_m16n8k16(c[n], a[last], b[n][last]);
+        }
+        #undef N_SLICES
 
         // Pre-decode slice 0 of next tile
         if (tk + 1 < K / S12_TILE_K) {

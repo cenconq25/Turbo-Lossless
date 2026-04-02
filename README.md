@@ -69,12 +69,15 @@ B=8:  decode -> 8x FMA    (2.4x faster than BF16)
 
 | Batch | llama.cpp BF16 | vLLM BF16 | Turbo 12-bit | vs vLLM | Compression | VRAM |
 |------:|---------------:|----------:|-------------:|:-------:|:-----------:|-----:|
-| B=1 | 55.6 tok/s | 54.7 tok/s | **60 tok/s** | **1.09x** | **1.36x** | 13.5 vs **~10 GB** |
-| B=64 | — | 853 tok/s | **1291 tok/s** | **1.51x** | **1.36x** | **~10 GB** |
-| B=128 | — | 902 tok/s | **1367 tok/s** | **1.52x** | **1.36x** | **~10 GB** |
-| B=256 | — | — | **1388 tok/s** | — | **1.36x** | **~10 GB** |
+| B=1 | 55.6 tok/s | 54.7 tok/s | **64 tok/s** | **1.16x** | **1.36x** | 13.5 vs **~10 GB** |
+| B=8 | — | 414.6 tok/s | **170 tok/s** | — | **1.36x** | **~10 GB** |
+| B=16 | — | 687.9 tok/s | **671 tok/s** | — | **1.36x** | **~10 GB** |
+| B=32 | — | 694.2 tok/s | **1039 tok/s** | **1.50x** | **1.36x** | **~10 GB** |
+| B=64 | — | 853 tok/s | **1274 tok/s** | **1.49x** | **1.36x** | **~10 GB** |
+| B=128 | — | 902 tok/s | **1375 tok/s** | **1.52x** | **1.36x** | **~10 GB** |
+| B=256 | — | — | **1621 tok/s** | — | **1.36x** | **~10 GB** |
 
-**1.5x faster than vLLM** with 200-token generation. Fused decode+PTX tensor core GEMM with cp.async pipeline, ZipServ-style K-slice interleaving, direct decode-to-register (3 ALU ops), compact sparse patch correction. Uses **1.35x less VRAM**. 100% lossless.
+**1.5x faster than vLLM** with 200-token generation. Fused decode+PTX mma.sync with cp.async pipeline, ZipServ-derived K-slice interleaving, direct decode-to-register (3 ALU ops), compact sparse patch correction. 8 warps (256 threads), TILE_M=128. Uses **1.35x less VRAM**. 100% lossless.
 
 #### Llama 3.1 8B Instruct (8.03B params, escape rate 0.021%)
 

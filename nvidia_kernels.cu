@@ -298,23 +298,26 @@ int nv_launch_split12_fused_gemm_async(
     int M, int K, int B, void* stream)
 {
     // Adaptive TILE_N: TILE_N=32 optimal for B>=32
-    if (B >= 32) {
-        constexpr int TN = 32, WCT = 4;
+    auto launch = [&](auto TN_v, auto WCT_v) {
+        constexpr int TN = decltype(TN_v)::value, WCT = decltype(WCT_v)::value;
         dim3 grid((M + S12_TILE_M - 1) / S12_TILE_M, (B + TN - 1) / TN);
         int smem = S12_TILE_M * S12_TILE_K * 2 + S12_TILE_M * S12_TILE_K / 2 * 2
                  + S12_TILE_K * TN * sizeof(__nv_bfloat16) * 2;
+        // Request extended shared memory if needed (>48 KB)
+        static bool configured = false;
+        if (!configured && smem > 49152) {
+            cudaFuncSetAttribute(split12_fused_gemm<TN, WCT>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            configured = true;
+        }
         split12_fused_gemm<TN, WCT><<<grid, S12_BLOCK, smem, (cudaStream_t)stream>>>(
             (const uint8_t*)sm, (const uint8_t*)gr, base_exp,
             (const __nv_bfloat16*)act, (float*)out, M, K, B, out_stride);
-    } else {
-        constexpr int TN = 16, WCT = 2;
-        dim3 grid((M + S12_TILE_M - 1) / S12_TILE_M, (B + TN - 1) / TN);
-        int smem = S12_TILE_M * S12_TILE_K * 2 + S12_TILE_M * S12_TILE_K / 2 * 2
-                 + S12_TILE_K * TN * sizeof(__nv_bfloat16) * 2;
-        split12_fused_gemm<TN, WCT><<<grid, S12_BLOCK, smem, (cudaStream_t)stream>>>(
-            (const uint8_t*)sm, (const uint8_t*)gr, base_exp,
-            (const __nv_bfloat16*)act, (float*)out, M, K, B, out_stride);
-    }
+    };
+    if (B >= 32)
+        launch(std::integral_constant<int,32>{}, std::integral_constant<int,4>{});
+    else
+        launch(std::integral_constant<int,16>{}, std::integral_constant<int,2>{});
 
     return 0;
 }
