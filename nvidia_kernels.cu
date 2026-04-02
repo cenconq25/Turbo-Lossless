@@ -297,6 +297,7 @@ int nv_launch_split12_fused_gemm_async(
     const void* sm, const void* gr, int base_exp,
     const void* act, int act_stride,
     void* out, int out_stride,
+    // DEBUG: this function should be called for every GEMM tensor
     int M, int K, int B, void* stream,
     const void* patch_row_off, const void* patch_cols,
     const void* patch_correct, const void* patch_wrong)
@@ -382,22 +383,15 @@ int nv_launch_split12_fused_gemm_async(
             (const int16_t*)patch_correct, (const int16_t*)patch_wrong);
     };
 
-    // Kernel version selection
-    static int s_kernel_ver = -1;
-    if (s_kernel_ver < 0) {
-        const char* e = getenv("TURBO_KERNEL");
-        if (e && e[0] == '1') { s_kernel_ver = 1; printf("  GEMM: V1 kernel (8 warps, TM=128)\n"); }
-        else { s_kernel_ver = 2; printf("  GEMM: V2 high-occupancy kernel (4 warps, TM=64)\n"); }
-    }
 #endif
 
     // Kernel version selection
     static int s_kernel_ver = -1;
     if (s_kernel_ver < 0) {
         const char* e = getenv("TURBO_KERNEL");
-        if (e && e[0] == '3') { s_kernel_ver = 3; printf("  GEMM: V3 TMA kernel (separate CU)\n"); }
-        else if (e && e[0] == '1') { s_kernel_ver = 1; printf("  GEMM: V1 kernel (8 warps, TM=128)\n"); }
-        else { s_kernel_ver = 2; printf("  GEMM: V2 high-occupancy kernel (4 warps, TM=64)\n"); }
+        if (e && e[0] == '3') { s_kernel_ver = 3; printf("  GEMM: V3 TMA kernel\n"); }
+        else if (e && e[0] == '1') { s_kernel_ver = 1; printf("  GEMM: V1 kernel (8 warps)\n"); }
+        else { s_kernel_ver = 2; printf("  GEMM: V2 kernel (4 warps)\n"); }
     }
 
     if (s_kernel_ver == 3) {
