@@ -1,8 +1,12 @@
 /**
- * Split12 Fused Decode+GEMM v3 — TMA-accelerated kernel
- * Uses cp.async.bulk.tensor (TMA) for hardware-accelerated data loading.
- * Descriptors passed as device pointers (not __grid_constant__).
- * Same decode+MMA pipeline as V2 (4 warps, TILE_M=64, K-slice interleaving)
+ * Split12 Fused Decode+GEMM v3 — TMA-accelerated kernel for SM120
+ * Based on gau-nernst/learn-cuda/02c_matmul_sm120 (96% SOL on RTX 5090)
+ *
+ * Key patterns from working SM120 TMA code:
+ *   - elect.sync for TMA thread election
+ *   - fence.mbarrier_init.release.cluster after init
+ *   - mbarrier.try_wait.parity.acquire.cta with timeout
+ *   - cp.async.bulk.tensor.2d.shared::cta (not ::cluster)
  */
 
 #pragma once
@@ -15,6 +19,8 @@
 #define V3_TILE_K 64
 #define V3_N_WARPS 4
 #define V3_BLOCK (V3_N_WARPS * 32)
+
+__device__ __forceinline__ uint32_t s32(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
 
 __device__ __forceinline__ void v3_mma(uint32_t* C, const uint32_t* A, const uint32_t* B) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
@@ -30,12 +36,38 @@ __device__ __forceinline__ uint32_t v3_dec(uint8_t s0, uint8_t s1, uint8_t g0, u
     return ((uint32_t)b1<<16)|b0;
 }
 
-__device__ __forceinline__ uint32_t s32(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
+// elect.sync: returns 1 for exactly one thread in the warp (0 for others)
+__device__ __forceinline__ int elect_sync() {
+    int pred = 0;
+    asm volatile("{\n .reg .pred P;\n elect.sync _|P, 0xFFFFFFFF;\n @P mov.s32 %0, 1;\n}" : "+r"(pred));
+    return pred;
+}
+
+// mbarrier helpers matching gau-nernst's working SM120 patterns
+__device__ __forceinline__ void mbar_init(int addr, int count) {
+    asm volatile("mbarrier.init.shared.b64 [%0], %1;" :: "r"(addr), "r"(count) : "memory");
+}
+__device__ __forceinline__ void mbar_expect_tx(int addr, int size) {
+    asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+        :: "r"(addr), "r"(size) : "memory");
+}
+__device__ __forceinline__ void mbar_wait(int addr, int phase) {
+    int ticks = 0x989680;  // ~10ms timeout, same as gau-nernst
+    asm volatile("{\n .reg .pred P1;\n LAB_WAIT:\n"
+        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1, [%0], %1, %2;\n"
+        "@!P1 bra.uni LAB_WAIT;\n}" :: "r"(addr), "r"(phase), "r"(ticks));
+}
+
+// TMA load: shared::cta (not ::cluster)
+__device__ __forceinline__ void tma_g2s(int dst, const void* tmap, int x, int y, int mbar) {
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
+        :: "r"(dst), "l"(tmap), "r"(x), "r"(y), "r"(mbar) : "memory");
+}
 
 __device__ __forceinline__ void v3_decode_a(uint32_t a[4],
     const uint8_t* sm, const uint8_t* gr, int r0, int r1, int twg, int kk, int be)
 {
-    int k0 = kk + twg*2, k1 = kk + 8 + twg*2;
+    int k0=kk+twg*2, k1=kk+8+twg*2;
     const uint32_t* s0=(const uint32_t*)(sm+r0*V3_TILE_K);
     const uint32_t* s1=(const uint32_t*)(sm+r1*V3_TILE_K);
     uint32_t w0r0=s0[k0/4],w0r1=s1[k0/4],w1r0=s0[k1/4],w1r1=s1[k1/4];
@@ -51,7 +83,7 @@ __device__ __forceinline__ void v3_decode_a(uint32_t a[4],
 }
 
 template<int V3_TILE_N, int WCT>
-__launch_bounds__(V3_BLOCK, 3)
+__launch_bounds__(V3_BLOCK, 2)
 __global__ void split12_fused_gemm_v3(
     __grid_constant__ const CUtensorMap sm_tma,
     __grid_constant__ const CUtensorMap gr_tma,
@@ -70,11 +102,16 @@ __global__ void split12_fused_gemm_v3(
     uint8_t* gr_buf = sm_buf + V3_TILE_M * V3_TILE_K * 2;
     __nv_bfloat16* B_buf = (__nv_bfloat16*)(gr_buf + V3_TILE_M * V3_TILE_K / 2 * 2);
     constexpr int DSIZE = V3_TILE_M*V3_TILE_K*2 + V3_TILE_M*V3_TILE_K/2*2 + V3_TILE_K*V3_TILE_N*2*2;
-    uint64_t* mbar = (uint64_t*)(smem + ((DSIZE+7)&~7));
+    constexpr int MBAR_OFF = (DSIZE + 7) & ~7;
+    // mbar addresses (as uint32 shared memory offsets for PTX)
+    int mbar0 = s32(smem + MBAR_OFF);
+    int mbar1 = s32(smem + MBAR_OFF + 8);
 
-    if (tid == 0) {
-        asm volatile("mbarrier.init.shared.b64 [%0], %1;" :: "r"(s32(&mbar[0])), "r"(1) : "memory");
-        asm volatile("mbarrier.init.shared.b64 [%0], %1;" :: "r"(s32(&mbar[1])), "r"(1) : "memory");
+    // Init mbarriers — use elect.sync + fence (gau-nernst pattern)
+    if (warp_id == 0 && elect_sync()) {
+        mbar_init(mbar0, 1);
+        mbar_init(mbar1, 1);
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     __syncthreads();
 
@@ -83,29 +120,22 @@ __global__ void split12_fused_gemm_v3(
     for (int j=0; j<WCT; j++) c[j][0]=c[j][1]=c[j][2]=c[j][3]=0;
     int r0=warp_id*16+lane_id/4, r1=r0+8, twg=lane_id%4, bg=lane_id/4, bt=lane_id%4;
 
-    // TMA load: thread 0 issues, mbarrier tracks completion
-    #define V3_LOAD(stg, ks) do { if (tid==0) { \
-        uint32_t tx = V3_TILE_M*V3_TILE_K + V3_TILE_M*V3_TILE_K/2 + V3_TILE_K*V3_TILE_N*2; \
-        asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;" \
-            :: "r"(s32(&mbar[stg])), "r"(tx) : "memory"); \
-        asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];" \
-            :: "r"(s32(sm_buf+(stg)*V3_TILE_M*V3_TILE_K)), "l"(&sm_tma), "r"((int)(ks)), "r"(block_m), "r"(s32(&mbar[stg])) : "memory"); \
-        asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];" \
-            :: "r"(s32(gr_buf+(stg)*V3_TILE_M*V3_TILE_K/2)), "l"(&gr_tma), "r"((int)((ks)/2)), "r"(block_m), "r"(s32(&mbar[stg])) : "memory"); \
-        asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];" \
-            :: "r"(s32((uint8_t*)B_buf+(stg)*V3_TILE_K*V3_TILE_N*2)), "l"(&b_tma), "r"((int)(ks)), "r"(block_n), "r"(s32(&mbar[stg])) : "memory"); \
-    } } while(0)
-
-    #define V3_WAIT(stg, ph) do { \
-        uint32_t _d=0; while(!_d) { asm volatile("{\n\t .reg .pred P;\n\t" \
-            "mbarrier.try_wait.parity.shared::cta.b64 P, [%1], %2;\n\t" \
-            "selp.b32 %0, 1, 0, P;\n\t}" \
-            : "=r"(_d) : "r"(s32(&mbar[stg])), "r"(ph) : "memory"); } \
+    // TMA load macro: elect_sync thread issues, all participate
+    #define V3_LOAD(mbar_addr, stg, ks) do { \
+        if (warp_id == 0 && elect_sync()) { \
+            uint32_t tx = V3_TILE_M*V3_TILE_K + V3_TILE_M*V3_TILE_K/2 + V3_TILE_K*V3_TILE_N*2; \
+            mbar_expect_tx(mbar_addr, tx); \
+            tma_g2s(s32(sm_buf+(stg)*V3_TILE_M*V3_TILE_K), &sm_tma, (int)(ks), block_m, mbar_addr); \
+            tma_g2s(s32(gr_buf+(stg)*V3_TILE_M*V3_TILE_K/2), &gr_tma, (int)((ks)/2), block_m, mbar_addr); \
+            tma_g2s(s32((uint8_t*)B_buf+(stg)*V3_TILE_K*V3_TILE_N*2), &b_tma, (int)(ks), block_n, mbar_addr); \
+        } \
     } while(0)
 
-    int ph[2] = {0, 0};
-    V3_LOAD(0, 0);
-    V3_WAIT(0, ph[0]); ph[0]^=1;
+    int phase = 0;
+    V3_LOAD(mbar0, 0, 0);
+
+    // Wait for first tile (warp 0 waits, then sync all)
+    if (warp_id == 0) mbar_wait(mbar0, phase);
     __syncthreads();
 
     uint8_t *sm_r=sm_buf, *gr_r=gr_buf; __nv_bfloat16* B_r=B_buf;
@@ -117,13 +147,19 @@ __global__ void split12_fused_gemm_v3(
         b_reg[n][0][1]=*reinterpret_cast<const uint32_t*>(&bp[8+bt*2]);
     }
 
+    int num_k = K / V3_TILE_K;
+    int stage = 0;
     #pragma unroll(1)
-    for (int tk=0; tk < K/V3_TILE_K; tk++) {
-        int br=tk%2, bw=1-br;
-        if (tk+1 < K/V3_TILE_K) V3_LOAD(bw, (tk+1)*V3_TILE_K);
+    for (int tk=0; tk < num_k; tk++) {
+        int next_stage = 1 - stage;
+        int next_mbar = (stage == 0) ? mbar1 : mbar0;
 
-        sm_r=sm_buf+br*V3_TILE_M*V3_TILE_K; gr_r=gr_buf+br*V3_TILE_M*V3_TILE_K/2;
-        B_r=B_buf+br*V3_TILE_K*V3_TILE_N;
+        if (tk+1 < num_k)
+            V3_LOAD(next_mbar, next_stage, (tk+1)*V3_TILE_K);
+
+        sm_r=sm_buf+stage*V3_TILE_M*V3_TILE_K;
+        gr_r=gr_buf+stage*V3_TILE_M*V3_TILE_K/2;
+        B_r=B_buf+stage*V3_TILE_K*V3_TILE_N;
 
         #pragma unroll
         for (int ks=1; ks<V3_TILE_K/16; ks++) {
@@ -142,11 +178,14 @@ __global__ void split12_fused_gemm_v3(
           #pragma unroll
           for(int n=0;n<WCT;n++) v3_mma(c[n], a[last], b_reg[n][last]); }
 
-        if (tk+1 < K/V3_TILE_K) {
-            V3_WAIT(bw, ph[bw]); ph[bw]^=1;
+        if (tk+1 < num_k) {
+            int next_phase = (next_stage == 0 && stage == 1) ? (phase ^ 1) : phase;
+            if (warp_id == 0) mbar_wait(next_mbar, next_phase);
             __syncthreads();
-            sm_r=sm_buf+bw*V3_TILE_M*V3_TILE_K; gr_r=gr_buf+bw*V3_TILE_M*V3_TILE_K/2;
-            B_r=B_buf+bw*V3_TILE_K*V3_TILE_N;
+
+            sm_r=sm_buf+next_stage*V3_TILE_M*V3_TILE_K;
+            gr_r=gr_buf+next_stage*V3_TILE_M*V3_TILE_K/2;
+            B_r=B_buf+next_stage*V3_TILE_K*V3_TILE_N;
             v3_decode_a(a[0], sm_r, gr_r, r0, r1, twg, 0, base_exp);
             #pragma unroll
             for(int n=0;n<WCT;n++){
@@ -155,9 +194,11 @@ __global__ void split12_fused_gemm_v3(
                 b_reg[n][0][1]=*reinterpret_cast<const uint32_t*>(&bp[8+bt*2]);
             }
         }
+
+        stage = next_stage;
+        if (stage == 0) phase ^= 1;
     }
     #undef V3_LOAD
-    #undef V3_WAIT
 
     // Coalesced output
     { __syncthreads();
