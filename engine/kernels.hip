@@ -70,9 +70,10 @@ __global__ void rms_norm_kernel(
 // RoPE: Rotary Position Embeddings (with precomputed frequencies)
 // ============================================================
 
-// Precomputed frequency table on GPU (set once during init)
-static float* d_rope_freqs = nullptr;
-static int d_rope_freqs_dim = 0;
+// Precomputed frequency table on GPU (per-device for TP multi-GPU)
+static constexpr int MAX_DEVICES = 8;
+static float* d_rope_freqs[MAX_DEVICES] = {};
+static int d_rope_freqs_dim[MAX_DEVICES] = {};
 
 __global__ void rope_kernel(
     float* __restrict__ q,   // [n_head, head_dim]
@@ -213,15 +214,17 @@ void launch_rms_norm(const float* x, const float* weight, float* y,
 }
 
 void launch_rope_init(int head_dim, float theta_base) {
-    if (d_rope_freqs && d_rope_freqs_dim == head_dim) return;
+    int dev = 0;
+    GPU_CHECK(hipGetDevice(&dev));
+    if (d_rope_freqs[dev] && d_rope_freqs_dim[dev] == head_dim) return;
     int half_dim = head_dim / 2;
     float* h_freqs = new float[half_dim];
     for (int d = 0; d < half_dim; d++)
         h_freqs[d] = 1.0f / powf(theta_base, (float)(2 * d) / head_dim);
-    if (d_rope_freqs) hipFree(d_rope_freqs);
-    GPU_CHECK(hipMalloc(&d_rope_freqs, half_dim * sizeof(float)));
-    hipMemcpy(d_rope_freqs, h_freqs, half_dim * sizeof(float), hipMemcpyHostToDevice);
-    d_rope_freqs_dim = head_dim;
+    if (d_rope_freqs[dev]) hipFree(d_rope_freqs[dev]);
+    GPU_CHECK(hipMalloc(&d_rope_freqs[dev], half_dim * sizeof(float)));
+    hipMemcpy(d_rope_freqs[dev], h_freqs, half_dim * sizeof(float), hipMemcpyHostToDevice);
+    d_rope_freqs_dim[dev] = head_dim;
     delete[] h_freqs;
 }
 
@@ -232,7 +235,8 @@ void launch_rope(float* q, float* k, int head_dim, int n_head, int n_head_kv,
     int max_threads = max(n_head, n_head_kv) * half_dim;
     int threads = 256;
     int blocks = (max_threads + threads - 1) / threads;
-    rope_kernel<<<blocks, threads, 0, stream>>>(q, k, d_rope_freqs, head_dim, n_head, n_head_kv, position);
+    int dev = 0; GPU_CHECK(hipGetDevice(&dev));
+    rope_kernel<<<blocks, threads, 0, stream>>>(q, k, d_rope_freqs[dev], head_dim, n_head, n_head_kv, position);
 }
 
 void launch_embed_lookup(const int16_t* embd_table, const int* token_ids,
@@ -365,8 +369,9 @@ void launch_rope_store_kv(float* q, float* k, const float* v,
     int max_threads = max(rope_threads, kv_threads);
     int threads = 256;
     int blocks = (max_threads + threads - 1) / threads;
+    int dev = 0; GPU_CHECK(hipGetDevice(&dev));
     rope_store_kv_kernel<<<blocks, threads, 0, stream>>>(
-        q, k, v, kv_k, kv_v, d_rope_freqs,
+        q, k, v, kv_k, kv_v, d_rope_freqs[dev],
         head_dim, n_head, n_head_kv, position, max_seq);
 }
 
@@ -917,8 +922,9 @@ void launch_rope_batch(float* q, float* k, const int* positions,
     int half_dim = head_dim / 2;
     int max_threads = max(n_head, n_head_kv) * half_dim;
     dim3 grid((max_threads + 255) / 256, batch_size);
+    int dev = 0; GPU_CHECK(hipGetDevice(&dev));
     rope_batch_kernel<<<grid, 256, 0, stream>>>(
-        q, k, positions, d_rope_freqs, head_dim, n_head, n_head_kv, q_stride, k_stride);
+        q, k, positions, d_rope_freqs[dev], head_dim, n_head, n_head_kv, q_stride, k_stride);
 }
 
 void launch_store_kv_batch(const float* k, const float* v,

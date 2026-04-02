@@ -235,6 +235,7 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
     hipMemcpyAsync(state->d_tokens, token_ids, sizeof(int), hipMemcpyHostToDevice, stream);
     launch_embed_lookup(m->token_embd, state->d_tokens, state->hidden, n, 1, cfg.n_vocab, stream);
 
+
     // Ping-pong between hidden and hidden2 to avoid unnecessary copies
     float* cur = state->hidden;
     float* res = state->hidden2;
@@ -269,10 +270,14 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
             launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
         PROF_END_NORM(stream);
 
+
         PROF_START(stream);
         MATVEC_B1(L.wq, bf16_a, state->q_buf);
+
         MATVEC_B1(L.wk, bf16_a, state->k_buf);
+
         MATVEC_B1(L.wv, bf16_a, state->v_buf);
+
         PROF_END_MV(stream);
 
         PROF_START(stream);
@@ -281,6 +286,7 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
                              m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
                              head_dim, n_head_local, n_head_kv_local, pos,
                              m->max_seq_len, cfg.rope_theta, stream);
+
         if (pos < 1024)
             launch_attention_all_heads(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
                 bf16_a, n_head_local, n_head_kv_local, head_dim, pos+1, m->max_seq_len, scale, stream);
@@ -288,10 +294,12 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
             launch_flash_attention(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
                 bf16_a, n_head_local, n_head_kv_local, head_dim, pos+1, m->max_seq_len, scale, stream);
 
+
         PROF_END_ATTN(stream);
 
         PROF_START(stream);
         MATVEC_B1(L.wo, bf16_a, res);
+
         PROF_END_MV(stream);
         // TP: wo is column-split, output is partial sum — all-reduce to get full result
         if (state->tp)

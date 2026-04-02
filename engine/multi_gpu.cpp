@@ -93,12 +93,6 @@ void tp_allreduce_sum(float* buf, int count, TPState* tp, int rank, void* stream
 
 #if HAS_NCCL
     GPU_CHECK(hipSetDevice(tp->device_ids[rank]));
-    // Sync stream first to catch any prior kernel errors
-    cudaError_t sync_err = cudaStreamSynchronize((cudaStream_t)stream);
-    if (sync_err != cudaSuccess) {
-        fprintf(stderr, "CUDA kernel error before allreduce rank %d: %s\n", rank, cudaGetErrorString(sync_err));
-        exit(1);
-    }
     ncclComm_t comm = (ncclComm_t)tp->nccl_comms[rank];
     NCCL_CHECK(ncclAllReduce(
         (const void*)buf, (void*)buf, (size_t)count,
