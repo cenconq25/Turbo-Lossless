@@ -68,8 +68,15 @@ extern "C" {
 #ifdef TURBO_NVIDIA
 #define FUSED_MATVEC(w, bf16_in, out_buf, n_in, n_out, bs, strm) do { \
     if ((w).split_sm) { \
-        nv_launch_split12_fused_gemm_async((w).split_sm, (w).split_gr, (w).base_exp, \
-            bf16_in, n_in, out_buf, n_out, (w).M, (w).K, bs, strm); \
+        /* Hybrid: fused PTX for large tensors, cuBLAS for small ones */ \
+        if ((w).M >= 4096) { \
+            nv_launch_split12_fused_gemm_async((w).split_sm, (w).split_gr, (w).base_exp, \
+                bf16_in, n_in, out_buf, n_out, (w).M, (w).K, bs, strm); \
+        } else { \
+            nv_launch_split12_cublas_batch_async((w).split_sm, (w).split_gr, (w).base_exp, \
+                bf16_in, n_in, out_buf, n_out, state->weight_buf, state->weight_buf_half, \
+                (w).M, (w).K, bs, strm); \
+        } \
         if ((w).num_nonempty_rows > 0) \
             nv_launch_patches_batch_async((w).row_offsets, (w).patch_cols, \
                 (w).patch_correct, (w).patch_wrong, \
