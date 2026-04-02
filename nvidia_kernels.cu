@@ -231,6 +231,7 @@ __global__ void nv_apply_patches_batch(
 // Fused Decode+GEMM via PTX mma.sync (the main batched kernel)
 // ============================================================
 #include "split12_gemm.cuh"
+#include "split12_gemm_v2.cuh"
 
 // ============================================================
 // Launch wrappers
@@ -292,7 +293,42 @@ int nv_launch_split12_fused_gemm_async(
     const void* patch_row_off, const void* patch_cols,
     const void* patch_correct, const void* patch_wrong)
 {
-    // Adaptive TILE_N and TILE_K
+    // V2 high-occupancy kernel (4 warps, TILE_M=64, 2-3 blocks/SM)
+    auto launch_v2 = [&](auto TN_v, auto WCT_v) {
+        constexpr int TN = decltype(TN_v)::value, WCT = decltype(WCT_v)::value;
+        dim3 grid((B + TN - 1) / TN, (M + V2_TILE_M - 1) / V2_TILE_M);
+        int smem = V2_TILE_M * V2_TILE_K * 2 + V2_TILE_M * V2_TILE_K / 2 * 2
+                 + V2_TILE_K * TN * (int)sizeof(__nv_bfloat16) * 2;
+        static bool cfg2 = false;
+        if (!cfg2 && smem > 49152) {
+            cudaFuncSetAttribute(split12_fused_gemm_v2<TN, WCT>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            cfg2 = true;
+        }
+        split12_fused_gemm_v2<TN, WCT><<<grid, V2_BLOCK, smem, (cudaStream_t)stream>>>(
+            (const uint8_t*)sm, (const uint8_t*)gr, base_exp,
+            (const __nv_bfloat16*)act, (float*)out, M, K, B, out_stride,
+            (const int32_t*)patch_row_off, (const int32_t*)patch_cols,
+            (const int16_t*)patch_correct, (const int16_t*)patch_wrong);
+    };
+
+    // Check env for V2 toggle
+    static int s_use_v2 = -1;
+    if (s_use_v2 < 0) {
+        const char* e = getenv("TURBO_V2");
+        s_use_v2 = (!e || e[0] != '0') ? 1 : 0;  // V2 on by default
+        if (s_use_v2) printf("  GEMM: V2 high-occupancy kernel (4 warps, TM=64)\n");
+        else printf("  GEMM: V1 kernel (8 warps, TM=128)\n");
+    }
+
+    if (s_use_v2) {
+        if (B >= 128) launch_v2(std::integral_constant<int,64>{}, std::integral_constant<int,8>{});
+        else if (B >= 32) launch_v2(std::integral_constant<int,32>{}, std::integral_constant<int,4>{});
+        else launch_v2(std::integral_constant<int,16>{}, std::integral_constant<int,2>{});
+        return 0;
+    }
+
+    // V1 fallback: Adaptive TILE_N and TILE_K
     auto launch = [&](auto TN_v, auto WCT_v, auto TK_v) {
         constexpr int TN = decltype(TN_v)::value, WCT = decltype(WCT_v)::value;
         constexpr int TK = decltype(TK_v)::value;
