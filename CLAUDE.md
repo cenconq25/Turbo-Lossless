@@ -41,7 +41,7 @@ CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./turbo-engine <model_dir> "<prompt>" <max_t
 | `TURBO_FAST=1` | Pre-computed escape counts (+10% speed, +361 MB VRAM) |
 | `TURBO_CTX=N` | Max context length (default 2048) |
 | `TURBO_PROFILE=1` | Print per-token timing: matvec/attn/norm/silu breakdown |
-| `TURBO_KERNEL=1\|2\|3` | NVIDIA kernel: 1=V1, **2=V2 cp.async** (recommended), 3=V3 TMA (Mistral only) |
+| `TURBO_KERNEL=1\|2\|3` | NVIDIA kernel: 1=V1, 2=V2 cp.async, **3=V3 TMA** (default, auto-selects B>=64) |
 | `TURBO_CUBLAS=1` | Force cuBLAS path for all tensors (debug) |
 
 ## Current Results
@@ -60,20 +60,18 @@ CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./turbo-engine <model_dir> "<prompt>" <max_t
 | B=128 | 2196.6 | ~10 GB | 2.33x |
 | **B=256** | **2553.5** | **~10 GB** | **2.93x** |
 
-#### Llama 3.1 8B Instruct (V2 kernel, TURBO_KERNEL=2)
+#### Llama 3.1 8B Instruct (V3 TMA for B>=64, V2 for B<64)
 
 | Mode | tok/s total | VRAM | Notes |
 |------|------------:|-----:|:------|
 | B=1 | 57.0 | ~10.5 GB | vLLM OOM |
-| B=4 | 113.7 | ~10.5 GB | vLLM OOM |
+| B=4 | 113.5 | ~10.5 GB | vLLM OOM |
 | B=8 | 154.3 | ~10.5 GB | vLLM OOM |
-| B=16 | 627.1 | ~10.5 GB | vLLM OOM |
-| B=32 | 1069.5 | ~10.5 GB | vLLM OOM |
-| B=64 | 1359.1 | ~10.5 GB | vLLM OOM |
-| B=128 | 1594.7 | ~10.5 GB | vLLM OOM |
-| **B=256** | **1673.9** | **~10.5 GB** | **vLLM OOM** |
-
-**Note:** V3 TMA produces incorrect output for Llama 3.1 8B — use `TURBO_KERNEL=2`.
+| B=16 | 627.5 | ~10.5 GB | vLLM OOM |
+| B=32 | 1068.6 | ~10.5 GB | vLLM OOM |
+| B=64 | 1438.6 | ~10.5 GB | vLLM OOM |
+| B=128 | 2110.8 | ~10.5 GB | vLLM OOM |
+| **B=256** | **2470.7** | **~10.5 GB** | **vLLM OOM** |
 
 ### MI50 32GB (AMD GCN, 1.0 TB/s)
 
@@ -90,7 +88,7 @@ CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./turbo-engine <model_dir> "<prompt>" <max_t
 | Model | tok/s B=1 (RTX 5070 Ti) | tok/s B=1 (MI50) | Tokenizer | Status |
 |-------|------------------------:|-----------------:|-----------|--------|
 | Mistral 7B Instruct | 60.0 | 32.6 | sentencepiece | Production (V2+V3) |
-| Llama 3.1 8B Instruct | 57.0 | 31.8 | HF BPE | Production (V2 only, V3 TMA broken) |
+| Llama 3.1 8B Instruct | 57.0 | 31.8 | HF BPE | Production (V2+V3) |
 
 ### Compression
 
@@ -263,11 +261,11 @@ Example: `4096 4096 5358 107`
 | Single accumulator B=8 | +3% B=8 | Saves 8 VGPRs, reduces register pressure |
 | Batched argmax | +0.5% B=8 | 1 launch for all sequences |
 
-## Known Issues
+## Known Issues (All Fixed)
 
-| Issue | Status | Workaround |
-|-------|--------|------------|
-| V3 TMA produces garbage for Llama 3.1 8B | Open | Use `TURBO_KERNEL=2` (V2 cp.async) |
+| Issue | Status | Fix |
+|-------|--------|-----|
+| V3 TMA garbage for large-vocab models (Llama 128K vocab) | **Fixed** | cuBLAS weight_buf was over-allocated (~2GB), causing V3 OOM. Now dynamically scans all weights |
 | forward_b1/b4/b8 used stream=0 (race with sampling) | **Fixed** | Changed to `state->stream` (2026-04-02) |
 
 ## Tested and Rejected

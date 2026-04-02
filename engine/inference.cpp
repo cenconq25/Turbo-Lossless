@@ -137,10 +137,27 @@ InferenceState* create_inference_state(Model* model, int batch_size, int max_seq
     hipStreamCreateWithFlags(&s->stream2, hipStreamNonBlocking);
     hipEventCreateWithFlags(&s->sync_event, hipEventDisableTiming);
 #ifdef TURBO_NVIDIA
-    // Ping-pong BF16 buffers for decode+cuBLAS: 2 × largest weight tensor
-    int max_M = std::max(n_ff, n_vocab);
-    s->weight_buf_half = max_M * n;  // elements per half-buffer
-    hipMalloc(&s->weight_buf, (size_t)s->weight_buf_half * 2 * sizeof(int16_t));
+    // Ping-pong BF16 buffers for decode+cuBLAS: only needed for weights with M < 4096
+    // Fused GEMM handles M >= 4096 without materializing BF16 weights
+    // Scan all weights to find the largest M*K that routes to cuBLAS
+    {
+        size_t max_cublas_elems = 0;
+        auto check = [&](const CompressedWeight& w) {
+            if (w.split_sm && w.M < 4096)
+                max_cublas_elems = std::max(max_cublas_elems, (size_t)w.M * w.K);
+        };
+        for (int i = 0; i < model->config.n_layer; i++) {
+            auto& L = model->layers[i];
+            check(L.wq); check(L.wk); check(L.wv); check(L.wo);
+            check(L.w_gate); check(L.w_up); check(L.w_down);
+        }
+        check(model->output_proj);
+        s->weight_buf_half = max_cublas_elems;
+        if (max_cublas_elems > 0)
+            hipMalloc(&s->weight_buf, max_cublas_elems * 2 * sizeof(int16_t));
+        else
+            s->weight_buf = nullptr;
+    }
 #endif
     init_sampler(batch_size);
     return s;

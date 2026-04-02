@@ -84,15 +84,15 @@ B=8:  decode -> 8x FMA    (2.4x faster than BF16)
 | Batch | Kernel | vLLM BF16 | Turbo 12-bit | Compression | VRAM |
 |------:|:------:|----------:|-------------:|:-----------:|-----:|
 | B=1 | V2 | OOM | **57.0 tok/s** | **1.42x** | 15.0 vs **~10.5 GB** |
-| B=4 | V2 | OOM | **113.7 tok/s** | **1.42x** | **~10.5 GB** |
+| B=4 | V2 | OOM | **113.5 tok/s** | **1.42x** | **~10.5 GB** |
 | B=8 | V2 | OOM | **154.3 tok/s** | **1.42x** | **~10.5 GB** |
-| B=16 | V2 | OOM | **627.1 tok/s** | **1.42x** | **~10.5 GB** |
-| B=32 | V2 | OOM | **1069.5 tok/s** | **1.42x** | **~10.5 GB** |
-| B=64 | V2 | OOM | **1359.1 tok/s** | **1.42x** | **~10.5 GB** |
-| B=128 | V2 | OOM | **1594.7 tok/s** | **1.42x** | **~10.5 GB** |
-| B=256 | V2 | OOM | **1673.9 tok/s** | **1.42x** | **~10.5 GB** |
+| B=16 | V2 | OOM | **627.5 tok/s** | **1.42x** | **~10.5 GB** |
+| B=32 | V2 | OOM | **1068.6 tok/s** | **1.42x** | **~10.5 GB** |
+| B=64 | V3 TMA | OOM | **1438.6 tok/s** | **1.42x** | **~10.5 GB** |
+| B=128 | V3 TMA | OOM | **2110.8 tok/s** | **1.42x** | **~10.5 GB** |
+| B=256 | V3 TMA | OOM | **2470.7 tok/s** | **1.42x** | **~10.5 GB** |
 
-vLLM **cannot load** Llama 3.1 8B BF16 on a 16GB card (needs ~16 GB weights + overhead). Turbo runs it comfortably at **~10.5 GB** with room to spare. V3 TMA produces incorrect output for Llama 3.1 8B — use V2 (`TURBO_KERNEL=2`). No OOM up to B=1024.
+vLLM **cannot load** Llama 3.1 8B BF16 on a 16GB card (needs ~16 GB weights + overhead). Turbo runs it comfortably at **~10.5 GB** with room to spare. **2471 tok/s** at B=256 with V3 TMA. No OOM up to B=1024.
 
 ### MI50 32GB (AMD GCN, 1.0 TB/s)
 
@@ -159,18 +159,18 @@ CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./turbo-engine models/mistral-7b-instruct-tu
 | `TURBO_FAST=1` | Pre-computed escape counts (+10% speed, +361 MB VRAM) |
 | `TURBO_CTX=N` | Max context length (default 2048) |
 | `TURBO_PROFILE=1` | Print per-token timing breakdown |
-| `TURBO_KERNEL=1\|2\|3` | NVIDIA kernel version: 1=baseline, **2=V2 cp.async** (recommended), 3=V3 TMA (Mistral only) |
+| `TURBO_KERNEL=1\|2\|3` | NVIDIA kernel version: 1=V1 baseline, 2=V2 cp.async, **3=V3 TMA** (default, auto B>=64) |
 | `TURBO_CUBLAS=1` | Force cuBLAS path for all tensors (debug/comparison) |
 
 #### Kernel Selection Guide (NVIDIA)
 
 | Kernel | Best For | Notes |
 |--------|----------|-------|
-| **V2** (`TURBO_KERNEL=2`) | All models, all batch sizes | Recommended default. cp.async pipeline, 4 warps, high occupancy |
-| **V3** (`TURBO_KERNEL=3`) | Mistral 7B at B>=64 | TMA hardware loads (Blackwell SM120). Faster than V2 for Mistral but produces incorrect output for Llama 3.1 8B |
+| **V2** (`TURBO_KERNEL=2`) | All models, B < 64 | cp.async pipeline, 4 warps, high occupancy. Auto-selected for B<64 |
+| **V3** (`TURBO_KERNEL=3`) | All models, B >= 64 | TMA hardware loads (Blackwell SM120). Auto-selected for B>=64 |
 | **V1** (`TURBO_KERNEL=1`) | Fallback | 8 warps, TILE_M=128. Lower occupancy than V2 |
 
-Default: V3 auto-selects for B>=64, V2 for B<64. Override with `TURBO_KERNEL=2` for Llama models.
+Default: V3 auto-selects for B>=64, V2 for B<64. No manual override needed.
 
 ---
 
