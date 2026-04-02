@@ -66,10 +66,18 @@ extern "C" {
 
 // NVIDIA tensor core GEMM: decode → shared mem → WMMA (sm_80+ Ampere/Hopper/Ada/Blackwell)
 #ifdef TURBO_NVIDIA
+static int s_force_cublas = -1;
+static void check_force_cublas() {
+    if (s_force_cublas < 0) {
+        const char* e = getenv("TURBO_CUBLAS");
+        s_force_cublas = (e && e[0] == '1') ? 1 : 0;
+        if (s_force_cublas) printf("  TURBO_CUBLAS=1: all tensors use cuBLAS path\n");
+    }
+}
 #define FUSED_MATVEC(w, bf16_in, out_buf, n_in, n_out, bs, strm) do { \
     if ((w).split_sm) { \
-        /* Hybrid: fused PTX for large tensors, cuBLAS for small ones */ \
-        if ((w).M >= 4096) { \
+        /* Route through fused or cuBLAS based on TURBO_CUBLAS env */ \
+        if ((w).M >= 4096 && !s_force_cublas) { \
             nv_launch_split12_fused_gemm_async((w).split_sm, (w).split_gr, (w).base_exp, \
                 bf16_in, n_in, out_buf, n_out, (w).M, (w).K, bs, strm, \
                 nullptr, nullptr, nullptr, nullptr); \
@@ -125,7 +133,7 @@ InferenceState* create_inference_state(Model* model, int batch_size, int max_seq
     int max_act = std::max(n, n_ff);
     hipMalloc(&s->bf16_act,  bs * max_act * sizeof(int16_t));
     hipMalloc(&s->bf16_act2, bs * max_act * sizeof(int16_t));
-    s->stream = 0;
+    hipStreamCreateWithFlags(&s->stream, hipStreamNonBlocking);
     hipStreamCreateWithFlags(&s->stream2, hipStreamNonBlocking);
     hipEventCreateWithFlags(&s->sync_event, hipEventDisableTiming);
 #ifdef TURBO_NVIDIA
@@ -540,19 +548,57 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
     for (int s = 0; s < BS; s++) state->positions[s]++;
 }
 
-// NVIDIA tiled batch forward: handles any B>=2 in a single pass per weight tensor
+// NVIDIA tiled batch forward with stream overlap:
+// GEMM on stream1, patches on stream2 (patches hidden behind next GEMM)
 #ifdef TURBO_NVIDIA
+
+// Launch GEMM only (no patches) on the main stream
+#define GEMM_ONLY(w, bf16_in, out_buf, n_in, n_out, bs, strm) do { \
+    if ((w).split_sm) { \
+        if ((w).M >= 4096) { \
+            nv_launch_split12_fused_gemm_async((w).split_sm, (w).split_gr, (w).base_exp, \
+                bf16_in, n_in, out_buf, n_out, (w).M, (w).K, bs, strm, \
+                nullptr, nullptr, nullptr, nullptr); \
+        } else { \
+            nv_launch_split12_cublas_batch_async((w).split_sm, (w).split_gr, (w).base_exp, \
+                bf16_in, n_in, out_buf, n_out, state->weight_buf, state->weight_buf_half, \
+                (w).M, (w).K, bs, strm); \
+        } \
+    } \
+} while(0)
+
+// Launch patches on stream2, after GEMM finishes on stream1
+#define PATCHES_ASYNC(w, bf16_in, out_buf, n_in, n_out, bs, s1, s2, ev) do { \
+    if ((w).split_sm && (w).num_nonempty_rows > 0) { \
+        hipEventRecord(ev, s1); \
+        hipStreamWaitEvent(s2, ev, 0); \
+        nv_launch_patches_batch_async((w).row_offsets, (w).patch_cols, \
+            (w).patch_correct, (w).patch_wrong, \
+            (w).patch_nonempty_rows, (w).num_nonempty_rows, \
+            bf16_in, n_in, out_buf, n_out, bs, s2); \
+    } \
+} while(0)
+
+// Sync: ensure stream2 patches are done before consuming the output
+#define SYNC_PATCHES(s1, s2, ev) do { \
+    hipEventRecord(ev, s2); \
+    hipStreamWaitEvent(s1, ev, 0); \
+} while(0)
+
 static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
+    check_force_cublas();
     Model* m = state->model;
     auto& cfg = m->config;
-    hipStream_t stream = 0;
+    hipStream_t s1 = state->stream;      // main compute stream
+    hipStream_t s2 = state->stream2;     // patch correction stream
+    hipEvent_t ev = state->sync_event;
     int n = cfg.n_embd, n_ff = cfg.n_ff, head_dim = n / cfg.n_head;
     int kv_dim = cfg.n_head_kv * head_dim;
     int BS = state->batch_size;
 
-    hipMemcpyAsync(state->d_positions, state->positions, BS * sizeof(int), hipMemcpyHostToDevice, stream);
-    hipMemcpyAsync(state->d_tokens, token_ids, BS * sizeof(int), hipMemcpyHostToDevice, stream);
-    launch_embed_lookup(m->token_embd, state->d_tokens, state->hidden, n, BS, cfg.n_vocab, stream);
+    hipMemcpyAsync(state->d_positions, state->positions, BS * sizeof(int), hipMemcpyHostToDevice, s1);
+    hipMemcpyAsync(state->d_tokens, token_ids, BS * sizeof(int), hipMemcpyHostToDevice, s1);
+    launch_embed_lookup(m->token_embd, state->d_tokens, state->hidden, n, BS, cfg.n_vocab, s1);
 
     float* cur = state->hidden;
     float* res = state->hidden2;
@@ -564,46 +610,75 @@ static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
         auto& L = m->layers[layer];
 
         if (layer == 0)
-            launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
+            launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, s1);
 
-        FUSED_MATVEC(L.wq, bf16_a, state->q_buf, n, n, BS, stream);
-        FUSED_MATVEC(L.wk, bf16_a, state->k_buf, n, kv_dim, BS, stream);
-        FUSED_MATVEC(L.wv, bf16_a, state->v_buf, n, kv_dim, BS, stream);
+        // wq/wk/wv: GEMM on s1, patches on s2 (overlapped with next GEMM)
+        GEMM_ONLY(L.wq, bf16_a, state->q_buf, n, n, BS, s1);
+        PATCHES_ASYNC(L.wq, bf16_a, state->q_buf, n, n, BS, s1, s2, ev);
+        GEMM_ONLY(L.wk, bf16_a, state->k_buf, n, kv_dim, BS, s1);
+        PATCHES_ASYNC(L.wk, bf16_a, state->k_buf, n, kv_dim, BS, s1, s2, ev);
+        GEMM_ONLY(L.wv, bf16_a, state->v_buf, n, kv_dim, BS, s1);
+        PATCHES_ASYNC(L.wv, bf16_a, state->v_buf, n, kv_dim, BS, s1, s2, ev);
+
+        // Sync patches before consuming q/k/v
+        SYNC_PATCHES(s1, s2, ev);
 
         size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
         launch_rope_batch(state->q_buf, state->k_buf, state->d_positions,
-                          head_dim, cfg.n_head, cfg.n_head_kv, n, kv_dim, cfg.rope_theta, BS, stream);
+                          head_dim, cfg.n_head, cfg.n_head_kv, n, kv_dim, cfg.rope_theta, BS, s1);
         launch_store_kv_batch(state->k_buf, state->v_buf,
                               m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
-                              state->d_positions, kv_dim, m->max_seq_len, BS, stream);
+                              state->d_positions, kv_dim, m->max_seq_len, BS, s1);
 
         int max_pos = 0;
         for (int s = 0; s < BS; s++) max_pos = std::max(max_pos, state->positions[s]);
         if (max_pos < 1024)
             launch_attention_all_heads_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
                 bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
-                max_pos + 1, scale, BS, 0, stream);
+                max_pos + 1, scale, BS, 0, s1);
         else
             launch_flash_attention_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
                 bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
-                max_pos + 1, scale, BS, 0, stream);
+                max_pos + 1, scale, BS, 0, s1);
 
-        FUSED_MATVEC(L.wo, bf16_a, res, n, n, BS, stream);
-        launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
-        FUSED_MATVEC(L.w_gate, bf16_a, state->ffn_gate, n, n_ff, BS, stream);
-        FUSED_MATVEC(L.w_up, bf16_a, state->ffn_up, n, n_ff, BS, stream);
-        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, BS, stream);
-        FUSED_MATVEC(L.w_down, bf16_b, cur, n_ff, n, BS, stream);
+        // wo: GEMM + patches (patches must finish before add_rms_norm reads res)
+        GEMM_ONLY(L.wo, bf16_a, res, n, n, BS, s1);
+        PATCHES_ASYNC(L.wo, bf16_a, res, n, n, BS, s1, s2, ev);
+        SYNC_PATCHES(s1, s2, ev);
+
+        launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, s1);
+
+        // w_gate + w_up: patches overlap with next GEMM
+        GEMM_ONLY(L.w_gate, bf16_a, state->ffn_gate, n, n_ff, BS, s1);
+        PATCHES_ASYNC(L.w_gate, bf16_a, state->ffn_gate, n, n_ff, BS, s1, s2, ev);
+        GEMM_ONLY(L.w_up, bf16_a, state->ffn_up, n, n_ff, BS, s1);
+        PATCHES_ASYNC(L.w_up, bf16_a, state->ffn_up, n, n_ff, BS, s1, s2, ev);
+
+        // Sync patches before silu_mul consumes gate+up
+        SYNC_PATCHES(s1, s2, ev);
+        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, BS, s1);
+
+        // w_down: patches must finish before add_rms_norm
+        GEMM_ONLY(L.w_down, bf16_b, cur, n_ff, n, BS, s1);
+        PATCHES_ASYNC(L.w_down, bf16_b, cur, n_ff, n, BS, s1, s2, ev);
+        SYNC_PATCHES(s1, s2, ev);
 
         if (layer + 1 < cfg.n_layer)
-            launch_add_rms_norm_bf16_batch(cur, res, m->layers[layer + 1].attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
+            launch_add_rms_norm_bf16_batch(cur, res, m->layers[layer + 1].attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, s1);
         else
-            launch_add_rms_norm_bf16_batch(cur, res, m->output_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
+            launch_add_rms_norm_bf16_batch(cur, res, m->output_norm, bf16_a, n, cfg.rms_norm_eps, BS, s1);
     }
 
-    FUSED_MATVEC(m->output_proj, bf16_a, state->logits, n, cfg.n_vocab, BS, stream);
+    // output_proj: patches must finish before argmax
+    GEMM_ONLY(m->output_proj, bf16_a, state->logits, n, cfg.n_vocab, BS, s1);
+    PATCHES_ASYNC(m->output_proj, bf16_a, state->logits, n, cfg.n_vocab, BS, s1, s2, ev);
+    SYNC_PATCHES(s1, s2, ev);
+
     for (int s = 0; s < BS; s++) state->positions[s]++;
 }
+#undef GEMM_ONLY
+#undef PATCHES_ASYNC
+#undef SYNC_PATCHES
 #endif
 
 void forward(InferenceState* state, const int* token_ids) {

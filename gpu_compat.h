@@ -54,6 +54,7 @@
 #define hipEventDisableTiming    cudaEventDisableTiming
 #define hipEventDestroy          cudaEventDestroy
 #define hipEventRecord           cudaEventRecord
+#define hipStreamWaitEvent       cudaStreamWaitEvent
 #define hipEventSynchronize      cudaEventSynchronize
 #define hipEventElapsedTime      cudaEventElapsedTime
 
