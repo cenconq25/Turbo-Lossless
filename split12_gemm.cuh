@@ -25,8 +25,22 @@
 #define S12_BLOCK (S12_N_WARPS * 32)
 
 // ============================================================
-// PTX helpers
+// PTX helpers + cp.async for DRAM→shared memory pipeline
 // ============================================================
+
+// cp.async: copy 16 bytes from global to shared without touching registers
+__device__ __forceinline__
+void cp_async_16(void* smem_ptr, const void* global_ptr) {
+    uint32_t addr = __cvta_generic_to_shared(smem_ptr);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(addr), "l"(global_ptr));
+}
+__device__ __forceinline__ void cp_async_commit() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+template<int N>
+__device__ __forceinline__ void cp_async_wait() {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+}
 __device__ __forceinline__
 void mma_m16n8k16(uint32_t* C, const uint32_t* A, const uint32_t* B) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
@@ -117,22 +131,24 @@ __global__ void split12_fused_gemm(
     int twg = lane_id % 4;
     int bg = lane_id/4, bt = lane_id%4;
 
-    // Vectorized tile load macros
-    #define VL_SM(dst, ks) do { uint4* _d=(uint4*)(dst); \
+    // cp.async tile load macros: DRAM → shared memory bypassing registers
+    #define VL_SM(dst, ks) do { \
         for(int _i=tid;_i<S12_TILE_M*S12_TILE_K/16;_i+=S12_BLOCK){ \
         int _b=_i*16,_m=_b/S12_TILE_K,_k=_b%S12_TILE_K; \
-        _d[_i]=*((const uint4*)(sign_mantissa+(int64_t)(block_m+_m)*K+(ks)+_k));} }while(0)
-    #define VL_GR(dst, ks) do { uint4* _d=(uint4*)(dst); \
+        cp_async_16((uint8_t*)(dst)+_i*16, sign_mantissa+(int64_t)(block_m+_m)*K+(ks)+_k);} }while(0)
+    #define VL_GR(dst, ks) do { \
         for(int _i=tid;_i<S12_TILE_M*S12_TILE_K/2/16;_i+=S12_BLOCK){ \
         int _b=_i*16,_m=_b/(S12_TILE_K/2),_k=_b%(S12_TILE_K/2); \
-        _d[_i]=*((const uint4*)(groups+(int64_t)(block_m+_m)*K/2+(ks)/2+_k));} }while(0)
-    #define VL_B(dst, ks) do { uint4* _d=(uint4*)(dst); \
+        cp_async_16((uint8_t*)(dst)+_i*16, groups+(int64_t)(block_m+_m)*K/2+(ks)/2+_k);} }while(0)
+    #define VL_B(dst, ks) do { \
         for(int _i=tid;_i<S12_TILE_K*S12_TILE_N*2/16;_i+=S12_BLOCK){ \
         int _b=_i*16,_e=_b/2,_n=_e/S12_TILE_K,_k=_e%S12_TILE_K; \
-        _d[_i]=*((const uint4*)(B_matrix+(int64_t)(block_n+_n)*K+(ks)+_k));} }while(0)
+        cp_async_16((uint8_t*)(dst)+_i*16, B_matrix+(int64_t)(block_n+_n)*K+(ks)+_k);} }while(0)
 
-    // Load first tile
+    // Load first tile via cp.async
     VL_SM(sm_buf, 0); VL_GR(gr_buf, 0); VL_B(B_buf, 0);
+    cp_async_commit();
+    cp_async_wait<0>();
     __syncthreads();
 
     // Pre-decode slice 0 into buffer 0
@@ -152,12 +168,13 @@ __global__ void split12_fused_gemm(
     for (int tk = 0; tk < K / S12_TILE_K; tk++) {
         int br = tk % 2, bw = 1 - br;
 
-        // Async load next tile
+        // cp.async load next tile (runs in background during compute below!)
         if (tk + 1 < K / S12_TILE_K) {
             int kn = (tk+1)*S12_TILE_K;
             VL_SM(sm_buf+bw*S12_TILE_M*S12_TILE_K, kn);
             VL_GR(gr_buf+bw*S12_TILE_M*S12_TILE_K/2, kn);
             VL_B(B_buf+bw*S12_TILE_K*S12_TILE_N, kn);
+            cp_async_commit();
         }
 
         sm_r = sm_buf + br*S12_TILE_M*S12_TILE_K;
@@ -199,7 +216,8 @@ __global__ void split12_fused_gemm(
         #pragma unroll
         for(int n=0;n<WCT;n++) mma_m16n8k16(c[n], a[0], b[n][0]);
 
-        // Sync for next tile, then mma last slice
+        // Wait for cp.async of next tile, then sync, then mma last slice
+        cp_async_wait<0>();
         __syncthreads();
         #pragma unroll
         for(int n=0;n<WCT;n++) mma_m16n8k16(c[n], a[1], b[n][1]);
