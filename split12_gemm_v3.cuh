@@ -58,9 +58,9 @@ __device__ __forceinline__ void mbar_wait(int addr, int phase) {
         "@!P1 bra.uni LAB_WAIT;\n}" :: "r"(addr), "r"(phase), "r"(ticks));
 }
 
-// TMA load: shared::cta (not ::cluster)
+// BUG FIX: must use shared::cluster (not ::cta) for mbarrier completion
 __device__ __forceinline__ void tma_g2s(int dst, const void* tmap, int x, int y, int mbar) {
-    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
+    asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
         :: "r"(dst), "l"(tmap), "r"(x), "r"(y), "r"(mbar) : "memory");
 }
 
@@ -111,9 +111,9 @@ __device__ __forceinline__ void v3_decode_a(uint32_t a[4],
 template<int V3_TILE_N, int WCT>
 __launch_bounds__(V3_BLOCK, 2)
 __global__ void split12_fused_gemm_v3(
-    __grid_constant__ const CUtensorMap sm_tma,
-    __grid_constant__ const CUtensorMap gr_tma,
-    __grid_constant__ const CUtensorMap b_tma,
+    const CUtensorMap* __restrict__ sm_tma,
+    const CUtensorMap* __restrict__ gr_tma,
+    const CUtensorMap* __restrict__ b_tma,
     int base_exp,
     float* __restrict__ C_matrix,
     int M, int K, int N, int out_stride,
@@ -146,14 +146,15 @@ __global__ void split12_fused_gemm_v3(
     for (int j=0; j<WCT; j++) c[j][0]=c[j][1]=c[j][2]=c[j][3]=0;
     int r0=warp_id*16+lane_id/4, r1=r0+8, twg=lane_id%4, bg=lane_id/4, bt=lane_id%4;
 
-    // TMA load macro: elect_sync thread issues, all participate
+    // BUG FIX: TMA loads FIRST, then expect_tx LAST (gau-nernst pattern)
+    // Also add __syncthreads() before TMA to prevent overwriting in-use smem (Bug 3)
     #define V3_LOAD(mbar_addr, stg, ks) do { \
         if (warp_id == 0 && elect_sync()) { \
+            tma_g2s(s32(sm_buf+(stg)*V3_TILE_M*V3_TILE_K), sm_tma, (int)(ks), block_m, mbar_addr); \
+            tma_g2s(s32(gr_buf+(stg)*V3_TILE_M*V3_TILE_K/2), gr_tma, (int)((ks)/2), block_m, mbar_addr); \
+            tma_g2s(s32((uint8_t*)B_buf+(stg)*V3_TILE_K*V3_TILE_N*2), b_tma, (int)(ks), block_n, mbar_addr); \
             uint32_t tx = V3_TILE_M*V3_TILE_K + V3_TILE_M*V3_TILE_K/2 + V3_TILE_K*V3_TILE_N*2; \
             mbar_expect_tx(mbar_addr, tx); \
-            tma_g2s(s32(sm_buf+(stg)*V3_TILE_M*V3_TILE_K), &sm_tma, (int)(ks), block_m, mbar_addr); \
-            tma_g2s(s32(gr_buf+(stg)*V3_TILE_M*V3_TILE_K/2), &gr_tma, (int)((ks)/2), block_m, mbar_addr); \
-            tma_g2s(s32((uint8_t*)B_buf+(stg)*V3_TILE_K*V3_TILE_N*2), &b_tma, (int)(ks), block_n, mbar_addr); \
         } \
     } while(0)
 
@@ -186,6 +187,8 @@ __global__ void split12_fused_gemm_v3(
         int next_stage = 1 - stage;
         int next_mbar = (stage == 0) ? mbar1 : mbar0;
 
+        // BUG FIX: sync before TMA to ensure previous compute finished reading smem
+        if (tk > 0) __syncthreads();
         if (tk+1 < num_k)
             V3_LOAD(next_mbar, next_stage, (tk+1)*V3_TILE_K);
 

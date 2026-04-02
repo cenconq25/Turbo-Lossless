@@ -232,7 +232,7 @@ __global__ void nv_apply_patches_batch(
 // ============================================================
 #include "split12_gemm.cuh"
 #include "split12_gemm_v2.cuh"
-// V3 TMA kernel in separate compilation unit (nvidia_kernels_v3.cu)
+// V3 TMA kernel in separate CU (device pointer descriptors)
 extern "C" int nv_launch_split12_fused_gemm_v3_async(
     const void* sm, const void* gr, int base_exp,
     const void* act, int act_stride,
