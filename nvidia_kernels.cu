@@ -232,6 +232,7 @@ __global__ void nv_apply_patches_batch(
 // ============================================================
 #include "split12_gemm.cuh"
 #include "split12_gemm_v2.cuh"
+#include "split12_gemm_v3.cuh"
 
 // ============================================================
 // Launch wrappers
@@ -312,16 +313,85 @@ int nv_launch_split12_fused_gemm_async(
             (const int16_t*)patch_correct, (const int16_t*)patch_wrong);
     };
 
-    // Check env for V2 toggle
-    static int s_use_v2 = -1;
-    if (s_use_v2 < 0) {
-        const char* e = getenv("TURBO_V2");
-        s_use_v2 = (!e || e[0] != '0') ? 1 : 0;  // V2 on by default
-        if (s_use_v2) printf("  GEMM: V2 high-occupancy kernel (4 warps, TM=64)\n");
-        else printf("  GEMM: V1 kernel (8 warps, TM=128)\n");
+    // V3 TMA launcher
+    auto launch_v3 = [&](auto TN_v, auto WCT_v) {
+        constexpr int TN = decltype(TN_v)::value, WCT = decltype(WCT_v)::value;
+        dim3 grid((B + TN - 1) / TN, (M + V3_TILE_M - 1) / V3_TILE_M);
+        // smem: mbarrier(128B align) + sm(2×64×64) + gr(2×64×32) + B(2×64×TN×2)
+        int smem = 128 + V3_TILE_M * V3_TILE_K * 2 + V3_TILE_M * V3_TILE_K / 2 * 2
+                 + V3_TILE_K * TN * (int)sizeof(__nv_bfloat16) * 2;
+        static bool cfg3 = false;
+        if (!cfg3) {
+            cudaFuncSetAttribute(split12_fused_gemm_v3<TN, WCT>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            cfg3 = true;
+        }
+        // Create TMA descriptors (64-byte aligned via aligned_alloc)
+        static CUtensorMap* sm_desc_p = (CUtensorMap*)aligned_alloc(64, sizeof(CUtensorMap));
+        static CUtensorMap* gr_desc_p = (CUtensorMap*)aligned_alloc(64, sizeof(CUtensorMap));
+        static CUtensorMap* b_desc_p = (CUtensorMap*)aligned_alloc(64, sizeof(CUtensorMap));
+        CUtensorMap& sm_desc = *sm_desc_p;
+        CUtensorMap& gr_desc = *gr_desc_p;
+        CUtensorMap& b_desc = *b_desc_p;
+        { CUresult r;
+            cuuint64_t sm_dim[2] = {(cuuint64_t)K, (cuuint64_t)M};
+            cuuint64_t sm_stride[1] = {(cuuint64_t)K};
+            cuuint32_t sm_box[2] = {V3_TILE_K, V3_TILE_M};
+            cuuint32_t sm_es[2] = {1, 1};
+            r = cuTensorMapEncodeTiled(&sm_desc, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2,
+                (void*)sm, sm_dim, sm_stride, sm_box, sm_es,
+                CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+                CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+            if (r) { printf("SM TMA desc error: %d (M=%d K=%d)\n", (int)r, M, K); return -1; }
+            static bool once = false;
+            if (!once) { fprintf(stderr, "  TMA sm: ptr=%p dim=[%lu,%lu] stride=%lu box=[%u,%u] smem=%d grid=(%d,%d)\n",
+                sm, sm_dim[0], sm_dim[1], sm_stride[0], sm_box[0], sm_box[1], smem, grid.x, grid.y); once=true; }
+
+            cuuint64_t gr_dim[2] = {(cuuint64_t)(K/2), (cuuint64_t)M};
+            cuuint64_t gr_stride[1] = {(cuuint64_t)(K/2)};
+            cuuint32_t gr_box[2] = {V3_TILE_K/2, V3_TILE_M};
+            cuuint32_t gr_es[2] = {1, 1};
+            r = cuTensorMapEncodeTiled(&gr_desc, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2,
+                (void*)gr, gr_dim, gr_stride, gr_box, gr_es,
+                CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+                CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+            if (r) { printf("GR TMA desc error: %d\n", (int)r); return -1; }
+
+            cuuint64_t b_dim[2] = {(cuuint64_t)K, (cuuint64_t)B};
+            cuuint64_t b_stride[1] = {(cuuint64_t)(K * 2)};
+            cuuint32_t b_box[2] = {V3_TILE_K, (cuuint32_t)TN};
+            cuuint32_t b_es[2] = {1, 1};
+            r = cuTensorMapEncodeTiled(&b_desc, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2,
+                (void*)act, b_dim, b_stride, b_box, b_es,
+                CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+                CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+            if (r) { printf("B TMA desc error: %d (K=%d B=%d TN=%d)\n", (int)r, K, B, TN); return -1; }
+        }
+        split12_fused_gemm_v3<TN, WCT><<<grid, V3_BLOCK, smem, (cudaStream_t)stream>>>(
+            sm_desc, gr_desc, b_desc, base_exp,
+            (float*)out, M, K, B, out_stride,
+            (const int32_t*)patch_row_off, (const int32_t*)patch_cols,
+            (const int16_t*)patch_correct, (const int16_t*)patch_wrong);
+    };
+
+    // Check env for kernel version
+    static int s_kernel_ver = -1;
+    if (s_kernel_ver < 0) {
+        const char* e = getenv("TURBO_KERNEL");
+        if (e && e[0] == '3') { s_kernel_ver = 3; printf("  GEMM: V3 TMA kernel (hardware loads)\n"); }
+        else if (e && e[0] == '1') { s_kernel_ver = 1; printf("  GEMM: V1 kernel (8 warps, TM=128)\n"); }
+        else { s_kernel_ver = 2; printf("  GEMM: V2 high-occupancy kernel (4 warps, TM=64)\n"); }
     }
 
-    if (s_use_v2) {
+    // V3 TMA kernel: compiles on SM120, needs data correctness fix (descriptor/smem layout)
+    // Enable with TURBO_KERNEL=3 for development testing
+    if (s_kernel_ver == 3) {
+        if (B >= 128) launch_v3(std::integral_constant<int,64>{}, std::integral_constant<int,8>{});
+        else if (B >= 32) launch_v3(std::integral_constant<int,32>{}, std::integral_constant<int,4>{});
+        else launch_v3(std::integral_constant<int,16>{}, std::integral_constant<int,2>{});
+        return 0;
+    }
+    if (s_kernel_ver >= 2) {
         if (B >= 128) launch_v2(std::integral_constant<int,64>{}, std::integral_constant<int,8>{});
         else if (B >= 32) launch_v2(std::integral_constant<int,32>{}, std::integral_constant<int,4>{});
         else launch_v2(std::integral_constant<int,16>{}, std::integral_constant<int,2>{});
