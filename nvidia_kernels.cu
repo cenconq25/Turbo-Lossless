@@ -204,19 +204,24 @@ __global__ void nv_apply_patches(
     if (tid == 0 && correction != 0.0f) output[row] += correction;
 }
 
-// Batched patch correction: single launch for all B items
+// Sparse batched patch correction: only launches for rows WITH patches
+// Grid: (num_nonempty_rows, B) — typically 3-5% of M, 30x grid reduction
 __global__ void nv_apply_patches_batch(
     const int32_t* __restrict__ row_offsets,
     const int32_t* __restrict__ patch_cols,
     const int16_t* __restrict__ correct_vals,
     const int16_t* __restrict__ wrong_vals,
+    const int32_t* __restrict__ nonempty_rows,  // [num_nonempty] actual row indices
     const int16_t* __restrict__ activations, int act_stride,
-    float* __restrict__ output, int out_stride, int M, int B)
+    float* __restrict__ output, int out_stride, int num_nonempty, int B)
 {
-    int row = blockIdx.x, b = blockIdx.y;
-    if (row >= M || b >= B) return;
+    int idx = blockIdx.x, b = blockIdx.y;
+    if (idx >= num_nonempty || b >= B) return;
+
+    int row = nonempty_rows[idx];
     int tid = threadIdx.x;
     int start = row_offsets[row], end = row_offsets[row + 1];
+
     const int16_t* act = activations + b * act_stride;
     float correction = 0.0f;
     for (int p = start + tid; p < end; p += WARP_SIZE)
@@ -269,16 +274,18 @@ int nv_launch_patches_async(
 
 int nv_launch_patches_batch_async(
     const void* row_off, const void* cols, const void* correct, const void* wrong,
+    const void* nonempty_rows, int num_nonempty,
     const void* act, int act_stride, void* out, int out_stride,
-    int M, int B, void* stream)
+    int B, void* stream)
 {
-    if (M == 0 || B == 0) return 0;
-    dim3 grid(M, B);
+    if (num_nonempty == 0 || B == 0) return 0;
+    dim3 grid(num_nonempty, B);  // SPARSE: only rows with patches
     nv_apply_patches_batch<<<grid, WARP_SIZE, 0, (cudaStream_t)stream>>>(
         (const int32_t*)row_off, (const int32_t*)cols,
         (const int16_t*)correct, (const int16_t*)wrong,
+        (const int32_t*)nonempty_rows,
         (const int16_t*)act, act_stride,
-        (float*)out, out_stride, M, B);
+        (float*)out, out_stride, num_nonempty, B);
     return 0;
 }
 

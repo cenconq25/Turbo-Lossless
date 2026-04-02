@@ -36,6 +36,9 @@ struct CompressedWeight {
     // Split12 format: byte-aligned arrays (zero read amplification)
     uint8_t* split_sm;            // [M*K] sign+mantissa bytes (NULL if not loaded)
     uint8_t* split_gr;            // [M*K/2] nibble-packed groups
+    // Sparse patch row list (NVIDIA: reduces patch grid from M to num_nonempty_rows)
+    int32_t* patch_nonempty_rows; // [num_nonempty_rows] indices of rows with patches
+    int num_nonempty_rows;
 };
 
 // One transformer layer

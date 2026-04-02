@@ -170,6 +170,21 @@ static bool load_compressed(const std::string& dir, const std::string& prefix, C
         }
 
         w.escape_vals = upload_gpu<int16_t>(esc_vals.data(), esc_vals.size());
+
+        // Build sparse nonempty row list for efficient patch correction
+        std::vector<int32_t> nonempty;
+        for (int r = 0; r < w.M; r++) {
+            if (h_row_off[r + 1] > h_row_off[r])
+                nonempty.push_back(r);
+        }
+        w.num_nonempty_rows = (int)nonempty.size();
+        if (!nonempty.empty())
+            w.patch_nonempty_rows = upload_gpu<int32_t>(nonempty.data(), nonempty.size());
+        else
+            w.patch_nonempty_rows = nullptr;
+    } else {
+        w.patch_nonempty_rows = nullptr;
+        w.num_nonempty_rows = 0;
     }
 
     return true;
