@@ -22,7 +22,7 @@ template<typename T>
 static T* upload_gpu(const void* host_data, size_t count) {
     T* d_ptr;
     size_t bytes = count * sizeof(T);
-    hipMalloc(&d_ptr, bytes);
+    GPU_CHECK(hipMalloc(&d_ptr, bytes));
     hipMemcpy(d_ptr, host_data, bytes, hipMemcpyHostToDevice);
     return d_ptr;
 }
@@ -281,8 +281,8 @@ Model* load_model(const std::string& model_path, int device_id) {
     if (m->max_seq_len < 128) m->max_seq_len = 128;
     printf("  Context length: %d\n", m->max_seq_len);
     size_t kv_size = (size_t)cfg.n_layer * m->max_seq_len * cfg.n_head_kv * head_dim;
-    hipMalloc(&m->kv_cache_k, kv_size * sizeof(int16_t));
-    hipMalloc(&m->kv_cache_v, kv_size * sizeof(int16_t));
+    GPU_CHECK(hipMalloc(&m->kv_cache_k, kv_size * sizeof(int16_t)));
+    GPU_CHECK(hipMalloc(&m->kv_cache_v, kv_size * sizeof(int16_t)));
     hipMemset(m->kv_cache_k, 0, kv_size * sizeof(int16_t));
     hipMemset(m->kv_cache_v, 0, kv_size * sizeof(int16_t));
     printf("  KV cache: %.1f MB per K/V\n", kv_size * 2 / 1e6);

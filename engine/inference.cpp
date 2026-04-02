@@ -117,25 +117,25 @@ InferenceState* create_inference_state(Model* model, int batch_size, int max_seq
     int kv_dim = model->config.n_head_kv * (n / model->config.n_head);
     int bs = batch_size;
 
-    hipMalloc(&s->hidden,   bs * n * sizeof(float));
-    hipMalloc(&s->hidden2,  bs * n * sizeof(float));
-    hipMalloc(&s->attn_out, bs * n * sizeof(float));
-    hipMalloc(&s->q_buf,    bs * n * sizeof(float));
-    hipMalloc(&s->k_buf,    bs * kv_dim * sizeof(float));
-    hipMalloc(&s->v_buf,    bs * kv_dim * sizeof(float));
-    hipMalloc(&s->ffn_gate, bs * n_ff * sizeof(float));
-    hipMalloc(&s->ffn_up,   bs * n_ff * sizeof(float));
+    GPU_CHECK(hipMalloc(&s->hidden,   bs * n * sizeof(float)));
+    GPU_CHECK(hipMalloc(&s->hidden2,  bs * n * sizeof(float)));
+    GPU_CHECK(hipMalloc(&s->attn_out, bs * n * sizeof(float)));
+    GPU_CHECK(hipMalloc(&s->q_buf,    bs * n * sizeof(float)));
+    GPU_CHECK(hipMalloc(&s->k_buf,    bs * kv_dim * sizeof(float)));
+    GPU_CHECK(hipMalloc(&s->v_buf,    bs * kv_dim * sizeof(float)));
+    GPU_CHECK(hipMalloc(&s->ffn_gate, bs * n_ff * sizeof(float)));
+    GPU_CHECK(hipMalloc(&s->ffn_up,   bs * n_ff * sizeof(float)));
     s->ffn_down = nullptr;  // unused — w_down writes directly to cur
-    hipMalloc(&s->logits,   bs * n_vocab * sizeof(float));
+    GPU_CHECK(hipMalloc(&s->logits,   bs * n_vocab * sizeof(float)));
     s->attn_scores_buf = nullptr;  // unused — flash attention uses tiled LDS
-    hipMalloc(&s->d_positions, bs * sizeof(int));
-    hipMalloc(&s->d_tokens, bs * sizeof(int));
+    GPU_CHECK(hipMalloc(&s->d_positions, bs * sizeof(int)));
+    GPU_CHECK(hipMalloc(&s->d_tokens, bs * sizeof(int)));
     int max_act = std::max(n, n_ff);
-    hipMalloc(&s->bf16_act,  bs * max_act * sizeof(int16_t));
-    hipMalloc(&s->bf16_act2, bs * max_act * sizeof(int16_t));
-    hipStreamCreateWithFlags(&s->stream, hipStreamNonBlocking);
-    hipStreamCreateWithFlags(&s->stream2, hipStreamNonBlocking);
-    hipEventCreateWithFlags(&s->sync_event, hipEventDisableTiming);
+    GPU_CHECK(hipMalloc(&s->bf16_act,  bs * max_act * sizeof(int16_t)));
+    GPU_CHECK(hipMalloc(&s->bf16_act2, bs * max_act * sizeof(int16_t)));
+    GPU_CHECK(hipStreamCreateWithFlags(&s->stream, hipStreamNonBlocking));
+    GPU_CHECK(hipStreamCreateWithFlags(&s->stream2, hipStreamNonBlocking));
+    GPU_CHECK(hipEventCreateWithFlags(&s->sync_event, hipEventDisableTiming));
 #ifdef TURBO_NVIDIA
     // Ping-pong BF16 buffers for decode+cuBLAS: only needed for weights with M < 4096
     // Fused GEMM handles M >= 4096 without materializing BF16 weights
@@ -154,7 +154,7 @@ InferenceState* create_inference_state(Model* model, int batch_size, int max_seq
         check(model->output_proj);
         s->weight_buf_half = max_cublas_elems;
         if (max_cublas_elems > 0)
-            hipMalloc(&s->weight_buf, max_cublas_elems * 2 * sizeof(int16_t));
+            GPU_CHECK(hipMalloc(&s->weight_buf, max_cublas_elems * 2 * sizeof(int16_t)));
         else
             s->weight_buf = nullptr;
     }
@@ -189,7 +189,7 @@ static float s_prof_matvec = 0, s_prof_nonmv = 0;
 } while(0)
 
 #define PROF_EVENT_DECL() hipEvent_t _pE0, _pE1
-#define PROF_EVENT_CREATE() do { if (s_profile) { hipEventCreate(&_pE0); hipEventCreate(&_pE1); } } while(0)
+#define PROF_EVENT_CREATE() do { if (s_profile) { GPU_CHECK(hipEventCreate(&_pE0)); GPU_CHECK(hipEventCreate(&_pE1)); } } while(0)
 #define PROF_EVENT_DESTROY() do { if (s_profile) { hipEventDestroy(_pE0); hipEventDestroy(_pE1); } } while(0)
 #define PROF_START(strm) do { if (s_profile) hipEventRecord(_pE0, strm); } while(0)
 #define PROF_END_MV(strm) do { if (s_profile) { hipEventRecord(_pE1, strm); hipEventSynchronize(_pE1); \

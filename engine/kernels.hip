@@ -219,7 +219,7 @@ void launch_rope_init(int head_dim, float theta_base) {
     for (int d = 0; d < half_dim; d++)
         h_freqs[d] = 1.0f / powf(theta_base, (float)(2 * d) / head_dim);
     if (d_rope_freqs) hipFree(d_rope_freqs);
-    hipMalloc(&d_rope_freqs, half_dim * sizeof(float));
+    GPU_CHECK(hipMalloc(&d_rope_freqs, half_dim * sizeof(float)));
     hipMemcpy(d_rope_freqs, h_freqs, half_dim * sizeof(float), hipMemcpyHostToDevice);
     d_rope_freqs_dim = head_dim;
     delete[] h_freqs;

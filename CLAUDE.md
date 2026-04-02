@@ -267,6 +267,8 @@ Example: `4096 4096 5358 107`
 |-------|--------|-----|
 | V3 TMA garbage for large-vocab models (Llama 128K vocab) | **Fixed** | cuBLAS weight_buf was over-allocated (~2GB), causing V3 OOM. Now dynamically scans all weights |
 | forward_b1/b4/b8 used stream=0 (race with sampling) | **Fixed** | Changed to `state->stream` (2026-04-02) |
+| Silent garbage on GPU OOM (no malloc error checking) | **Fixed** | All hipMalloc/cudaMalloc calls wrapped with GPU_CHECK macro (2026-04-03) |
+| Killed process leaves GPU memory dirty for 5-15s | **Fixed** | SIGTERM/SIGINT handler calls free_inference_state + free_model (2026-04-03) |
 
 ## Tested and Rejected
 

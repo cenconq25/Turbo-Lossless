@@ -11,7 +11,7 @@ static int  s_d_result_size = 0;
 void init_sampler(int max_batch) {
     if (max_batch <= s_d_result_size) return;
     if (s_d_result) hipFree(s_d_result);
-    hipMalloc(&s_d_result, max_batch * sizeof(int));
+    GPU_CHECK(hipMalloc(&s_d_result, max_batch * sizeof(int)));
     s_d_result_size = max_batch;
 }
 

@@ -1,10 +1,23 @@
 #include <cstdio>
 #include <ctime>
+#include <csignal>
 #include <string>
 #include "model.h"
 #include "inference.h"
 #include "tokenizer.h"
 #include "sampler.h"
+
+// Global pointers for signal handler GPU cleanup
+static volatile Model* g_model = nullptr;
+static volatile InferenceState* g_state = nullptr;
+static volatile Tokenizer* g_tok = nullptr;
+
+static void signal_handler(int sig) {
+    if (g_state) free_inference_state(const_cast<InferenceState*>(g_state));
+    if (g_tok) free_tokenizer(const_cast<Tokenizer*>(g_tok));
+    if (g_model) free_model(const_cast<Model*>(g_model));
+    _exit(1);
+}
 
 int main(int argc, char** argv) {
     if (argc < 3) {
@@ -26,9 +39,11 @@ int main(int argc, char** argv) {
     printf("Loading model...\n");
     Model* model = load_model(model_path);
     if (!model) { fprintf(stderr, "Failed to load model\n"); return 1; }
+    g_model = model;
 
     Tokenizer* tok = load_tokenizer(model_path);
     if (!tok) { fprintf(stderr, "Failed to load tokenizer\n"); return 1; }
+    g_tok = tok;
 
     // Tokenize prompt
     auto prompt_tokens = tokenize(tok, prompt);
@@ -38,6 +53,11 @@ int main(int argc, char** argv) {
     InferenceState* state = create_inference_state(model, batch_size, model->max_seq_len);
     if (batch_size > 1) printf("Batch size: %d\n", batch_size);
     if (!state) { fprintf(stderr, "Failed to create inference state\n"); return 1; }
+    g_state = state;
+
+    // Register signal handlers for graceful GPU cleanup on kill
+    signal(SIGTERM, signal_handler);
+    signal(SIGINT, signal_handler);
 
     // Generate with timing
     printf("Generating...\n\n");
@@ -73,7 +93,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Cleanup
+    // Cleanup (clear globals first to prevent signal handler double-free)
+    g_state = nullptr;
+    g_tok = nullptr;
+    g_model = nullptr;
     free_inference_state(state);
     free_tokenizer(tok);
     free_model(model);

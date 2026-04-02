@@ -38,6 +38,7 @@
 #define hipSetDevice             cudaSetDevice
 #define hipDeviceSynchronize     cudaDeviceSynchronize
 #define hipGetLastError          cudaGetLastError
+#define hipGetErrorString        cudaGetErrorString
 #define hipSuccess               cudaSuccess
 
 // Stream types and management
@@ -82,3 +83,18 @@
 #elif defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wunused-result"
 #endif
+
+// ============================================================
+// GPU error checking macro
+// ============================================================
+#include <cstdio>
+#include <cstdlib>
+
+#define GPU_CHECK(call) do { \
+    auto _gpu_err = (call); \
+    if (_gpu_err != hipSuccess) { \
+        fprintf(stderr, "GPU error at %s:%d: %s\n", \
+                __FILE__, __LINE__, hipGetErrorString(_gpu_err)); \
+        exit(1); \
+    } \
+} while(0)
