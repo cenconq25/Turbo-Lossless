@@ -198,32 +198,40 @@ __global__ void nv_apply_patches(
     if (tid == 0 && correction != 0.0f) output[row] += correction;
 }
 
-// Sparse batched patch correction: only launches for rows WITH patches
-// Grid: (num_nonempty_rows, B) — typically 3-5% of M, 30x grid reduction
+// Compact batched patch correction: each block handles 16 rows × 1 batch item
+// Grid: (ceil(num_nonempty/16), B) — 16x fewer blocks than sparse version
+#define PATCH_ROWS_PER_BLOCK 16
 __global__ void nv_apply_patches_batch(
     const int32_t* __restrict__ row_offsets,
     const int32_t* __restrict__ patch_cols,
     const int16_t* __restrict__ correct_vals,
     const int16_t* __restrict__ wrong_vals,
-    const int32_t* __restrict__ nonempty_rows,  // [num_nonempty] actual row indices
+    const int32_t* __restrict__ nonempty_rows,
     const int16_t* __restrict__ activations, int act_stride,
     float* __restrict__ output, int out_stride, int num_nonempty, int B)
 {
-    int idx = blockIdx.x, b = blockIdx.y;
-    if (idx >= num_nonempty || b >= B) return;
-
-    int row = nonempty_rows[idx];
+    int block_row_start = blockIdx.x * PATCH_ROWS_PER_BLOCK;
+    int b = blockIdx.y;
+    if (b >= B) return;
     int tid = threadIdx.x;
-    int start = row_offsets[row], end = row_offsets[row + 1];
+    // 256 threads, 16 rows → 16 threads per row (half-warp)
+    int local_row = tid / 16;
+    int local_tid = tid % 16;
+    int row_idx = block_row_start + local_row;
+    if (row_idx >= num_nonempty) return;
 
+    int row = nonempty_rows[row_idx];
+    int start = row_offsets[row], end = row_offsets[row + 1];
     const int16_t* act = activations + b * act_stride;
+
     float correction = 0.0f;
-    for (int p = start + tid; p < end; p += WARP_SIZE)
+    for (int p = start + local_tid; p < end; p += 16)
         correction += (bf16_to_float(correct_vals[p]) - bf16_to_float(wrong_vals[p]))
                       * bf16_to_float(act[patch_cols[p]]);
-    for (int off = WARP_SIZE/2; off > 0; off >>= 1)
-        correction += __shfl_down_sync(0xFFFFFFFF, correction, off, WARP_SIZE);
-    if (tid == 0 && correction != 0.0f)
+    // Half-warp reduction (16 threads)
+    for (int off = 8; off > 0; off >>= 1)
+        correction += __shfl_down_sync(0xFFFF << (local_row * 16), correction, off, 16);
+    if (local_tid == 0 && correction != 0.0f)
         output[b * out_stride + row] += correction;
 }
 
@@ -273,8 +281,8 @@ int nv_launch_patches_batch_async(
     int B, void* stream)
 {
     if (num_nonempty == 0 || B == 0) return 0;
-    dim3 grid(num_nonempty, B);  // SPARSE: only rows with patches
-    nv_apply_patches_batch<<<grid, WARP_SIZE, 0, (cudaStream_t)stream>>>(
+    dim3 grid((num_nonempty + PATCH_ROWS_PER_BLOCK - 1) / PATCH_ROWS_PER_BLOCK, B);
+    nv_apply_patches_batch<<<grid, 256, 0, (cudaStream_t)stream>>>(
         (const int32_t*)row_off, (const int32_t*)cols,
         (const int16_t*)correct, (const int16_t*)wrong,
         (const int32_t*)nonempty_rows,
