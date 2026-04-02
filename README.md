@@ -1,10 +1,10 @@
 # Turbo Lossless: BF16 Compression Engine
 
-100% bit-perfect lossless compression for BF16 LLM weights. BF16 in, BF16 out — no precision loss, 1.33x smaller. Runs Llama 3.1 8B on 16 GB cards where vLLM OOMs. 2.93x faster than vLLM at B=256.
+100% bit-perfect lossless compression for BF16 LLM weights. BF16 in, BF16 out — no precision loss, 1.33x smaller. Runs Llama 3.1 8B on 16 GB cards where vLLM OOMs. 2.93x faster than vLLM at B=256. Multi-GPU tensor parallelism (TP=2) via NCCL.
 
 **BF16 safetensors only.** No GGUF, no FP16, no FP32, no quantized formats.
 
-**GPU support:** AMD (ROCm/HIP) and NVIDIA (CUDA). Auto-detected at build time.
+**GPU support:** AMD (ROCm/HIP) and NVIDIA (CUDA). Multi-GPU (TP=2) on NVIDIA via NCCL. Auto-detected at build time.
 
 ## How It Works
 
@@ -119,6 +119,21 @@ vLLM OOMs loading Llama 8B BF16 (needs ~15 GB weights + ~2 GB overhead > 16 GB).
 
 The VRAM jump at B>=64 is cuBLAS workspace (~1.5 GB), allocated lazily when `forward_batch_tiled` first calls cuBLAS for small tensors (wk/wv, M=1024). At B<=32, the engine uses `forward_b8` slicing which avoids cuBLAS entirely.
 
+### Multi-GPU: 2x RTX 5070 Ti (TP=2, NCCL over PCIe 5.0)
+
+#### Mistral 7B Instruct — Tensor Parallel (TP=2)
+
+| Config | tok/s | vs Single-GPU | Speedup |
+|--------|------:|--------------:|--------:|
+| 1 GPU, B=1 | 60.0 | baseline | 1.00x |
+| **2 GPU TP=2, B=1** | **93.1** | **+55%** | **1.55x** |
+
+**How it works:** Model weights split across 2 GPUs. Each GPU holds half the attention heads (16/32) and half the FFN (7168/14336). NCCL all-reduce synchronizes after attention output projection (wo) and FFN down projection (w_down) — **2 all-reduces per layer x 32 layers = 64 NCCL calls per token**. Each all-reduce transfers 16 KB (4096 floats) at B=1.
+
+**VRAM per GPU (TP=2):** ~5.5 GB model + ~0.5 GB overhead = **~6 GB per GPU** (vs ~11 GB single-GPU). This enables **13B+ models** on 2x 16 GB cards.
+
+**Interconnect:** PCIe 5.0 x8 per GPU (bifurcated from x16 on i9-12900K). No NVLink. NCCL uses SHM/direct transport. All-reduce overhead: ~0.5 ms per token (2.9% of 17.5 ms token time at B=1).
+
 ### MI50 32GB (AMD GCN, 1.0 TB/s)
 
 #### Mistral 7B Instruct
@@ -149,12 +164,20 @@ gcc -O3 -shared -fPIC -o structured12_pack.so structured12_pack.c
 gcc -O3 -shared -fPIC -o split12_pack.so split12_pack.c
 
 # 2. Build engine
-# NVIDIA (CUDA):
+# NVIDIA (CUDA) — single-GPU:
 cd engine && ln -sf kernels.hip kernels.cu && ln -sf ../decompress_v2.hip decompress_v2.cu
 nvcc -O3 -arch=sm_120 -I.. -o turbo-engine \
-  main.cpp model.cpp inference.cpp tokenizer.cpp sampler.cpp \
+  main.cpp model.cpp inference.cpp tokenizer.cpp sampler.cpp multi_gpu.cpp \
   kernels.cu decompress_v2.cu ../nvidia_kernels.cu ../nvidia_kernels_v3.cu \
   -lcublas -lsentencepiece -lcuda -std=c++17
+
+# NVIDIA (CUDA) — with multi-GPU TP support (requires NCCL):
+nvcc -O3 -arch=sm_120 -I.. -DTURBO_NCCL \
+  -I/path/to/nccl/include -L/path/to/nccl/lib \
+  -o turbo-engine \
+  main.cpp model.cpp inference.cpp tokenizer.cpp sampler.cpp multi_gpu.cpp \
+  kernels.cu decompress_v2.cu ../nvidia_kernels.cu ../nvidia_kernels_v3.cu \
+  -lcublas -lsentencepiece -lcuda -lnccl -std=c++17
 
 # AMD (ROCm/HIP):
 cd engine && /opt/rocm/bin/hipcc -O3 --offload-arch=gfx906 -o turbo-engine \
@@ -168,8 +191,13 @@ cp models/mistral-7b-instruct/tokenizer.model models/mistral-7b-instruct-turbo/
 # For HF BPE models (Llama 3.x), extract tokenizer:
 python3 engine/extract_tokenizer.py models/llama-3.1-8b-instruct
 
-# 4. Run
+# 4. Run (single GPU)
 CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./turbo-engine models/mistral-7b-instruct-turbo "Hello" 200 8
+
+# 5. Multi-GPU (TP=2): convert with --tp, then run with TURBO_TP=2
+python3 engine/convert_model.py --tp 2 models/mistral-7b-instruct models/mistral-7b-instruct-turbo-tp2
+cp models/mistral-7b-instruct/tokenizer.model models/mistral-7b-instruct-turbo-tp2/
+TURBO_TP=2 TURBO_FAST=1 ./turbo-engine models/mistral-7b-instruct-turbo-tp2 "Hello" 200 1
 ```
 
 ### Usage
@@ -186,6 +214,7 @@ CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./turbo-engine models/mistral-7b-instruct-tu
 | `TURBO_PROFILE=1` | Print per-token timing breakdown |
 | `TURBO_KERNEL=1\|2\|3` | NVIDIA kernel version: 1=V1 baseline, 2=V2 cp.async, **3=V3 TMA** (default, auto B>=64) |
 | `TURBO_CUBLAS=1` | Force cuBLAS path for all tensors (debug/comparison) |
+| `TURBO_TP=2` | Enable 2-GPU tensor parallelism (requires NCCL build + TP-converted model) |
 
 #### Kernel Selection Guide (NVIDIA)
 
@@ -213,6 +242,8 @@ Default: V3 auto-selects for B>=64, V2 for B<64. No manual override needed.
 | `engine/tokenizer.cpp` | 379 | Auto-detect sentencepiece / HF BPE tokenizer |
 | `engine/convert_model.py` | 207 | BF16 safetensors -> turbo format converter |
 | `engine/extract_tokenizer.py` | 80 | Extract HF BPE tokenizer to binary format |
-| `engine/main.cpp` | 81 | CLI entry point |
+| `engine/multi_gpu.h` | 35 | TPState struct, NCCL all-reduce, distributed argmax |
+| `engine/multi_gpu.cpp` | 200 | NCCL init, all-reduce, distributed argmax, cleanup |
+| `engine/main.cpp` | 224 | CLI entry point + TP orchestration |
 
-**Total: ~4450 lines of production code.** Supports AMD (ROCm/HIP) and NVIDIA (CUDA).
+**Total: ~5200 lines of production code.** Supports AMD (ROCm/HIP), NVIDIA (CUDA), and multi-GPU (TP=2 via NCCL).

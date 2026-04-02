@@ -10,7 +10,9 @@
 - Do not push to remote repo unless explicitly told to.
 - When benchmarking, use a non-display GPU (not the one connected to the monitor).
 - Do not commit unless explicitly told to.
-- GPU 1 may be degraded from previous crashes — use GPU 0 (HIP_VISIBLE_DEVICES=0).
+- For single-GPU: use GPU 0 (`CUDA_VISIBLE_DEVICES=0`).
+- For multi-GPU TP=2: both GPUs used. Set `TURBO_TP=2`. Model must be converted with `--tp 2`.
+- Always update CLAUDE.md and README.md when making code changes.
 
 ## Build & Run
 
@@ -19,12 +21,25 @@
 gcc -O3 -shared -fPIC -o structured12_pack.so structured12_pack.c
 gcc -O3 -shared -fPIC -o split12_pack.so split12_pack.c
 
-# Build engine — NVIDIA (RTX 5070 Ti, sm_120)
+# Build engine — NVIDIA single-GPU (RTX 5070 Ti, sm_120)
 cd engine && ln -sf kernels.hip kernels.cu && ln -sf ../decompress_v2.hip decompress_v2.cu
 nvcc -O3 -arch=sm_120 -I.. -o turbo-engine \
-  main.cpp model.cpp inference.cpp tokenizer.cpp sampler.cpp \
+  main.cpp model.cpp inference.cpp tokenizer.cpp sampler.cpp multi_gpu.cpp \
   kernels.cu decompress_v2.cu ../nvidia_kernels.cu ../nvidia_kernels_v3.cu \
   -lcublas -lsentencepiece -lcuda -std=c++17
+
+# Build engine — NVIDIA multi-GPU TP=2 (requires NCCL)
+nvcc -O3 -arch=sm_120 -I.. -DTURBO_NCCL \
+  -I/home/roy/miniconda3/lib/python3.13/site-packages/nvidia/nccl/include \
+  -L/home/roy/miniconda3/lib/python3.13/site-packages/nvidia/nccl/lib \
+  -o turbo-engine \
+  main.cpp model.cpp inference.cpp tokenizer.cpp sampler.cpp multi_gpu.cpp \
+  kernels.cu decompress_v2.cu ../nvidia_kernels.cu ../nvidia_kernels_v3.cu \
+  -lcublas -lsentencepiece -lcuda -lnccl -std=c++17 -lpthread
+
+# Convert model for TP=2
+python3 engine/convert_model.py --tp 2 models/mistral-7b-instruct models/mistral-7b-instruct-turbo-tp2
+cp models/mistral-7b-instruct/tokenizer.model models/mistral-7b-instruct-turbo-tp2/
 
 # Build engine — AMD (MI50, gfx906)
 cd engine && /opt/rocm/bin/hipcc -O3 --offload-arch=gfx906 -o turbo-engine \
@@ -43,6 +58,7 @@ CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./turbo-engine <model_dir> "<prompt>" <max_t
 | `TURBO_PROFILE=1` | Print per-token timing: matvec/attn/norm/silu breakdown |
 | `TURBO_KERNEL=1\|2\|3` | NVIDIA kernel: 1=V1, 2=V2 cp.async, **3=V3 TMA** (default, auto-selects B>=64) |
 | `TURBO_CUBLAS=1` | Force cuBLAS path for all tensors (debug) |
+| `TURBO_TP=2` | Enable 2-GPU tensor parallelism (needs NCCL build + TP model) |
 
 ## Current Results
 
@@ -73,6 +89,19 @@ CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./turbo-engine <model_dir> "<prompt>" <max_t
 | B=128 | 2110.8 | ~10.5 GB | vLLM OOM |
 | **B=256** | **2470.7** | **~10.5 GB** | **vLLM OOM** |
 
+### 2x RTX 5070 Ti (TP=2, NCCL over PCIe 5.0) — Measured 2026-04-03
+
+#### Mistral 7B Instruct (TP=2, B=1)
+
+| Config | tok/s | vs 1-GPU | VRAM per GPU |
+|--------|------:|---------:|-------------:|
+| 1 GPU | 60.0 | 1.00x | ~11 GB |
+| **2 GPU TP=2** | **93.1** | **1.55x** | **~6 GB** |
+
+Architecture: 2 all-reduces/layer x 32 layers = 64 NCCL calls/token (16 KB each).
+Interconnect: PCIe 5.0 x8 (bifurcated), SHM/direct transport. ~0.5 ms overhead/token.
+Enables 13B+ models on 2x 16 GB cards (32 GB total VRAM).
+
 ### MI50 32GB (AMD GCN, 1.0 TB/s)
 
 #### Mistral 7B Instruct
@@ -87,7 +116,7 @@ CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./turbo-engine <model_dir> "<prompt>" <max_t
 
 | Model | tok/s B=1 (RTX 5070 Ti) | tok/s B=1 (MI50) | Tokenizer | Status |
 |-------|------------------------:|-----------------:|-----------|--------|
-| Mistral 7B Instruct | 60.0 | 32.6 | sentencepiece | Production (V2+V3) |
+| Mistral 7B Instruct | 60.0 (93.1 TP=2) | 32.6 | sentencepiece | Production (V2+V3+TP) |
 | Llama 3.1 8B Instruct | 57.0 | 31.8 | HF BPE | Production (V2+V3) |
 
 ### Compression
@@ -192,12 +221,12 @@ for each layer:
   MATVEC_B1(wv, bf16_a) -> v_buf
   rope_store_kv(q, k, v -> kv_cache)    // fused RoPE + KV store
   attention(q, kv_cache) -> bf16_a       // outputs BF16 directly (no fp32_to_bf16)
-  MATVEC_B1(wo, bf16_a) -> res
+  MATVEC_B1(wo, bf16_a) -> res           // TP: column-split, ALL_REDUCE after
   add_rms_norm_bf16(res, cur) -> bf16_a  // fused add + norm for FFN
-  split12_dual(gate+up, bf16_a) -> ffn_gate, ffn_up  // fused gate+up
+  split12_dual(gate+up, bf16_a) -> ffn_gate, ffn_up  // fused gate+up (TP: row-split)
   + patches for gate and up
   silu_mul_bf16(gate, up) -> bf16_b
-  MATVEC_B1(w_down, bf16_b) -> cur
+  MATVEC_B1(w_down, bf16_b) -> cur       // TP: column-split, ALL_REDUCE after
   add_rms_norm_bf16(cur, res, NEXT_attn_norm) -> bf16_a  // cross-layer fusion!
 
 MATVEC_B1(output_proj, bf16_a) -> logits
@@ -269,6 +298,7 @@ Example: `4096 4096 5358 107`
 | forward_b1/b4/b8 used stream=0 (race with sampling) | **Fixed** | Changed to `state->stream` (2026-04-02) |
 | Silent garbage on GPU OOM (no malloc error checking) | **Fixed** | All hipMalloc/cudaMalloc calls wrapped with GPU_CHECK macro (2026-04-03) |
 | Killed process leaves GPU memory dirty for 5-15s | **Fixed** | SIGTERM/SIGINT handler calls free_inference_state + free_model (2026-04-03) |
+| TP=2 crash: cross-device RoPE frequency pointer | **Fixed** | d_rope_freqs was single static shared across GPUs. Now per-device array (2026-04-03) |
 
 ## Tested and Rejected
 
@@ -303,9 +333,11 @@ Example: `4096 4096 5358 107`
 | `engine/tokenizer.cpp` | 379 | Auto-detect + BPE encode/decode with byte-level mapping |
 | `engine/sampler.h` | 11 | Sampler interface |
 | `engine/sampler.cpp` | 32 | Greedy + batched argmax |
-| `engine/convert_model.py` | 207 | HF safetensors -> turbo format |
+| `engine/convert_model.py` | 260 | HF safetensors -> turbo format (supports `--tp 2`) |
+| `engine/multi_gpu.h` | 35 | TPState struct, NCCL all-reduce, distributed argmax |
+| `engine/multi_gpu.cpp` | 200 | NCCL init/teardown, all-reduce, distributed argmax |
 
-**Total: ~4450 lines.**
+**Total: ~5200 lines.**
 
 ## Scope
 
