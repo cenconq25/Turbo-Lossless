@@ -74,8 +74,8 @@ B=8:  decode -> 8x FMA    (2.4x faster than BF16)
 | B=16 | — | 687.9 tok/s | **628 tok/s** | — | **1.36x** | **~10 GB** |
 | B=32 | — | 694.2 tok/s | **999 tok/s** | **1.44x** | **1.36x** | **~10 GB** |
 | B=64 | — | 853 tok/s | **1405 tok/s** | **1.65x** | **1.36x** | **~10 GB** |
-| B=128 | — | 902 tok/s | **1655 tok/s** | **1.83x** | **1.36x** | **~10 GB** |
-| B=256 | — | — | **1786 tok/s** | — | **1.36x** | **~10 GB** |
+| B=128 | — | 942 tok/s | **1655 tok/s** | **1.76x** | **1.36x** | **~10 GB** |
+| B=256 | — | 872 tok/s | **1786 tok/s** | **2.05x** | **1.36x** | **~10 GB** |
 
 **1.83x faster than vLLM** at B=128 with 200-token generation. Fused decode+PTX mma.sync with cp.async pipeline, ZipServ-derived K-slice interleaving, L2-optimized grid layout, adaptive TILE_N, flat patch correction, coalesced output writes. 8 warps (256 threads), TILE_M=128. Uses **1.35x less VRAM**. 100% lossless.
 
@@ -83,12 +83,14 @@ B=8:  decode -> 8x FMA    (2.4x faster than BF16)
 
 | Batch | llama.cpp BF16 | vLLM BF16 | Turbo 12-bit | Compression | VRAM |
 |------:|---------------:|----------:|-------------:|:-----------:|-----:|
-| B=1 | 51.0 tok/s | OOM | **58.6 tok/s** | **1.42x** | 15.0 vs **~10.5 GB** |
-| B=4 | — | OOM | **146.7 tok/s** | **1.42x** | **~10.5 GB** |
-| B=8 | — | OOM | **159.0 tok/s** | **1.42x** | **~10.5 GB** |
-| B=16 | — | OOM | **162.9 tok/s** | **1.42x** | **~10.5 GB** |
-| B=32 | — | OOM | 162.0 tok/s | **1.42x** | **~10.5 GB** |
-| B=64 | — | OOM | 161.7 tok/s | **1.42x** | **~10.5 GB** |
+| B=1 | 53.9 tok/s | OOM | **57.0 tok/s** | **1.42x** | 15.0 vs **~10.5 GB** |
+| B=4 | — | OOM | **113.8 tok/s** | **1.42x** | **~10.5 GB** |
+| B=8 | — | OOM | **154.1 tok/s** | **1.42x** | **~10.5 GB** |
+| B=16 | — | OOM | **584.4 tok/s** | **1.42x** | **~10.5 GB** |
+| B=32 | — | OOM | **942.3 tok/s** | **1.42x** | **~10.5 GB** |
+| B=64 | — | OOM | **1330 tok/s** | **1.42x** | **~10.5 GB** |
+| B=128 | — | OOM | **1558 tok/s** | **1.42x** | **~10.5 GB** |
+| B=256 | — | OOM | **1702 tok/s** | **1.42x** | **~10.5 GB** |
 
 vLLM **cannot load** Llama 3.1 8B BF16 on a 16GB card (needs ~16 GB weights + overhead). Turbo runs it comfortably at **~10.5 GB** with room to spare. No OOM up to B=1024.
 
