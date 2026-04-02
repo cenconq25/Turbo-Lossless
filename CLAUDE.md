@@ -19,25 +19,65 @@
 gcc -O3 -shared -fPIC -o structured12_pack.so structured12_pack.c
 gcc -O3 -shared -fPIC -o split12_pack.so split12_pack.c
 
-# Build engine (zero warnings)
+# Build engine — NVIDIA (RTX 5070 Ti, sm_120)
+cd engine && ln -sf kernels.hip kernels.cu && ln -sf ../decompress_v2.hip decompress_v2.cu
+nvcc -O3 -arch=sm_120 -I.. -o turbo-engine \
+  main.cpp model.cpp inference.cpp tokenizer.cpp sampler.cpp \
+  kernels.cu decompress_v2.cu ../nvidia_kernels.cu ../nvidia_kernels_v3.cu \
+  -lcublas -lsentencepiece -lcuda -std=c++17
+
+# Build engine — AMD (MI50, gfx906)
 cd engine && /opt/rocm/bin/hipcc -O3 --offload-arch=gfx906 -o turbo-engine \
   main.cpp model.cpp inference.cpp tokenizer.cpp sampler.cpp \
   kernels.hip ../decompress_v2.hip -lhipblas -lsentencepiece -std=c++17
 
 # Run
-HIP_VISIBLE_DEVICES=0 TURBO_FAST=1 ./turbo-engine <model_dir> "<prompt>" <max_tokens> [batch_size]
+CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./turbo-engine <model_dir> "<prompt>" <max_tokens> [batch_size]
 ```
 
 | Variable | Effect |
 |----------|--------|
-| `HIP_VISIBLE_DEVICES=N` | Select GPU |
+| `CUDA_VISIBLE_DEVICES=N` / `HIP_VISIBLE_DEVICES=N` | Select GPU |
 | `TURBO_FAST=1` | Pre-computed escape counts (+10% speed, +361 MB VRAM) |
 | `TURBO_CTX=N` | Max context length (default 2048) |
 | `TURBO_PROFILE=1` | Print per-token timing: matvec/attn/norm/silu breakdown |
+| `TURBO_KERNEL=1\|2\|3` | NVIDIA kernel: 1=V1, **2=V2 cp.async** (recommended), 3=V3 TMA (Mistral only) |
+| `TURBO_CUBLAS=1` | Force cuBLAS path for all tensors (debug) |
 
-## Current Results (Measured on MI50 32GB, GPU 0)
+## Current Results
 
-### Engine End-to-End (Mistral 7B Instruct)
+### RTX 5070 Ti 16GB (NVIDIA Blackwell, 896 GB/s) — Measured 2026-04-02
+
+#### Mistral 7B Instruct (V3 TMA for B>=64, V2 for B<64)
+
+| Mode | tok/s total | VRAM | vs vLLM BF16 |
+|------|------------:|-----:|:-------------|
+| B=1 | 60.0 | ~10 GB | 1.10x |
+| B=8 | 162.6 | ~10 GB | — |
+| B=16 | 673.1 | ~10 GB | — |
+| B=32 | 1136.3 | ~10 GB | 1.64x |
+| B=64 | 1514.2 | ~10 GB | 1.77x |
+| B=128 | 2196.6 | ~10 GB | 2.33x |
+| **B=256** | **2553.5** | **~10 GB** | **2.93x** |
+
+#### Llama 3.1 8B Instruct (V2 kernel, TURBO_KERNEL=2)
+
+| Mode | tok/s total | VRAM | Notes |
+|------|------------:|-----:|:------|
+| B=1 | 57.0 | ~10.5 GB | vLLM OOM |
+| B=4 | 113.7 | ~10.5 GB | vLLM OOM |
+| B=8 | 154.3 | ~10.5 GB | vLLM OOM |
+| B=16 | 627.1 | ~10.5 GB | vLLM OOM |
+| B=32 | 1069.5 | ~10.5 GB | vLLM OOM |
+| B=64 | 1359.1 | ~10.5 GB | vLLM OOM |
+| B=128 | 1594.7 | ~10.5 GB | vLLM OOM |
+| **B=256** | **1673.9** | **~10.5 GB** | **vLLM OOM** |
+
+**Note:** V3 TMA produces incorrect output for Llama 3.1 8B — use `TURBO_KERNEL=2`.
+
+### MI50 32GB (AMD GCN, 1.0 TB/s)
+
+#### Mistral 7B Instruct
 
 | Mode | tok/s total | VRAM | vs llama.cpp BF16 (33.0 tok/s) |
 |------|------------:|-----:|:-------------------------------|
@@ -47,10 +87,10 @@ HIP_VISIBLE_DEVICES=0 TURBO_FAST=1 ./turbo-engine <model_dir> "<prompt>" <max_to
 
 ### Tested Models
 
-| Model | tok/s (B=1) | Tokenizer | Status |
-|-------|------------:|-----------|--------|
-| Mistral 7B Instruct | 32.6 | sentencepiece | Production |
-| Llama 3.1 8B | 31.8 | HF BPE | Production |
+| Model | tok/s B=1 (RTX 5070 Ti) | tok/s B=1 (MI50) | Tokenizer | Status |
+|-------|------------------------:|-----------------:|-----------|--------|
+| Mistral 7B Instruct | 60.0 | 32.6 | sentencepiece | Production (V2+V3) |
+| Llama 3.1 8B Instruct | 57.0 | 31.8 | HF BPE | Production (V2 only, V3 TMA broken) |
 
 ### Compression
 
@@ -222,6 +262,13 @@ Example: `4096 4096 5358 107`
 | Warp-shuffle RMSNorm | +1% | Fewer syncs, less shared memory |
 | Single accumulator B=8 | +3% B=8 | Saves 8 VGPRs, reduces register pressure |
 | Batched argmax | +0.5% B=8 | 1 launch for all sequences |
+
+## Known Issues
+
+| Issue | Status | Workaround |
+|-------|--------|------------|
+| V3 TMA produces garbage for Llama 3.1 8B | Open | Use `TURBO_KERNEL=2` (V2 cp.async) |
+| forward_b1/b4/b8 used stream=0 (race with sampling) | **Fixed** | Changed to `state->stream` (2026-04-02) |
 
 ## Tested and Rejected
 

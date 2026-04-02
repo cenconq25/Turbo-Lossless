@@ -197,7 +197,7 @@ static float s_prof_attn = 0, s_prof_norm = 0, s_prof_silu = 0, s_prof_misc = 0;
 static void forward_b1(InferenceState* state, const int* token_ids) {
     Model* m = state->model;
     auto& cfg = m->config;
-    hipStream_t stream = 0;
+    hipStream_t stream = state->stream;
     int n = cfg.n_embd, head_dim = n / cfg.n_head;
     int kv_dim = cfg.n_head_kv * head_dim;
     int pos = state->positions[0];
@@ -355,7 +355,7 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
 static void forward_b4(InferenceState* state, const int token_ids[4]) {
     Model* m = state->model;
     auto& cfg = m->config;
-    hipStream_t stream = 0;
+    hipStream_t stream = state->stream;
     int n = cfg.n_embd, n_ff = cfg.n_ff, head_dim = n / cfg.n_head;
     int kv_dim = cfg.n_head_kv * head_dim;
     const int BS = 4;
@@ -479,7 +479,7 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
 static void forward_b8(InferenceState* state, const int token_ids[8]) {
     Model* m = state->model;
     auto& cfg = m->config;
-    hipStream_t stream = 0;
+    hipStream_t stream = state->stream;
     int n = cfg.n_embd, n_ff = cfg.n_ff, head_dim = n / cfg.n_head;
     int kv_dim = cfg.n_head_kv * head_dim;
     const int BS = 8;
