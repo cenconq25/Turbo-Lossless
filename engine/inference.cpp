@@ -400,8 +400,11 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
     Model* m = state->model;
     auto& cfg = m->config;
     hipStream_t stream = state->stream;
-    int n = cfg.n_embd, n_ff = cfg.n_ff, head_dim = n / cfg.n_head;
-    int kv_dim = cfg.n_head_kv * head_dim;
+    int tp = m->tp_size > 1 ? m->tp_size : 1;
+    int n = cfg.n_embd, head_dim = n / cfg.n_head;
+    int n_head_local = cfg.n_head / tp;
+    int n_head_kv_local = cfg.n_head_kv / tp;
+    int kv_dim = n_head_kv_local * head_dim;
     const int BS = 4;
 
     hipMemcpyAsync(state->d_positions, state->positions, BS * sizeof(int), hipMemcpyHostToDevice, stream);
@@ -424,7 +427,7 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
 
 #ifdef TURBO_NVIDIA
         // NVIDIA: auto-select split12 when available (saves 10 GB VRAM)
-        BATCH4_MATVEC(L.wq, bf16_a, state->q_buf, n, n, stream);
+        BATCH4_MATVEC(L.wq, bf16_a, state->q_buf, n, L.wq.M, stream);
         BATCH4_MATVEC(L.wk, bf16_a, state->k_buf, n, kv_dim, stream);
         BATCH4_MATVEC(L.wv, bf16_a, state->v_buf, n, kv_dim, stream);
 #else
@@ -432,7 +435,7 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
         launch_structured12_batch4_async(L.wq.packed, L.wq.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.wq.escape_row_base, L.wq.escape_counts, L.wq.escape_vals,
-            SEQ(state->q_buf,0,n), SEQ(state->q_buf,1,n), SEQ(state->q_buf,2,n), SEQ(state->q_buf,3,n),
+            SEQ(state->q_buf,0,L.wq.M), SEQ(state->q_buf,1,L.wq.M), SEQ(state->q_buf,2,L.wq.M), SEQ(state->q_buf,3,L.wq.M),
             L.wq.M, L.wq.K, stream);
         launch_structured12_batch4_async(L.wk.packed, L.wk.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
@@ -448,7 +451,7 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
 
         size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
         launch_rope_batch(state->q_buf, state->k_buf, state->d_positions,
-                          head_dim, cfg.n_head, cfg.n_head_kv, n, kv_dim, cfg.rope_theta, BS, stream);
+                          head_dim, n_head_local, n_head_kv_local, n_head_local * head_dim, kv_dim, cfg.rope_theta, BS, stream);
         launch_store_kv_batch(state->k_buf, state->v_buf,
                               m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
                               state->d_positions, kv_dim, m->max_seq_len, BS, stream);
@@ -457,29 +460,29 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
         for (int s = 0; s < BS; s++) max_pos = std::max(max_pos, state->positions[s]);
         if (max_pos < 1024)
             launch_attention_all_heads_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
-                bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
+                bf16_a, state->d_positions, n_head_local, n_head_kv_local, head_dim,
                 max_pos + 1, scale, BS, 0, stream);
         else
             launch_flash_attention_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
-                bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
+                bf16_a, state->d_positions, n_head_local, n_head_kv_local, head_dim,
                 max_pos + 1, scale, BS, 0, stream);
 
 #ifdef TURBO_NVIDIA
-        BATCH4_MATVEC(L.wo, bf16_a, res, n, n, stream);
+        BATCH4_MATVEC(L.wo, bf16_a, res, n_head_local * head_dim, n, stream);
         // TP: wo is column-split — all-reduce partial sums
         if (state->tp)
             tp_allreduce_sum(res, n * BS, state->tp, state->tp_rank, (void*)stream, 1);
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
-        BATCH4_MATVEC(L.w_gate, bf16_a, state->ffn_gate, n, n_ff, stream);
-        BATCH4_MATVEC(L.w_up, bf16_a, state->ffn_up, n, n_ff, stream);
-        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, BS, stream);
-        BATCH4_MATVEC(L.w_down, bf16_b, cur, n_ff, n, stream);
+        BATCH4_MATVEC(L.w_gate, bf16_a, state->ffn_gate, n, L.w_gate.M, stream);
+        BATCH4_MATVEC(L.w_up, bf16_a, state->ffn_up, n, L.w_gate.M, stream);
+        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, BS, stream);
+        BATCH4_MATVEC(L.w_down, bf16_b, cur, L.w_gate.M, n, stream);
         // TP: w_down is column-split — all-reduce partial sums
         if (state->tp)
             tp_allreduce_sum(cur, n * BS, state->tp, state->tp_rank, (void*)stream, 0);
 #else
         launch_structured12_batch4_async(L.wo.packed, L.wo.base_exp,
-            SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
+            SEQI(bf16_a,0,n_head_local * head_dim), SEQI(bf16_a,1,n_head_local * head_dim), SEQI(bf16_a,2,n_head_local * head_dim), SEQI(bf16_a,3,n_head_local * head_dim),
             L.wo.escape_row_base, L.wo.escape_counts, L.wo.escape_vals,
             SEQ(res,0,n), SEQ(res,1,n), SEQ(res,2,n), SEQ(res,3,n),
             L.wo.M, L.wo.K, stream);
@@ -490,16 +493,16 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
         launch_structured12_batch4_async(L.w_gate.packed, L.w_gate.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.w_gate.escape_row_base, L.w_gate.escape_counts, L.w_gate.escape_vals,
-            SEQ(state->ffn_gate,0,n_ff), SEQ(state->ffn_gate,1,n_ff), SEQ(state->ffn_gate,2,n_ff), SEQ(state->ffn_gate,3,n_ff),
+            SEQ(state->ffn_gate,0,L.w_gate.M), SEQ(state->ffn_gate,1,L.w_gate.M), SEQ(state->ffn_gate,2,L.w_gate.M), SEQ(state->ffn_gate,3,L.w_gate.M),
             L.w_gate.M, L.w_gate.K, stream);
         launch_structured12_batch4_async(L.w_up.packed, L.w_up.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.w_up.escape_row_base, L.w_up.escape_counts, L.w_up.escape_vals,
-            SEQ(state->ffn_up,0,n_ff), SEQ(state->ffn_up,1,n_ff), SEQ(state->ffn_up,2,n_ff), SEQ(state->ffn_up,3,n_ff),
+            SEQ(state->ffn_up,0,L.w_gate.M), SEQ(state->ffn_up,1,L.w_gate.M), SEQ(state->ffn_up,2,L.w_gate.M), SEQ(state->ffn_up,3,L.w_gate.M),
             L.w_up.M, L.w_up.K, stream);
-        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, BS, stream);
+        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, BS, stream);
         launch_structured12_batch4_async(L.w_down.packed, L.w_down.base_exp,
-            SEQI(bf16_b,0,n_ff), SEQI(bf16_b,1,n_ff), SEQI(bf16_b,2,n_ff), SEQI(bf16_b,3,n_ff),
+            SEQI(bf16_b,0,L.w_gate.M), SEQI(bf16_b,1,L.w_gate.M), SEQI(bf16_b,2,L.w_gate.M), SEQI(bf16_b,3,L.w_gate.M),
             L.w_down.escape_row_base, L.w_down.escape_counts, L.w_down.escape_vals,
             SEQ(cur,0,n), SEQ(cur,1,n), SEQ(cur,2,n), SEQ(cur,3,n),
             L.w_down.M, L.w_down.K, stream);
@@ -519,13 +522,13 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
 
     // Output projection
 #ifdef TURBO_NVIDIA
-    BATCH4_MATVEC(m->output_proj, bf16_a, state->logits, n, cfg.n_vocab, stream);
+    BATCH4_MATVEC(m->output_proj, bf16_a, state->logits, n, m->output_proj.M, stream);
 #else
     launch_structured12_batch4_async(m->output_proj.packed, m->output_proj.base_exp,
         SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
         m->output_proj.escape_row_base, m->output_proj.escape_counts, m->output_proj.escape_vals,
-        SEQ(state->logits,0,cfg.n_vocab), SEQ(state->logits,1,cfg.n_vocab),
-        SEQ(state->logits,2,cfg.n_vocab), SEQ(state->logits,3,cfg.n_vocab),
+        SEQ(state->logits,0,m->output_proj.M), SEQ(state->logits,1,m->output_proj.M),
+        SEQ(state->logits,2,m->output_proj.M), SEQ(state->logits,3,m->output_proj.M),
         m->output_proj.M, m->output_proj.K, stream);
 #endif
     for (int s = 0; s < BS; s++) state->positions[s]++;
@@ -536,8 +539,11 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
     Model* m = state->model;
     auto& cfg = m->config;
     hipStream_t stream = state->stream;
-    int n = cfg.n_embd, n_ff = cfg.n_ff, head_dim = n / cfg.n_head;
-    int kv_dim = cfg.n_head_kv * head_dim;
+    int tp = m->tp_size > 1 ? m->tp_size : 1;
+    int n = cfg.n_embd, head_dim = n / cfg.n_head;
+    int n_head_local = cfg.n_head / tp;
+    int n_head_kv_local = cfg.n_head_kv / tp;
+    int kv_dim = n_head_kv_local * head_dim;
     const int BS = 8;
 
     hipMemcpyAsync(state->d_positions, state->positions, BS * sizeof(int), hipMemcpyHostToDevice, stream);
@@ -557,13 +563,13 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
         // Fused RMSNorm -> BF16 for Q/K/V (layer 0 only; subsequent fused with prev add)
         if (layer == 0)
             launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
-        BATCH8_MATVEC(L.wq, bf16_a, state->q_buf, n, n, stream);
+        BATCH8_MATVEC(L.wq, bf16_a, state->q_buf, n, L.wq.M, stream);
         BATCH8_MATVEC(L.wk, bf16_a, state->k_buf, n, kv_dim, stream);
         BATCH8_MATVEC(L.wv, bf16_a, state->v_buf, n, kv_dim, stream);
 
         size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
         launch_rope_batch(state->q_buf, state->k_buf, state->d_positions,
-                          head_dim, cfg.n_head, cfg.n_head_kv, n, kv_dim, cfg.rope_theta, BS, stream);
+                          head_dim, n_head_local, n_head_kv_local, n_head_local * head_dim, kv_dim, cfg.rope_theta, BS, stream);
         launch_store_kv_batch(state->k_buf, state->v_buf,
                               m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
                               state->d_positions, kv_dim, m->max_seq_len, BS, stream);
@@ -572,25 +578,25 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
         for (int s = 0; s < BS; s++) max_pos = std::max(max_pos, state->positions[s]);
         if (max_pos < 1024)
             launch_attention_all_heads_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
-                bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
+                bf16_a, state->d_positions, n_head_local, n_head_kv_local, head_dim,
                 max_pos + 1, scale, BS, 0, stream);
         else
             launch_flash_attention_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
-                bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
+                bf16_a, state->d_positions, n_head_local, n_head_kv_local, head_dim,
                 max_pos + 1, scale, BS, 0, stream);
 
         // wo: attention now writes BF16 directly to bf16_a
-        BATCH8_MATVEC(L.wo, bf16_a, res, n, n, stream);
+        BATCH8_MATVEC(L.wo, bf16_a, res, n_head_local * head_dim, n, stream);
         // TP: wo is column-split — all-reduce partial sums
         if (state->tp)
             tp_allreduce_sum(res, n * BS, state->tp, state->tp_rank, (void*)stream, 1);
         // Fused add + RMSNorm -> BF16
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
-        BATCH8_MATVEC(L.w_gate, bf16_a, state->ffn_gate, n, n_ff, stream);
-        BATCH8_MATVEC(L.w_up, bf16_a, state->ffn_up, n, n_ff, stream);
+        BATCH8_MATVEC(L.w_gate, bf16_a, state->ffn_gate, n, L.w_gate.M, stream);
+        BATCH8_MATVEC(L.w_up, bf16_a, state->ffn_up, n, L.w_gate.M, stream);
         // Fused SiLU*mul -> BF16 for w_down
-        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, BS, stream);
-        BATCH8_MATVEC(L.w_down, bf16_b, cur, n_ff, n, stream);
+        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, BS, stream);
+        BATCH8_MATVEC(L.w_down, bf16_b, cur, L.w_gate.M, n, stream);
         // TP: w_down is column-split — all-reduce partial sums
         if (state->tp)
             tp_allreduce_sum(cur, n * BS, state->tp, state->tp_rank, (void*)stream, 0);
@@ -606,7 +612,7 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
     }
 
     // Output projection (bf16_a already set by fused add+norm above)
-    BATCH8_MATVEC(m->output_proj, bf16_a, state->logits, n, cfg.n_vocab, stream);
+    BATCH8_MATVEC(m->output_proj, bf16_a, state->logits, n, m->output_proj.M, stream);
     for (int s = 0; s < BS; s++) state->positions[s]++;
 }
 
@@ -654,8 +660,11 @@ static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
     hipStream_t s1 = state->stream;      // main compute stream
     hipStream_t s2 = state->stream2;     // patch correction stream
     hipEvent_t ev = state->sync_event;
-    int n = cfg.n_embd, n_ff = cfg.n_ff, head_dim = n / cfg.n_head;
-    int kv_dim = cfg.n_head_kv * head_dim;
+    int tp = m->tp_size > 1 ? m->tp_size : 1;
+    int n = cfg.n_embd, head_dim = n / cfg.n_head;
+    int n_head_local = cfg.n_head / tp;
+    int n_head_kv_local = cfg.n_head_kv / tp;
+    int kv_dim = n_head_kv_local * head_dim;
     int BS = state->batch_size;
 
     hipMemcpyAsync(state->d_positions, state->positions, BS * sizeof(int), hipMemcpyHostToDevice, s1);
@@ -675,8 +684,8 @@ static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
             launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, s1);
 
         // wq/wk/wv: GEMM on s1, patches on s2 (overlapped with next GEMM)
-        GEMM_ONLY(L.wq, bf16_a, state->q_buf, n, n, BS, s1);
-        PATCHES_ASYNC(L.wq, bf16_a, state->q_buf, n, n, BS, s1, s2, ev);
+        GEMM_ONLY(L.wq, bf16_a, state->q_buf, n, L.wq.M, BS, s1);
+        PATCHES_ASYNC(L.wq, bf16_a, state->q_buf, n, L.wq.M, BS, s1, s2, ev);
         GEMM_ONLY(L.wk, bf16_a, state->k_buf, n, kv_dim, BS, s1);
         PATCHES_ASYNC(L.wk, bf16_a, state->k_buf, n, kv_dim, BS, s1, s2, ev);
         GEMM_ONLY(L.wv, bf16_a, state->v_buf, n, kv_dim, BS, s1);
@@ -687,7 +696,7 @@ static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
 
         size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
         launch_rope_batch(state->q_buf, state->k_buf, state->d_positions,
-                          head_dim, cfg.n_head, cfg.n_head_kv, n, kv_dim, cfg.rope_theta, BS, s1);
+                          head_dim, n_head_local, n_head_kv_local, n_head_local * head_dim, kv_dim, cfg.rope_theta, BS, s1);
         launch_store_kv_batch(state->k_buf, state->v_buf,
                               m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
                               state->d_positions, kv_dim, m->max_seq_len, BS, s1);
@@ -696,16 +705,16 @@ static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
         for (int s = 0; s < BS; s++) max_pos = std::max(max_pos, state->positions[s]);
         if (max_pos < 1024)
             launch_attention_all_heads_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
-                bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
+                bf16_a, state->d_positions, n_head_local, n_head_kv_local, head_dim,
                 max_pos + 1, scale, BS, 0, s1);
         else
             launch_flash_attention_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
-                bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
+                bf16_a, state->d_positions, n_head_local, n_head_kv_local, head_dim,
                 max_pos + 1, scale, BS, 0, s1);
 
         // wo: GEMM + patches (patches must finish before add_rms_norm reads res)
-        GEMM_ONLY(L.wo, bf16_a, res, n, n, BS, s1);
-        PATCHES_ASYNC(L.wo, bf16_a, res, n, n, BS, s1, s2, ev);
+        GEMM_ONLY(L.wo, bf16_a, res, n_head_local * head_dim, n, BS, s1);
+        PATCHES_ASYNC(L.wo, bf16_a, res, n_head_local * head_dim, n, BS, s1, s2, ev);
         SYNC_PATCHES(s1, s2, ev);
         // TP: wo is column-split — all-reduce partial sums
         if (state->tp)
@@ -714,18 +723,18 @@ static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, s1);
 
         // w_gate + w_up: patches overlap with next GEMM
-        GEMM_ONLY(L.w_gate, bf16_a, state->ffn_gate, n, n_ff, BS, s1);
-        PATCHES_ASYNC(L.w_gate, bf16_a, state->ffn_gate, n, n_ff, BS, s1, s2, ev);
-        GEMM_ONLY(L.w_up, bf16_a, state->ffn_up, n, n_ff, BS, s1);
-        PATCHES_ASYNC(L.w_up, bf16_a, state->ffn_up, n, n_ff, BS, s1, s2, ev);
+        GEMM_ONLY(L.w_gate, bf16_a, state->ffn_gate, n, L.w_gate.M, BS, s1);
+        PATCHES_ASYNC(L.w_gate, bf16_a, state->ffn_gate, n, L.w_gate.M, BS, s1, s2, ev);
+        GEMM_ONLY(L.w_up, bf16_a, state->ffn_up, n, L.w_gate.M, BS, s1);
+        PATCHES_ASYNC(L.w_up, bf16_a, state->ffn_up, n, L.w_gate.M, BS, s1, s2, ev);
 
         // Sync patches before silu_mul consumes gate+up
         SYNC_PATCHES(s1, s2, ev);
-        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, BS, s1);
+        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, BS, s1);
 
         // w_down: patches must finish before add_rms_norm
-        GEMM_ONLY(L.w_down, bf16_b, cur, n_ff, n, BS, s1);
-        PATCHES_ASYNC(L.w_down, bf16_b, cur, n_ff, n, BS, s1, s2, ev);
+        GEMM_ONLY(L.w_down, bf16_b, cur, L.w_gate.M, n, BS, s1);
+        PATCHES_ASYNC(L.w_down, bf16_b, cur, L.w_gate.M, n, BS, s1, s2, ev);
         SYNC_PATCHES(s1, s2, ev);
         // TP: w_down is column-split — all-reduce partial sums
         if (state->tp)
@@ -738,8 +747,8 @@ static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
     }
 
     // output_proj: patches must finish before argmax
-    GEMM_ONLY(m->output_proj, bf16_a, state->logits, n, cfg.n_vocab, BS, s1);
-    PATCHES_ASYNC(m->output_proj, bf16_a, state->logits, n, cfg.n_vocab, BS, s1, s2, ev);
+    GEMM_ONLY(m->output_proj, bf16_a, state->logits, n, m->output_proj.M, BS, s1);
+    PATCHES_ASYNC(m->output_proj, bf16_a, state->logits, n, m->output_proj.M, BS, s1, s2, ev);
     SYNC_PATCHES(s1, s2, ev);
 
     for (int s = 0; s < BS; s++) state->positions[s]++;
@@ -753,7 +762,8 @@ void forward(InferenceState* state, const int* token_ids) {
 #ifdef TURBO_NVIDIA
     // NVIDIA: decode+cuBLAS for B>8 (tensor cores win at high batch)
     // B<=8 uses hand-optimized split12 per-row kernels (faster for small batch)
-    if (state->batch_size > 8 && state->model->layers[0].wq.split_sm) {
+    // TP: skip forward_batch_tiled (dual-stream conflicts with NCCL), use B=8 slicing
+    if (state->batch_size > 8 && state->model->layers[0].wq.split_sm && !state->tp) {
         forward_batch_tiled(state, token_ids); return;
     }
 #endif
@@ -763,9 +773,14 @@ void forward(InferenceState* state, const int* token_ids) {
         // Process as multiple B=8 passes (e.g., B=16 = 2× B=8, B=32 = 4× B=8)
         int orig_bs = state->batch_size;
         int n = state->model->config.n_embd;
-        int n_ff = state->model->config.n_ff;
-        int n_vocab = state->model->config.n_vocab;
-        int kv_dim = state->model->config.n_head_kv * (n / state->model->config.n_head);
+        int tp = state->model->tp_size > 1 ? state->model->tp_size : 1;
+        int head_dim = n / state->model->config.n_head;
+        int n_head_local = state->model->config.n_head / tp;
+        int n_head_kv_local = state->model->config.n_head_kv / tp;
+        int local_n = n_head_local * head_dim;
+        int kv_dim = n_head_kv_local * head_dim;
+        int local_nff = state->model->config.n_ff / tp;
+        int local_vocab = state->model->config.n_vocab / tp;
 
         for (int chunk = 0; chunk < orig_bs; chunk += 8) {
             // Temporarily adjust state to point to this chunk's slice
@@ -775,16 +790,16 @@ void forward(InferenceState* state, const int* token_ids) {
             slice.hidden = state->hidden + chunk * n;
             slice.hidden2 = state->hidden2 + chunk * n;
             slice.attn_out = state->attn_out + chunk * n;
-            slice.q_buf = state->q_buf + chunk * n;
+            slice.q_buf = state->q_buf + chunk * local_n;
             slice.k_buf = state->k_buf + chunk * kv_dim;
             slice.v_buf = state->v_buf + chunk * kv_dim;
-            slice.ffn_gate = state->ffn_gate + chunk * n_ff;
-            slice.ffn_up = state->ffn_up + chunk * n_ff;
-            slice.logits = state->logits + chunk * n_vocab;
+            slice.ffn_gate = state->ffn_gate + chunk * local_nff;
+            slice.ffn_up = state->ffn_up + chunk * local_nff;
+            slice.logits = state->logits + chunk * local_vocab;
             slice.d_positions = state->d_positions + chunk;
             slice.d_tokens = state->d_tokens + chunk;
-            slice.bf16_act = state->bf16_act + chunk * std::max(n, n_ff);
-            slice.bf16_act2 = state->bf16_act2 + chunk * std::max(n, n_ff);
+            slice.bf16_act = state->bf16_act + chunk * std::max(n, local_nff);
+            slice.bf16_act2 = state->bf16_act2 + chunk * std::max(n, local_nff);
 
             forward_b8(&slice, token_ids + chunk);
         }

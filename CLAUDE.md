@@ -91,16 +91,27 @@ CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./turbo-engine <model_dir> "<prompt>" <max_t
 
 ### 2x RTX 5070 Ti (TP=2, NCCL over PCIe 5.0) — Measured 2026-04-03
 
-#### Mistral 7B Instruct (TP=2, B=1)
+#### Mistral 7B (TP=2 vs 1-GPU)
 
-| Config | tok/s | vs 1-GPU | VRAM per GPU |
-|--------|------:|---------:|-------------:|
-| 1 GPU | 60.0 | 1.00x | ~11 GB |
-| **2 GPU TP=2** | **93.1** | **1.55x** | **~6 GB** |
+| Batch | 1-GPU | TP=2 | Speedup | Winner |
+|------:|------:|-----:|--------:|:------:|
+| B=1 | 60.0 | **93.1** | **1.55x** | TP=2 |
+| B=8 | 162.6 | **261.9** | **1.61x** | TP=2 |
+| B=16 | 673.1 | 263.8 | 0.39x | 1-GPU |
+| B=256 | 2553.5 | 264.3 | 0.10x | 1-GPU |
 
-Architecture: 2 all-reduces/layer x 32 layers = 64 NCCL calls/token (16 KB each).
-Interconnect: PCIe 5.0 x8 (bifurcated), SHM/direct transport. ~0.5 ms overhead/token.
-Enables 13B+ models on 2x 16 GB cards (32 GB total VRAM).
+#### Llama 3.1 8B (TP=2 vs 1-GPU)
+
+| Batch | 1-GPU | TP=2 | Speedup | Winner |
+|------:|------:|-----:|--------:|:------:|
+| B=1 | 57.0 | **86.3** | **1.51x** | TP=2 |
+| B=8 | 154.3 | **242.1** | **1.57x** | TP=2 |
+| B=16 | 627.5 | 243.8 | 0.39x | 1-GPU |
+| B=256 | 2470.7 | 248.5 | 0.10x | 1-GPU |
+
+**TP=2 wins at B<=8** (1.5-1.6x). **1-GPU wins at B>=16** (uses V3 TMA tensor cores).
+TP=2 currently uses B=8 slicing (no tensor cores). Future: TP-aware `forward_batch_tiled`.
+VRAM per GPU: ~6 GB (half model). Enables 13B+ models on 2x 16 GB.
 
 ### MI50 32GB (AMD GCN, 1.0 TB/s)
 

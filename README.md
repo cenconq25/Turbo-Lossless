@@ -121,18 +121,40 @@ The VRAM jump at B>=64 is cuBLAS workspace (~1.5 GB), allocated lazily when `for
 
 ### Multi-GPU: 2x RTX 5070 Ti (TP=2, NCCL over PCIe 5.0)
 
-#### Mistral 7B Instruct — Tensor Parallel (TP=2)
+#### Mistral 7B Instruct — TP=2 vs Single-GPU
 
-| Config | tok/s | vs Single-GPU | Speedup |
-|--------|------:|--------------:|--------:|
-| 1 GPU, B=1 | 60.0 | baseline | 1.00x |
-| **2 GPU TP=2, B=1** | **93.1** | **+55%** | **1.55x** |
+| Batch | 1 GPU tok/s | TP=2 tok/s | TP Speedup | Best Choice |
+|------:|------------:|-----------:|-----------:|:-----------:|
+| B=1 | 60.0 | **93.1** | **1.55x** | TP=2 |
+| B=4 | — | **188.2** | — | TP=2 |
+| B=8 | 162.6 | **261.9** | **1.61x** | TP=2 |
+| B=16 | 673.1 | 263.8 | 0.39x | 1 GPU |
+| B=32 | 1136.3 | 264.9 | 0.23x | 1 GPU |
+| B=64 | 1514.2 | 262.9 | 0.17x | 1 GPU |
+| B=128 | 2196.6 | 264.5 | 0.12x | 1 GPU |
+| B=256 | 2553.5 | 264.3 | 0.10x | 1 GPU |
 
-**How it works:** Model weights split across 2 GPUs. Each GPU holds half the attention heads (16/32) and half the FFN (7168/14336). NCCL all-reduce synchronizes after attention output projection (wo) and FFN down projection (w_down) — **2 all-reduces per layer x 32 layers = 64 NCCL calls per token**. Each all-reduce transfers 16 KB (4096 floats) at B=1.
+#### Llama 3.1 8B Instruct — TP=2 vs Single-GPU
 
-**VRAM per GPU (TP=2):** ~5.5 GB model + ~0.5 GB overhead = **~6 GB per GPU** (vs ~11 GB single-GPU). This enables **13B+ models** on 2x 16 GB cards.
+| Batch | 1 GPU tok/s | TP=2 tok/s | TP Speedup | Best Choice |
+|------:|------------:|-----------:|-----------:|:-----------:|
+| B=1 | 57.0 | **86.3** | **1.51x** | TP=2 |
+| B=4 | 113.5 | **176.3** | **1.55x** | TP=2 |
+| B=8 | 154.3 | **242.1** | **1.57x** | TP=2 |
+| B=16 | 627.5 | 243.8 | 0.39x | 1 GPU |
+| B=32 | 1068.6 | 225.9 | 0.21x | 1 GPU |
+| B=64 | 1438.6 | 123.4 | 0.09x | 1 GPU |
+| B=128 | 2110.8 | 112.8 | 0.05x | 1 GPU |
+| B=256 | 2470.7 | 248.5 | 0.10x | 1 GPU |
 
-**Interconnect:** PCIe 5.0 x8 per GPU (bifurcated from x16 on i9-12900K). No NVLink. NCCL uses SHM/direct transport. All-reduce overhead: ~0.5 ms per token (2.9% of 17.5 ms token time at B=1).
+**When to use TP=2:**
+- **B=1 to B=8 (latency):** TP=2 is 1.5-1.6x faster. Best for interactive single-user or small-batch serving.
+- **B>=16 (throughput):** Single-GPU is massively faster because it uses V3 TMA tensor cores via `forward_batch_tiled`. TP=2 currently falls back to B=8 slicing (per-row kernels) which doesn't scale.
+- **Large models:** TP=2 halves VRAM per GPU (~6 GB vs ~11 GB), enabling 13B+ models on 2x 16 GB cards.
+
+**Architecture:** Each GPU holds half the attention heads (16/32) and half the FFN (7168/14336). NCCL all-reduce after wo and w_down — 64 NCCL calls per token. PCIe 5.0 x8, SHM/direct transport, ~0.5 ms overhead at B=1.
+
+**Future optimization:** Implement TP-aware `forward_batch_tiled` with grouped NCCL all-reduce to unlock tensor core throughput at B>=16.
 
 ### MI50 32GB (AMD GCN, 1.0 TB/s)
 
