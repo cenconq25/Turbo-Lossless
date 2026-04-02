@@ -198,9 +198,9 @@ __global__ void nv_apply_patches(
     if (tid == 0 && correction != 0.0f) output[row] += correction;
 }
 
-// Compact batched patch correction: each block handles 16 rows × 1 batch item
-// Grid: (ceil(num_nonempty/16), B) — 16x fewer blocks than sparse version
-#define PATCH_ROWS_PER_BLOCK 16
+// Flat batched patch correction: 1 thread per (row, batch) pair
+// No warp reduction needed — each thread serializes ~2 patches (avg)
+// Grid: (ceil(num_nonempty * B / 256)), block: 256 threads
 __global__ void nv_apply_patches_batch(
     const int32_t* __restrict__ row_offsets,
     const int32_t* __restrict__ patch_cols,
@@ -210,14 +210,9 @@ __global__ void nv_apply_patches_batch(
     const int16_t* __restrict__ activations, int act_stride,
     float* __restrict__ output, int out_stride, int num_nonempty, int B)
 {
-    int block_row_start = blockIdx.x * PATCH_ROWS_PER_BLOCK;
-    int b = blockIdx.y;
-    if (b >= B) return;
-    int tid = threadIdx.x;
-    // 256 threads, 16 rows → 16 threads per row (half-warp)
-    int local_row = tid / 16;
-    int local_tid = tid % 16;
-    int row_idx = block_row_start + local_row;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int row_idx = idx / B;
+    int b = idx % B;
     if (row_idx >= num_nonempty) return;
 
     int row = nonempty_rows[row_idx];
@@ -225,13 +220,10 @@ __global__ void nv_apply_patches_batch(
     const int16_t* act = activations + b * act_stride;
 
     float correction = 0.0f;
-    for (int p = start + local_tid; p < end; p += 16)
+    for (int p = start; p < end; p++)
         correction += (bf16_to_float(correct_vals[p]) - bf16_to_float(wrong_vals[p]))
                       * bf16_to_float(act[patch_cols[p]]);
-    // Half-warp reduction (16 threads)
-    for (int off = 8; off > 0; off >>= 1)
-        correction += __shfl_down_sync(0xFFFF << (local_row * 16), correction, off, 16);
-    if (local_tid == 0 && correction != 0.0f)
+    if (correction != 0.0f)
         output[b * out_stride + row] += correction;
 }
 
@@ -281,8 +273,9 @@ int nv_launch_patches_batch_async(
     int B, void* stream)
 {
     if (num_nonempty == 0 || B == 0) return 0;
-    dim3 grid((num_nonempty + PATCH_ROWS_PER_BLOCK - 1) / PATCH_ROWS_PER_BLOCK, B);
-    nv_apply_patches_batch<<<grid, 256, 0, (cudaStream_t)stream>>>(
+    int total_pairs = num_nonempty * B;
+    int blocks = (total_pairs + 255) / 256;
+    nv_apply_patches_batch<<<blocks, 256, 0, (cudaStream_t)stream>>>(
         (const int32_t*)row_off, (const int32_t*)cols,
         (const int16_t*)correct, (const int16_t*)wrong,
         (const int32_t*)nonempty_rows,
@@ -295,29 +288,38 @@ int nv_launch_split12_fused_gemm_async(
     const void* sm, const void* gr, int base_exp,
     const void* act, int act_stride,
     void* out, int out_stride,
-    int M, int K, int B, void* stream)
+    int M, int K, int B, void* stream,
+    const void* patch_row_off, const void* patch_cols,
+    const void* patch_correct, const void* patch_wrong)
 {
-    // Adaptive TILE_N: TILE_N=32 optimal for B>=32
-    auto launch = [&](auto TN_v, auto WCT_v) {
+    // Adaptive TILE_N and TILE_K
+    auto launch = [&](auto TN_v, auto WCT_v, auto TK_v) {
         constexpr int TN = decltype(TN_v)::value, WCT = decltype(WCT_v)::value;
-        dim3 grid((M + S12_TILE_M - 1) / S12_TILE_M, (B + TN - 1) / TN);
-        int smem = S12_TILE_M * S12_TILE_K * 2 + S12_TILE_M * S12_TILE_K / 2 * 2
-                 + S12_TILE_K * TN * sizeof(__nv_bfloat16) * 2;
+        constexpr int TK = decltype(TK_v)::value;
+        // x=N-tiles (fast), y=M-tiles: consecutive blocks share weight data → L2 reuse
+        dim3 grid((B + TN - 1) / TN, (M + S12_TILE_M - 1) / S12_TILE_M);
+        int smem = S12_TILE_M * TK * 2              // sm_buf (double-buffered)
+                 + S12_TILE_M * TK / 2 * 2          // gr_buf (double-buffered)
+                 + TK * TN * (int)sizeof(__nv_bfloat16) * 2; // B_buf (double-buffered)
         // Request extended shared memory if needed (>48 KB)
         static bool configured = false;
         if (!configured && smem > 49152) {
-            cudaFuncSetAttribute(split12_fused_gemm<TN, WCT>,
+            cudaFuncSetAttribute(split12_fused_gemm<TN, WCT, TK>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             configured = true;
         }
-        split12_fused_gemm<TN, WCT><<<grid, S12_BLOCK, smem, (cudaStream_t)stream>>>(
+        split12_fused_gemm<TN, WCT, TK><<<grid, S12_BLOCK, smem, (cudaStream_t)stream>>>(
             (const uint8_t*)sm, (const uint8_t*)gr, base_exp,
-            (const __nv_bfloat16*)act, (float*)out, M, K, B, out_stride);
+            (const __nv_bfloat16*)act, (float*)out, M, K, B, out_stride,
+            (const int32_t*)patch_row_off, (const int32_t*)patch_cols,
+            (const int16_t*)patch_correct, (const int16_t*)patch_wrong);
     };
-    if (B >= 32)
-        launch(std::integral_constant<int,32>{}, std::integral_constant<int,4>{});
+    if (B >= 128)
+        launch(std::integral_constant<int,64>{}, std::integral_constant<int,8>{}, std::integral_constant<int,64>{});
+    else if (B >= 32)
+        launch(std::integral_constant<int,32>{}, std::integral_constant<int,4>{}, std::integral_constant<int,64>{});
     else
-        launch(std::integral_constant<int,16>{}, std::integral_constant<int,2>{});
+        launch(std::integral_constant<int,16>{}, std::integral_constant<int,2>{}, std::integral_constant<int,64>{});
 
     return 0;
 }

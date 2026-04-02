@@ -19,13 +19,12 @@
 #define MMA_N 8
 #define MMA_K 16
 
-#define S12_TILE_M 128      // 8 warp rows × 16 — 2x compute parallelism
-#define S12_TILE_K 64       // 4 K-slices
+#define S12_TILE_M 128      // 8 warp rows x 16 — 2x compute parallelism
 #define S12_N_WARPS 8       // 256 threads — 2x loading + compute throughput
 #define S12_BLOCK (S12_N_WARPS * 32)
 
 // ============================================================
-// PTX helpers + cp.async for DRAM→shared memory pipeline
+// PTX helpers + cp.async for DRAM->shared memory pipeline
 // ============================================================
 
 // cp.async: copy 16 bytes from global to shared without touching registers
@@ -70,16 +69,16 @@ __nv_bfloat16 decode_split12_bf16(uint8_t sm, uint8_t group, int base_exp) {
 __device__ __forceinline__
 void decode_a_slice(uint32_t a[4],
     const uint8_t* sm, const uint8_t* gr,
-    int r0, int r1, int twg, int kk, int be)
+    int r0, int r1, int twg, int kk, int be, int tile_k)
 {
     int k0 = kk + twg * 2, k1 = kk + 8 + twg * 2;
     // Vectorized uint32 reads from shared memory
-    const uint32_t* s0 = (const uint32_t*)(sm + r0 * S12_TILE_K);
-    const uint32_t* s1 = (const uint32_t*)(sm + r1 * S12_TILE_K);
+    const uint32_t* s0 = (const uint32_t*)(sm + r0 * tile_k);
+    const uint32_t* s1 = (const uint32_t*)(sm + r1 * tile_k);
     uint32_t w0r0=s0[k0/4], w0r1=s1[k0/4], w1r0=s0[k1/4], w1r1=s1[k1/4];
     int h0=(k0%4)*8, h1=(k1%4)*8;
-    const uint32_t* g0=(const uint32_t*)(gr+r0*(S12_TILE_K/2));
-    const uint32_t* g1=(const uint32_t*)(gr+r1*(S12_TILE_K/2));
+    const uint32_t* g0=(const uint32_t*)(gr+r0*(tile_k/2));
+    const uint32_t* g1=(const uint32_t*)(gr+r1*(tile_k/2));
     uint32_t gw0r0=g0[k0/8],gw0r1=g1[k0/8],gw1r0=g0[k1/8],gw1r1=g1[k1/8];
     int gh0=((k0/2)%4)*8, gh1=((k1/2)%4)*8;
 
@@ -95,8 +94,9 @@ void decode_a_slice(uint32_t a[4],
 
 // ============================================================
 // Main kernel: ZipServ-style interleaved decode + mma
+// Parameterized TILE_K for flexibility (64 or 128)
 // ============================================================
-template<int S12_TILE_N, int WCT>
+template<int S12_TILE_N, int WCT, int S12_TILE_K = 64>
 __launch_bounds__(S12_BLOCK)
 __global__ void split12_fused_gemm(
     const uint8_t* __restrict__ sign_mantissa,
@@ -104,18 +104,26 @@ __global__ void split12_fused_gemm(
     int base_exp,
     const __nv_bfloat16* __restrict__ B_matrix,
     float* __restrict__ C_matrix,
-    int M, int K, int N, int out_stride)
+    int M, int K, int N, int out_stride,
+    // Optional inline patch correction (NULL to skip)
+    const int32_t* __restrict__ patch_row_off,
+    const int32_t* __restrict__ patch_cols,
+    const int16_t* __restrict__ patch_correct,
+    const int16_t* __restrict__ patch_wrong)
 {
     const int tid = threadIdx.x;
     const int warp_id = tid / 32;
     const int lane_id = tid & 31;
-    const int block_m = blockIdx.x * S12_TILE_M;
-    const int block_n = blockIdx.y * S12_TILE_N;
+    // Grid: x=N-tiles (fast), y=M-tiles (slow)
+    // All N-tiles for the same M-tile dispatch together → weight data reused in L2
+    const int block_m = blockIdx.y * S12_TILE_M;
+    const int block_n = blockIdx.x * S12_TILE_N;
 
     extern __shared__ __align__(128) char smem[];
-    uint8_t* sm_buf = (uint8_t*)smem;
-    uint8_t* gr_buf = sm_buf + S12_TILE_M * S12_TILE_K * 2;
-    __nv_bfloat16* B_buf = (__nv_bfloat16*)(gr_buf + S12_TILE_M * S12_TILE_K / 2 * 2);
+    // Layout: sm_load(2xMxK) + gr_load(2xMxK/2) + B(2xKxNx2)
+    uint8_t* sm_buf = (uint8_t*)smem;                                          // 2xTILE_MxTILE_K
+    uint8_t* gr_buf = sm_buf + S12_TILE_M * S12_TILE_K * 2;                   // 2xTILE_MxTILE_K/2
+    __nv_bfloat16* B_buf = (__nv_bfloat16*)(gr_buf + S12_TILE_M * S12_TILE_K / 2 * 2); // 2xTILE_KxTILE_Nx2
 
     // Register double-buffers (ZipServ pattern)
     uint32_t a[2][4];          // 2 ping-pong buffers for A fragment
@@ -131,7 +139,7 @@ __global__ void split12_fused_gemm(
     int twg = lane_id % 4;
     int bg = lane_id/4, bt = lane_id%4;
 
-    // cp.async tile load macros: DRAM → shared memory bypassing registers
+    // cp.async tile load macros
     #define VL_SM(dst, ks) do { \
         for(int _i=tid;_i<S12_TILE_M*S12_TILE_K/16;_i+=S12_BLOCK){ \
         int _b=_i*16,_m=_b/S12_TILE_K,_k=_b%S12_TILE_K; \
@@ -155,7 +163,7 @@ __global__ void split12_fused_gemm(
     uint8_t* sm_r = sm_buf;
     uint8_t* gr_r = gr_buf;
     __nv_bfloat16* B_r = B_buf;
-    decode_a_slice(a[0], sm_r, gr_r, r0, r1, twg, 0, base_exp);
+    decode_a_slice(a[0], sm_r, gr_r, r0, r1, twg, 0, base_exp, S12_TILE_K);
     #pragma unroll
     for(int n=0;n<WCT;n++){
         const __nv_bfloat16* bp=B_r+(n*MMA_N+bg)*S12_TILE_K;
@@ -182,15 +190,13 @@ __global__ void split12_fused_gemm(
         B_r = B_buf + br*S12_TILE_K*S12_TILE_N;
 
         // === GENERALIZED INTERLEAVED K-slices (ZipServ pattern) ===
-        // decode(slice i+1) → mma(slice i) — overlaps ALU with tensor core
-        // Works for any TILE_K (4 slices for TILE_K=64, 8 for 128, etc.)
         #define N_SLICES (S12_TILE_K / MMA_K)
 
         #pragma unroll
         for (int ks = 1; ks < N_SLICES; ks++) {
             int cur = ks % 2, prev = 1 - cur;
             // Decode slice ks into buf[cur]
-            decode_a_slice(a[cur], sm_r, gr_r, r0, r1, twg, ks*MMA_K, base_exp);
+            decode_a_slice(a[cur], sm_r, gr_r, r0, r1, twg, ks*MMA_K, base_exp, S12_TILE_K);
             #pragma unroll
             for(int n=0;n<WCT;n++){
                 const __nv_bfloat16* bp=B_r+(n*MMA_N+bg)*S12_TILE_K+ks*MMA_K;
@@ -202,9 +208,7 @@ __global__ void split12_fused_gemm(
             for(int n=0;n<WCT;n++) mma_m16n8k16(c[n], a[prev], b[n][prev]);
         }
 
-        // Wait for cp.async, sync, then compute last slice
-        cp_async_wait<0>();
-        __syncthreads();
+        // MMA last slice (overlaps with cp.async in background)
         {
             int last = (N_SLICES - 1) % 2;
             #pragma unroll
@@ -212,12 +216,16 @@ __global__ void split12_fused_gemm(
         }
         #undef N_SLICES
 
+        // Wait for cp.async, sync
+        cp_async_wait<0>();
+        __syncthreads();
+
         // Pre-decode slice 0 of next tile
         if (tk + 1 < K / S12_TILE_K) {
             sm_r = sm_buf + bw*S12_TILE_M*S12_TILE_K;
             gr_r = gr_buf + bw*S12_TILE_M*S12_TILE_K/2;
             B_r = B_buf + bw*S12_TILE_K*S12_TILE_N;
-            decode_a_slice(a[0], sm_r, gr_r, r0, r1, twg, 0, base_exp);
+            decode_a_slice(a[0], sm_r, gr_r, r0, r1, twg, 0, base_exp, S12_TILE_K);
             #pragma unroll
             for(int n=0;n<WCT;n++){
                 const __nv_bfloat16* bp=B_r+(n*MMA_N+bg)*S12_TILE_K;
@@ -230,16 +238,51 @@ __global__ void split12_fused_gemm(
     #undef VL_GR
     #undef VL_B
 
-    // Output: C[b * out_stride + m]
-    int cg=lane_id/4, ct=lane_id%4;
-    for(int n=0;n<WCT;n++){
-        float* cf=reinterpret_cast<float*>(c[n]);
-        int nb=block_n+n*MMA_N;
-        int m0=block_m+warp_id*MMA_M+cg, m1=m0+8;
-        int b0=nb+ct*2, b1=b0+1;
-        if(m0<M&&b0<N) C_matrix[b0*out_stride+m0]=cf[0];
-        if(m0<M&&b1<N) C_matrix[b1*out_stride+m0]=cf[1];
-        if(m1<M&&b0<N) C_matrix[b0*out_stride+m1]=cf[2];
-        if(m1<M&&b1<N) C_matrix[b1*out_stride+m1]=cf[3];
+    // Output: transpose via shared memory for coalesced global writes
+    // Without this, each thread writes to b*out_stride+m — scattered (stride>>128B)
+    // With transpose: consecutive threads write consecutive m values — perfect coalescing
+    {
+        // Repurpose shared memory as output buffer (K-tile data no longer needed)
+        // Pad stride by +1 to avoid 32-way bank conflicts on read
+        const int OUT_PAD = S12_TILE_N + 1;
+        float* out_smem = (float*)smem;  // 128 × (TILE_N+1) × 4 bytes
+
+        int cg = lane_id / 4, ct = lane_id % 4;
+
+        // Step 1: write MMA results to shared memory
+        #pragma unroll
+        for (int n = 0; n < WCT; n++) {
+            float* cf = reinterpret_cast<float*>(c[n]);
+            int nb = n * MMA_N;
+            int m0 = warp_id * MMA_M + cg, m1 = m0 + 8;
+            out_smem[m0 * OUT_PAD + nb + ct*2]     = cf[0];
+            out_smem[m0 * OUT_PAD + nb + ct*2 + 1] = cf[1];
+            out_smem[m1 * OUT_PAD + nb + ct*2]     = cf[2];
+            out_smem[m1 * OUT_PAD + nb + ct*2 + 1] = cf[3];
+        }
+        __syncthreads();
+
+        // Step 2: coalesced write to global — consecutive threads write consecutive m
+        for (int idx = tid; idx < S12_TILE_M * S12_TILE_N; idx += S12_BLOCK) {
+            int m = idx % S12_TILE_M;
+            int b = idx / S12_TILE_M;
+            int gm = block_m + m, gb = block_n + b;
+            if (gm < M && gb < N) {
+                float val = out_smem[m * OUT_PAD + b];
+                // Inline patch correction (fused — no separate kernel launch)
+                if (patch_row_off) {
+                    int ps = patch_row_off[gm], pe = patch_row_off[gm + 1];
+                    for (int p = ps; p < pe; p++) {
+                        union { uint32_t u; float f; } cv, wv, av;
+                        cv.u = ((uint32_t)(uint16_t)patch_correct[p]) << 16;
+                        wv.u = ((uint32_t)(uint16_t)patch_wrong[p]) << 16;
+                        av.u = ((uint32_t)(uint16_t)((const int16_t*)B_matrix)[
+                            (int64_t)gb * K + patch_cols[p]]) << 16;
+                        val += (cv.f - wv.f) * av.f;
+                    }
+                }
+                C_matrix[gb * out_stride + gm] = val;
+            }
+        }
     }
 }

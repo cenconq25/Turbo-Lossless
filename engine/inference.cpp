@@ -34,7 +34,7 @@ extern "C" {
     // NVIDIA kernels (nvidia_kernels.cu)
     int nv_launch_split12_v2_async(const void* sm, const void* gr, int base_exp, const void* act, void* out, int M, int K, void* stream);
     int nv_launch_patches_async(const void* row_off, const void* cols, const void* correct, const void* wrong, const void* act, void* out, int M, void* stream);
-    int nv_launch_split12_fused_gemm_async(const void* sm, const void* gr, int base_exp, const void* act, int act_stride, void* out, int out_stride, int M, int K, int B, void* stream);
+    int nv_launch_split12_fused_gemm_async(const void* sm, const void* gr, int base_exp, const void* act, int act_stride, void* out, int out_stride, int M, int K, int B, void* stream, const void* patch_row_off, const void* patch_cols, const void* patch_correct, const void* patch_wrong);
     int nv_launch_patches_batch_async(const void* row_off, const void* cols, const void* correct, const void* wrong, const void* nonempty_rows, int num_nonempty, const void* act, int act_stride, void* out, int out_stride, int B, void* stream);
     int nv_launch_split12_cublas_batch_async(const void* sm, const void* gr, int base_exp, const void* act, int act_stride, void* out, int out_stride, void* bf16_weight_buf, int buf_half_elems, int M, int K, int B, void* stream);
 #endif
@@ -71,7 +71,8 @@ extern "C" {
         /* Hybrid: fused PTX for large tensors, cuBLAS for small ones */ \
         if ((w).M >= 4096) { \
             nv_launch_split12_fused_gemm_async((w).split_sm, (w).split_gr, (w).base_exp, \
-                bf16_in, n_in, out_buf, n_out, (w).M, (w).K, bs, strm); \
+                bf16_in, n_in, out_buf, n_out, (w).M, (w).K, bs, strm, \
+                nullptr, nullptr, nullptr, nullptr); \
         } else { \
             nv_launch_split12_cublas_batch_async((w).split_sm, (w).split_gr, (w).base_exp, \
                 bf16_in, n_in, out_buf, n_out, state->weight_buf, state->weight_buf_half, \
