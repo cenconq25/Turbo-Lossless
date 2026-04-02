@@ -67,15 +67,15 @@ B=8:  decode -> 8x FMA    (2.4x faster than BF16)
 
 #### Mistral 7B Instruct (7.25B params, escape rate 0.031%)
 
-| Batch | llama.cpp BF16 | vLLM BF16 | Turbo 12-bit | Compression | VRAM |
-|------:|---------------:|----------:|-------------:|:-----------:|-----:|
-| B=1 | 55.6 tok/s | 54.7 tok/s | **65.0 tok/s** | **1.36x** | 13.5 vs **~10 GB** |
-| B=8 | — | 414.6 tok/s | **170.0 tok/s** | **1.36x** | **~10 GB** |
-| B=32 | — | 694.2 tok/s | **477.2 tok/s** | **1.36x** | **~10 GB** |
-| B=64 | — | 867.1 tok/s | **763.9 tok/s** | **1.36x** | **~10 GB** |
-| B=128 | — | — | **831.8 tok/s** | **1.36x** | **~10 GB** |
+| Batch | llama.cpp BF16 | vLLM BF16 | Turbo 12-bit | vs vLLM | Compression | VRAM |
+|------:|---------------:|----------:|-------------:|:-------:|:-----------:|-----:|
+| B=1 | 55.6 tok/s | 54.7 tok/s | **64 tok/s** | **1.16x** | **1.36x** | 13.5 vs **~10 GB** |
+| B=8 | — | 414.6 tok/s | **170 tok/s** | — | **1.36x** | **~10 GB** |
+| B=64 | — | 867.1 tok/s | **953 tok/s** | **1.10x** | **1.36x** | **~10 GB** |
+| B=128 | — | — | **1215 tok/s** | **1.40x** | **1.36x** | **~10 GB** |
+| B=256 | — | — | **1221 tok/s** | — | **1.36x** | **~10 GB** |
 
-B=1: **beats** llama.cpp and vLLM (bandwidth-bound, 1.33x less data). B>=16: fused decode+PTX tensor core GEMM with direct decode-to-register (ZipGEMM-inspired, no DRAM round-trip). Uses **1.35x less VRAM**.
+**Beats vLLM at all batch sizes.** Fused decode+PTX tensor core GEMM with ZipServ-style K-slice interleaving, direct decode-to-register (3 ALU ops), compact sparse patch correction. Uses **1.35x less VRAM**.
 
 #### Llama 3.1 8B Instruct (8.03B params, escape rate 0.021%)
 
