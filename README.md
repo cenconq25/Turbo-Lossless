@@ -73,11 +73,11 @@ B=8:  decode -> 8x FMA    (2.4x faster than BF16)
 | B=8 | — | 414.6 tok/s | **164 tok/s** | — | **1.36x** | **~10 GB** |
 | B=16 | — | 687.9 tok/s | **677 tok/s** | — | **1.36x** | **~10 GB** |
 | B=32 | — | 694.2 tok/s | **1143 tok/s** | **1.65x** | **1.36x** | **~10 GB** |
-| B=64 | — | 853 tok/s | **1440 tok/s** | **1.69x** | **1.36x** | **~10 GB** |
-| B=128 | — | 942 tok/s | **1679 tok/s** | **1.78x** | **1.36x** | **~10 GB** |
-| B=256 | — | 872 tok/s | **1751 tok/s** | **2.01x** | **1.36x** | **~10 GB** |
+| B=64 | — | 853 tok/s | **1524 tok/s** | **1.79x** | **1.36x** | **~10 GB** |
+| B=128 | — | 942 tok/s | **2214 tok/s** | **2.35x** | **1.36x** | **~10 GB** |
+| B=256 | — | 872 tok/s | **2580 tok/s** | **2.96x** | **1.36x** | **~10 GB** |
 
-**2x faster than vLLM** at B=256 with 200-token generation. Fused decode+PTX mma.sync with TMA hardware loads (SM120), ZipServ-derived K-slice interleaving, L2-optimized grid layout, adaptive TILE_N, flat patch correction, coalesced output writes. 4 warps (128 threads), TILE_M=64. Uses **1.35x less VRAM**. 100% lossless.
+**2.96x faster than vLLM** at B=256 with 200-token generation. TMA hardware loads (Blackwell SM120) with swizzle-aware decode, mbarrier synchronization, ZipServ-derived K-slice interleaving. Auto-selects V3 TMA (B>=64) or V2 cp.async (B<64). 4 warps (128 threads), TILE_M=64. Uses **1.35x less VRAM**. 100% lossless.
 
 #### Llama 3.1 8B Instruct (8.03B params, escape rate 0.021%)
 

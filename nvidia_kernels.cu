@@ -434,12 +434,13 @@ int nv_launch_split12_fused_gemm_async(
     static int s_kernel_ver = -1;
     if (s_kernel_ver < 0) {
         const char* e = getenv("TURBO_KERNEL");
-        if (e && e[0] == '3') { s_kernel_ver = 3; printf("  GEMM: V3 TMA kernel\n"); }
+        if (e && e[0] == '2') { s_kernel_ver = 2; printf("  GEMM: V2 kernel (cp.async)\n"); }
         else if (e && e[0] == '1') { s_kernel_ver = 1; printf("  GEMM: V1 kernel (8 warps)\n"); }
-        else { s_kernel_ver = 2; printf("  GEMM: V2 kernel (4 warps)\n"); }
+        else { s_kernel_ver = 3; printf("  GEMM: V3 TMA kernel (auto)\n"); }
     }
 
-    if (s_kernel_ver == 3) {
+    if (s_kernel_ver == 3 && B >= 64) {
+        // V3 TMA: faster at B>=64, overhead too high for smaller batches
         return launch_v3_same_cu(
             sm, gr, base_exp, act, act_stride, out, out_stride,
             M, K, B, stream, patch_row_off, patch_cols, patch_correct, patch_wrong);
