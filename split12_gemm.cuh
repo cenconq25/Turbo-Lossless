@@ -1,317 +1,237 @@
 /**
- * Split12 Fused Decode+GEMM Kernel — ZipGEMM-inspired
+ * Split12 Fused Decode+GEMM — ZipServ-derived architecture (Apache 2.0)
+ * Adapted from ZipServ (arXiv 2603.17435) for split12 format.
  *
- * Decodes split12 compressed weights directly into tensor core registers.
- * NO DRAM round-trip: reads 1.5 bytes/weight from DRAM → decodes in registers → mma.sync
+ * Key optimizations from ZipServ:
+ *   1. K-slice interleaving: decode(i+1) overlaps with mma(i)
+ *   2. Register double-buffering for A and B fragments
+ *   3. Single __syncthreads per K-tile (not per K-slice)
  *
- * Adapted from ZipServ (arXiv 2603.17435) for our split12 format:
- *   split12: [sign 1][mantissa 7] (1 byte) + [group 4] (nibble) = 12 bits
- *   Decode: exponent = base_exp + group (1 ADD, no lookup)
- *
- * Key: our format is SIMPLER than TCA-TBE (no bitmaps, no popcount, no conditional paths)
- *
- * Hardware: sm_80+ (Ampere/Hopper/Ada/Blackwell) with BF16 tensor cores
+ * Our split12 decode: 3 ALU ops vs ZipServ's bitmap+popcount
  */
 
 #pragma once
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
-#include <mma.h>
 #include <cstdint>
-using namespace nvcuda;
 
-// MMA dimensions
 #define MMA_M 16
 #define MMA_N 8
 #define MMA_K 16
 
-// Tile dimensions
-#define S12_TILE_M 64      // 4 warp rows × 16
-#define S12_TILE_K 32      // 4 K-slices × 16 (MMA_K)
-#define S12_TILE_N_MAX 64  // max batch tile (adaptive)
-#define S12_N_WARPS 4      // warps per block
-#define S12_BLOCK (S12_N_WARPS * 32)  // 128 threads
+#define S12_TILE_M 64
+#define S12_TILE_K 64       // 4 K-slices of 16 — matches ZipServ
+#define S12_N_WARPS 4
+#define S12_BLOCK (S12_N_WARPS * 32)
 
 // ============================================================
-// PTX Inline Assembly Helpers
+// PTX helpers
 // ============================================================
-
-// mma.sync.aligned.m16n8k16: BF16 → FP32 accumulation
 __device__ __forceinline__
 void mma_m16n8k16(uint32_t* C, const uint32_t* A, const uint32_t* B) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{ %0, %1, %2, %3 }, "
-        "{ %4, %5, %6, %7 }, "
-        "{ %8, %9 }, "
-        "{ %10, %11, %12, %13 };\n"
-        : "=r"(C[0]), "=r"(C[1]), "=r"(C[2]), "=r"(C[3])
-        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
-          "r"(B[0]), "r"(B[1]),
-          "r"(C[0]), "r"(C[1]), "r"(C[2]), "r"(C[3]));
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\n"
+        :"=r"(C[0]),"=r"(C[1]),"=r"(C[2]),"=r"(C[3])
+        :"r"(A[0]),"r"(A[1]),"r"(A[2]),"r"(A[3]),
+         "r"(B[0]),"r"(B[1]),"r"(C[0]),"r"(C[1]),"r"(C[2]),"r"(C[3]));
 }
 
-// cp.async: async copy 16 bytes from global to shared
 __device__ __forceinline__
-void cp_async_16(void* smem_ptr, const void* global_ptr) {
-    uint32_t smem_addr = __cvta_generic_to_shared(smem_ptr);
-    asm volatile(
-        "cp.async.cg.shared.global [%0], [%1], 16;\n"
-        :: "r"(smem_addr), "l"(global_ptr));
+uint32_t decode_split12_pair(uint8_t sm0, uint8_t sm1, uint8_t g0, uint8_t g1, int be) {
+    uint16_t b0 = ((uint16_t)(sm0>>7)<<15)|((uint16_t)(be+g0)<<7)|(sm0&0x7F);
+    uint16_t b1 = ((uint16_t)(sm1>>7)<<15)|((uint16_t)(be+g1)<<7)|(sm1&0x7F);
+    return ((uint32_t)b1<<16)|b0;
 }
 
-__device__ __forceinline__ void cp_async_commit() {
-    asm volatile("cp.async.commit_group;\n" ::);
-}
-
-template<int N>
-__device__ __forceinline__ void cp_async_wait() {
-    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
-}
-
-// ldmatrix: load 8×8 BF16 matrix from shared memory → 4 registers
 __device__ __forceinline__
-void ldmatrix_x4(uint32_t* regs, const void* smem_ptr) {
-    uint32_t addr = __cvta_generic_to_shared(smem_ptr);
-    asm volatile(
-        "ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-        : "=r"(regs[0]), "=r"(regs[1]), "=r"(regs[2]), "=r"(regs[3])
-        : "r"(addr));
+__nv_bfloat16 decode_split12_bf16(uint8_t sm, uint8_t group, int base_exp) {
+    uint16_t bf16_bits = ((uint16_t)(sm >> 7) << 15) |
+                         ((uint16_t)(base_exp + group) << 7) | (sm & 0x7F);
+    return *reinterpret_cast<__nv_bfloat16*>(&bf16_bits);
 }
 
 // ============================================================
-// Split12 decode: sign_mantissa byte + group nibble → BF16 pair in register
+// Decode one K-slice of A into register buffer
 // ============================================================
 __device__ __forceinline__
-uint32_t decode_split12_pair(uint8_t sm0, uint8_t sm1, uint8_t group0, uint8_t group1, int base_exp) {
-    // Decode two BF16 values and pack into one uint32_t (bf16x2)
-    uint16_t bf16_0 = ((uint16_t)(sm0 >> 7) << 15) |
-                      ((uint16_t)(base_exp + group0) << 7) |
-                      (sm0 & 0x7F);
-    uint16_t bf16_1 = ((uint16_t)(sm1 >> 7) << 15) |
-                      ((uint16_t)(base_exp + group1) << 7) |
-                      (sm1 & 0x7F);
-    return ((uint32_t)bf16_1 << 16) | bf16_0;
+void decode_a_slice(uint32_t a[4],
+    const uint8_t* sm, const uint8_t* gr,
+    int r0, int r1, int twg, int kk, int be)
+{
+    int k0 = kk + twg * 2, k1 = kk + 8 + twg * 2;
+    // Vectorized uint32 reads from shared memory
+    const uint32_t* s0 = (const uint32_t*)(sm + r0 * S12_TILE_K);
+    const uint32_t* s1 = (const uint32_t*)(sm + r1 * S12_TILE_K);
+    uint32_t w0r0=s0[k0/4], w0r1=s1[k0/4], w1r0=s0[k1/4], w1r1=s1[k1/4];
+    int h0=(k0%4)*8, h1=(k1%4)*8;
+    const uint32_t* g0=(const uint32_t*)(gr+r0*(S12_TILE_K/2));
+    const uint32_t* g1=(const uint32_t*)(gr+r1*(S12_TILE_K/2));
+    uint32_t gw0r0=g0[k0/8],gw0r1=g1[k0/8],gw1r0=g0[k1/8],gw1r1=g1[k1/8];
+    int gh0=((k0/2)%4)*8, gh1=((k1/2)%4)*8;
+
+    a[0]=decode_split12_pair((w0r0>>h0)&0xFF,(w0r0>>(h0+8))&0xFF,
+        (gw0r0>>gh0)&0xF,(gw0r0>>(gh0+4))&0xF,be);
+    a[1]=decode_split12_pair((w0r1>>h0)&0xFF,(w0r1>>(h0+8))&0xFF,
+        (gw0r1>>gh0)&0xF,(gw0r1>>(gh0+4))&0xF,be);
+    a[2]=decode_split12_pair((w1r0>>h1)&0xFF,(w1r0>>(h1+8))&0xFF,
+        (gw1r0>>gh1)&0xF,(gw1r0>>(gh1+4))&0xF,be);
+    a[3]=decode_split12_pair((w1r1>>h1)&0xFF,(w1r1>>(h1+8))&0xFF,
+        (gw1r1>>gh1)&0xF,(gw1r1>>(gh1+4))&0xF,be);
 }
 
 // ============================================================
-// Main Fused Decode+GEMM Kernel
-//
-// C[M,N] = W[M,K] × A[K,N] where W is split12 compressed
-// Grid: (ceil(M/TILE_M), ceil(N/S12_TILE_N))
-// Block: 128 threads (4 warps)
+// Main kernel: ZipServ-style interleaved decode + mma
 // ============================================================
-template<int S12_TILE_N, int WARP_COL_TENSORS>
+template<int S12_TILE_N, int WCT>
 __launch_bounds__(S12_BLOCK)
 __global__ void split12_fused_gemm(
-    const uint8_t* __restrict__ sign_mantissa,  // [M * K]
-    const uint8_t* __restrict__ groups,          // [M * K / 2]
+    const uint8_t* __restrict__ sign_mantissa,
+    const uint8_t* __restrict__ groups,
     int base_exp,
-    const __nv_bfloat16* __restrict__ B_matrix,  // [N * K] activations (batch-major)
-    float* __restrict__ C_matrix,                // [N * out_stride] output (batch-major)
+    const __nv_bfloat16* __restrict__ B_matrix,
+    float* __restrict__ C_matrix,
     int M, int K, int N, int out_stride)
 {
     const int tid = threadIdx.x;
     const int warp_id = tid / 32;
     const int lane_id = tid & 31;
-
-    // Block position
     const int block_m = blockIdx.x * S12_TILE_M;
     const int block_n = blockIdx.y * S12_TILE_N;
-    const int tile_m_start = block_m;
-    const int rows_this_tile = min(S12_TILE_M, M - block_m);
-    const int cols_this_tile = min((int)S12_TILE_N, N - block_n);
 
-    // Shared memory: double-buffered weight data + B matrix
-    extern __shared__ __align__(128) char smem_raw[];
-    // Layout: [sm_buf0][sm_buf1][gr_buf0][gr_buf1][B_buf0][B_buf1]
-    uint8_t* sm_buf = (uint8_t*)smem_raw;
-    // sm: S12_TILE_M × S12_TILE_K × 2 buffers = 64×64×2 = 8192 bytes
+    extern __shared__ __align__(128) char smem[];
+    uint8_t* sm_buf = (uint8_t*)smem;
     uint8_t* gr_buf = sm_buf + S12_TILE_M * S12_TILE_K * 2;
-    // gr: S12_TILE_M × S12_TILE_K / 2 × 2 buffers = 64×32×2 = 4096 bytes
     __nv_bfloat16* B_buf = (__nv_bfloat16*)(gr_buf + S12_TILE_M * S12_TILE_K / 2 * 2);
-    // B: S12_TILE_K × S12_TILE_N × 2 buffers
-    // NO w_decoded buffer needed — direct decode to PTX registers!
 
-    // PTX m16n8k16 accumulators: 4 float32 (=4 uint32) per N-tile
-    // For WARP_COL_TENSORS=2: 2 accumulators covering N=16 (two m16n8k16 ops)
-    uint32_t c_regs[WARP_COL_TENSORS][4];
+    // Register double-buffers (ZipServ pattern)
+    uint32_t a[2][4];          // 2 ping-pong buffers for A fragment
+    uint32_t b[WCT][2][2];    // [n_tile][2 buffers][2 regs]
+
+    // Accumulators
+    uint32_t c[WCT][4];
     #pragma unroll
-    for (int j = 0; j < WARP_COL_TENSORS; j++)
-        c_regs[j][0] = c_regs[j][1] = c_regs[j][2] = c_regs[j][3] = 0;
+    for (int j = 0; j < WCT; j++) c[j][0]=c[j][1]=c[j][2]=c[j][3]=0;
 
-    const int num_k_tiles = (K + S12_TILE_K - 1) / S12_TILE_K;
+    int r0 = warp_id*MMA_M + lane_id/4;
+    int r1 = warp_id*MMA_M + 8 + lane_id/4;
+    int twg = lane_id % 4;
+    int bg = lane_id/4, bt = lane_id%4;
 
-    // Vectorized tile loading helper: load 16 bytes at a time for maximum throughput
-    // For interior tiles (not last K-tile), skip bounds checking for speed
-    #define LOAD_SM_TILE(dst, k_start) do { \
-        uint4* _d4 = (uint4*)(dst); \
-        for (int _i = tid; _i < S12_TILE_M * S12_TILE_K / 16; _i += S12_BLOCK) { \
-            int _byte = _i * 16; int _m = _byte / S12_TILE_K; int _k = _byte % S12_TILE_K; \
-            _d4[_i] = *((const uint4*)(sign_mantissa + (int64_t)(block_m + _m) * K + (k_start) + _k)); \
-        } \
-    } while(0)
-    #define LOAD_GR_TILE(dst, k_start) do { \
-        uint4* _d4 = (uint4*)(dst); \
-        for (int _i = tid; _i < S12_TILE_M * S12_TILE_K / 2 / 16; _i += S12_BLOCK) { \
-            int _byte = _i * 16; int _m = _byte / (S12_TILE_K/2); int _k = _byte % (S12_TILE_K/2); \
-            _d4[_i] = *((const uint4*)(groups + (int64_t)(block_m + _m) * K / 2 + (k_start)/2 + _k)); \
-        } \
-    } while(0)
-    #define LOAD_B_TILE(dst, k_start) do { \
-        uint4* _d4 = (uint4*)(dst); \
-        for (int _i = tid; _i < S12_TILE_K * S12_TILE_N * 2 / 16; _i += S12_BLOCK) { \
-            int _byte = _i * 16; int _elem = _byte / 2; \
-            int _n = _elem / S12_TILE_K; int _k = _elem % S12_TILE_K; \
-            _d4[_i] = *((const uint4*)(B_matrix + (int64_t)(block_n + _n) * K + (k_start) + _k)); \
-        } \
-    } while(0)
+    // Vectorized tile load macros
+    #define VL_SM(dst, ks) do { uint4* _d=(uint4*)(dst); \
+        for(int _i=tid;_i<S12_TILE_M*S12_TILE_K/16;_i+=S12_BLOCK){ \
+        int _b=_i*16,_m=_b/S12_TILE_K,_k=_b%S12_TILE_K; \
+        _d[_i]=*((const uint4*)(sign_mantissa+(int64_t)(block_m+_m)*K+(ks)+_k));} }while(0)
+    #define VL_GR(dst, ks) do { uint4* _d=(uint4*)(dst); \
+        for(int _i=tid;_i<S12_TILE_M*S12_TILE_K/2/16;_i+=S12_BLOCK){ \
+        int _b=_i*16,_m=_b/(S12_TILE_K/2),_k=_b%(S12_TILE_K/2); \
+        _d[_i]=*((const uint4*)(groups+(int64_t)(block_m+_m)*K/2+(ks)/2+_k));} }while(0)
+    #define VL_B(dst, ks) do { uint4* _d=(uint4*)(dst); \
+        for(int _i=tid;_i<S12_TILE_K*S12_TILE_N*2/16;_i+=S12_BLOCK){ \
+        int _b=_i*16,_e=_b/2,_n=_e/S12_TILE_K,_k=_e%S12_TILE_K; \
+        _d[_i]=*((const uint4*)(B_matrix+(int64_t)(block_n+_n)*K+(ks)+_k));} }while(0)
 
-    // Load first K-tile into buffer 0 (vectorized)
-    LOAD_SM_TILE(sm_buf, 0);
-    LOAD_GR_TILE(gr_buf, 0);
-    LOAD_B_TILE(B_buf, 0);
+    // Load first tile
+    VL_SM(sm_buf, 0); VL_GR(gr_buf, 0); VL_B(B_buf, 0);
     __syncthreads();
 
-    // K-tile loop with cp.async software pipeline
-    // Pattern: load tile i+1 async while computing tile i
-    for (int tile_k = 0; tile_k < num_k_tiles; tile_k++) {
-        int buf_read = tile_k % 2;
-        int buf_write = 1 - buf_read;
-
-        // VECTORIZED load next K-tile into write buffer
-        if (tile_k + 1 < num_k_tiles) {
-            int k_next = (tile_k + 1) * S12_TILE_K;
-            LOAD_SM_TILE(sm_buf + buf_write * S12_TILE_M * S12_TILE_K, k_next);
-            LOAD_GR_TILE(gr_buf + buf_write * S12_TILE_M * S12_TILE_K / 2, k_next);
-            LOAD_B_TILE(B_buf + buf_write * S12_TILE_K * S12_TILE_N, k_next);
-        }
-
-        // DIRECT DECODE-TO-REGISTER: no intermediate BF16 buffer, no WMMA load
-        // Reads compressed bytes from shared memory → decodes to PTX mma registers → tensor core
-        uint8_t* sm_read = sm_buf + buf_read * S12_TILE_M * S12_TILE_K;
-        uint8_t* gr_read = gr_buf + buf_read * S12_TILE_M * S12_TILE_K / 2;
-        __nv_bfloat16* B_read = B_buf + buf_read * S12_TILE_K * S12_TILE_N;
-
-        int warp_m_start = warp_id * MMA_M;  // rows this warp handles (0,16,32,48)
-        int row0 = warp_m_start + lane_id / 4;       // rows 0-7 within warp tile
-        int row1 = warp_m_start + 8 + lane_id / 4;   // rows 8-15 within warp tile
-        int twg = lane_id % 4;
-
-        // Macro to extract group nibble from shared memory
-        #define GR_SM(gr_ptr, row, k) \
-            (((k) & 1) ? ((gr_ptr)[(row) * (S12_TILE_K/2) + (k)/2] >> 4) \
-                       : ((gr_ptr)[(row) * (S12_TILE_K/2) + (k)/2] & 0xF))
-
-        #pragma unroll
-        for (int k_slice = 0; k_slice < S12_TILE_K / MMA_K; k_slice++) {
-            int kk = k_slice * MMA_K;
-
-            // Decode A directly into PTX mma.sync.m16n8k16 register layout:
-            //   a[0] = bf16x2(A[row0][kk+twg*2],   A[row0][kk+twg*2+1])   K cols 0-7
-            //   a[1] = bf16x2(A[row1][kk+twg*2],   A[row1][kk+twg*2+1])   rows 8-15, K 0-7
-            //   a[2] = bf16x2(A[row0][kk+8+twg*2], A[row0][kk+8+twg*2+1]) K cols 8-15
-            //   a[3] = bf16x2(A[row1][kk+8+twg*2], A[row1][kk+8+twg*2+1]) rows 8-15, K 8-15
-            uint32_t a_regs[4];
-            int k0 = kk + twg * 2, k1 = kk + 8 + twg * 2;
-
-            // Vectorized shared memory reads: load uint32 and extract bytes
-            // Eliminates 2-4x bank conflicts from individual byte reads
-            // k0 = kk + twg*2 is always even; k0 and k0+1 are in the same 4-byte word
-            {
-                // Load sm as uint32 (4 bytes at once) then extract 2 bytes
-                const uint32_t* sr0_4 = (const uint32_t*)(sm_read + row0 * S12_TILE_K);
-                const uint32_t* sr1_4 = (const uint32_t*)(sm_read + row1 * S12_TILE_K);
-
-                // k0/2 gives the word index containing bytes k0 and k0+1
-                // Since k0 is always even: k0/4 gives uint32 word, (k0%4) gives byte offset
-                uint32_t w0_r0 = sr0_4[k0/4];  // contains sm bytes [k0..k0+3]
-                uint32_t w0_r1 = sr1_4[k0/4];
-                uint32_t w1_r0 = sr0_4[k1/4];  // k1 = k0+8, always 4-aligned? k1/4 = (kk+8+twg*2)/4
-                uint32_t w1_r1 = sr1_4[k1/4];
-
-                int sh0 = (k0 % 4) * 8;  // bit shift for byte k0 within word
-                uint8_t sm0_r0 = (w0_r0 >> sh0) & 0xFF;
-                uint8_t sm1_r0 = (w0_r0 >> (sh0 + 8)) & 0xFF;  // k0+1 is k0+1 byte
-                uint8_t sm0_r1 = (w0_r1 >> sh0) & 0xFF;
-                uint8_t sm1_r1 = (w0_r1 >> (sh0 + 8)) & 0xFF;
-
-                int sh1 = (k1 % 4) * 8;
-                uint8_t sm2_r0 = (w1_r0 >> sh1) & 0xFF;
-                uint8_t sm3_r0 = (w1_r0 >> (sh1 + 8)) & 0xFF;
-                uint8_t sm2_r1 = (w1_r1 >> sh1) & 0xFF;
-                uint8_t sm3_r1 = (w1_r1 >> (sh1 + 8)) & 0xFF;
-
-                // Load gr as uint32 and extract nibbles (one byte has 2 nibbles)
-                const uint32_t* gr0_4 = (const uint32_t*)(gr_read + row0 * (S12_TILE_K/2));
-                const uint32_t* gr1_4 = (const uint32_t*)(gr_read + row1 * (S12_TILE_K/2));
-                uint32_t gw0_r0 = gr0_4[k0/8];  // byte k0/2 is at word k0/8
-                uint32_t gw0_r1 = gr1_4[k0/8];
-                uint32_t gw1_r0 = gr0_4[k1/8];
-                uint32_t gw1_r1 = gr1_4[k1/8];
-
-                int gsh0 = ((k0/2) % 4) * 8;  // bit shift for gr byte within word
-                uint8_t gb0_r0 = (gw0_r0 >> gsh0) & 0xFF;
-                uint8_t gb0_r1 = (gw0_r1 >> gsh0) & 0xFF;
-                int gsh1 = ((k1/2) % 4) * 8;
-                uint8_t gb1_r0 = (gw1_r0 >> gsh1) & 0xFF;
-                uint8_t gb1_r1 = (gw1_r1 >> gsh1) & 0xFF;
-
-                a_regs[0] = decode_split12_pair(sm0_r0, sm1_r0,
-                    gb0_r0 & 0xF, gb0_r0 >> 4, base_exp);
-                a_regs[1] = decode_split12_pair(sm0_r1, sm1_r1,
-                    gb0_r1 & 0xF, gb0_r1 >> 4, base_exp);
-                a_regs[2] = decode_split12_pair(sm2_r0, sm3_r0,
-                    gb1_r0 & 0xF, gb1_r0 >> 4, base_exp);
-                a_regs[3] = decode_split12_pair(sm2_r1, sm3_r1,
-                    gb1_r1 & 0xF, gb1_r1 >> 4, base_exp);
-            }
-
-            // Full PTX: load B from shared memory + mma.sync for each N-tile
-            // B fragment layout for m16n8k16: B[K=16][N=8], col-major
-            //   b[0] = bf16x2(B[K=twg*2][N=gid], B[K=twg*2+1][N=gid])
-            //   b[1] = bf16x2(B[K=8+twg*2][N=gid], B[K=8+twg*2+1][N=gid])
-            // B_read stored as [N][K], so B(N=n, K=k) = B_read[n * S12_TILE_K + k]
-            int b_gid = lane_id / 4;   // N position within 8-wide N-tile
-            int b_twg = lane_id % 4;   // K pair index
-
-            #pragma unroll
-            for (int n_tile = 0; n_tile < WARP_COL_TENSORS; n_tile++) {
-                __nv_bfloat16* b_ptr = B_read + (n_tile * MMA_N + b_gid) * S12_TILE_K + kk;
-                int bk0 = b_twg * 2;
-
-                uint32_t b_regs[2];
-                // Load B as 4-byte (uint32) aligned reads — one load per bf16x2 pair
-                b_regs[0] = *reinterpret_cast<const uint32_t*>(&b_ptr[bk0]);
-                b_regs[1] = *reinterpret_cast<const uint32_t*>(&b_ptr[8 + bk0]);
-
-                mma_m16n8k16(c_regs[n_tile], a_regs, b_regs);
-            }
-        }
-        #undef GR_SM
-
-        __syncthreads();  // Wait before overwriting read buffer
+    // Pre-decode slice 0 into buffer 0
+    uint8_t* sm_r = sm_buf;
+    uint8_t* gr_r = gr_buf;
+    __nv_bfloat16* B_r = B_buf;
+    decode_a_slice(a[0], sm_r, gr_r, r0, r1, twg, 0, base_exp);
+    #pragma unroll
+    for(int n=0;n<WCT;n++){
+        const __nv_bfloat16* bp=B_r+(n*MMA_N+bg)*S12_TILE_K;
+        b[n][0][0]=*reinterpret_cast<const uint32_t*>(&bp[bt*2]);
+        b[n][0][1]=*reinterpret_cast<const uint32_t*>(&bp[8+bt*2]);
     }
 
-    // Store PTX m16n8k16 accumulators directly to global memory
-    // C output mapping: c[0]=C[gid][twg*2], c[1]=C[gid][twg*2+1],
-    //                   c[2]=C[8+gid][twg*2], c[3]=C[8+gid][twg*2+1]
-    // where gid=lane/4, twg=lane%4, relative to warp's 16-row tile
-    int c_gid = lane_id / 4;  // row offset 0-7
-    int c_twg = lane_id % 4;  // col pair 0-3
+    // K-tile loop with ZipServ interleaving
+    #pragma unroll(1)
+    for (int tk = 0; tk < K / S12_TILE_K; tk++) {
+        int br = tk % 2, bw = 1 - br;
 
-    for (int n_tile = 0; n_tile < WARP_COL_TENSORS; n_tile++) {
-        float* cf = reinterpret_cast<float*>(c_regs[n_tile]);
-        int n_base = block_n + n_tile * MMA_N;  // MMA_N=8
+        // Async load next tile
+        if (tk + 1 < K / S12_TILE_K) {
+            int kn = (tk+1)*S12_TILE_K;
+            VL_SM(sm_buf+bw*S12_TILE_M*S12_TILE_K, kn);
+            VL_GR(gr_buf+bw*S12_TILE_M*S12_TILE_K/2, kn);
+            VL_B(B_buf+bw*S12_TILE_K*S12_TILE_N, kn);
+        }
 
-        int out_m0 = tile_m_start + warp_id * MMA_M + c_gid;
-        int out_m1 = tile_m_start + warp_id * MMA_M + 8 + c_gid;
-        int out_b0 = n_base + c_twg * 2;
-        int out_b1 = n_base + c_twg * 2 + 1;
+        sm_r = sm_buf + br*S12_TILE_M*S12_TILE_K;
+        gr_r = gr_buf + br*S12_TILE_M*S12_TILE_K/2;
+        B_r = B_buf + br*S12_TILE_K*S12_TILE_N;
 
-        if (out_m0 < M && out_b0 < N) C_matrix[out_b0 * out_stride + out_m0] = cf[0];
-        if (out_m0 < M && out_b1 < N) C_matrix[out_b1 * out_stride + out_m0] = cf[1];
-        if (out_m1 < M && out_b0 < N) C_matrix[out_b0 * out_stride + out_m1] = cf[2];
-        if (out_m1 < M && out_b1 < N) C_matrix[out_b1 * out_stride + out_m1] = cf[3];
+        // === INTERLEAVED K-slices (the ZipServ pattern) ===
+
+        // Decode slice 1 → buf 1, THEN mma slice 0 from buf 0
+        decode_a_slice(a[1], sm_r, gr_r, r0, r1, twg, 1*MMA_K, base_exp);
+        #pragma unroll
+        for(int n=0;n<WCT;n++){
+            const __nv_bfloat16* bp=B_r+(n*MMA_N+bg)*S12_TILE_K+1*MMA_K;
+            b[n][1][0]=*reinterpret_cast<const uint32_t*>(&bp[bt*2]);
+            b[n][1][1]=*reinterpret_cast<const uint32_t*>(&bp[8+bt*2]);
+        }
+        #pragma unroll
+        for(int n=0;n<WCT;n++) mma_m16n8k16(c[n], a[0], b[n][0]);
+
+        // Decode slice 2 → buf 0, mma slice 1 from buf 1
+        decode_a_slice(a[0], sm_r, gr_r, r0, r1, twg, 2*MMA_K, base_exp);
+        #pragma unroll
+        for(int n=0;n<WCT;n++){
+            const __nv_bfloat16* bp=B_r+(n*MMA_N+bg)*S12_TILE_K+2*MMA_K;
+            b[n][0][0]=*reinterpret_cast<const uint32_t*>(&bp[bt*2]);
+            b[n][0][1]=*reinterpret_cast<const uint32_t*>(&bp[8+bt*2]);
+        }
+        #pragma unroll
+        for(int n=0;n<WCT;n++) mma_m16n8k16(c[n], a[1], b[n][1]);
+
+        // Decode slice 3 → buf 1, mma slice 2 from buf 0
+        decode_a_slice(a[1], sm_r, gr_r, r0, r1, twg, 3*MMA_K, base_exp);
+        #pragma unroll
+        for(int n=0;n<WCT;n++){
+            const __nv_bfloat16* bp=B_r+(n*MMA_N+bg)*S12_TILE_K+3*MMA_K;
+            b[n][1][0]=*reinterpret_cast<const uint32_t*>(&bp[bt*2]);
+            b[n][1][1]=*reinterpret_cast<const uint32_t*>(&bp[8+bt*2]);
+        }
+        #pragma unroll
+        for(int n=0;n<WCT;n++) mma_m16n8k16(c[n], a[0], b[n][0]);
+
+        // Sync for next tile, then mma last slice
+        __syncthreads();
+        #pragma unroll
+        for(int n=0;n<WCT;n++) mma_m16n8k16(c[n], a[1], b[n][1]);
+
+        // Pre-decode slice 0 of next tile
+        if (tk + 1 < K / S12_TILE_K) {
+            sm_r = sm_buf + bw*S12_TILE_M*S12_TILE_K;
+            gr_r = gr_buf + bw*S12_TILE_M*S12_TILE_K/2;
+            B_r = B_buf + bw*S12_TILE_K*S12_TILE_N;
+            decode_a_slice(a[0], sm_r, gr_r, r0, r1, twg, 0, base_exp);
+            #pragma unroll
+            for(int n=0;n<WCT;n++){
+                const __nv_bfloat16* bp=B_r+(n*MMA_N+bg)*S12_TILE_K;
+                b[n][0][0]=*reinterpret_cast<const uint32_t*>(&bp[bt*2]);
+                b[n][0][1]=*reinterpret_cast<const uint32_t*>(&bp[8+bt*2]);
+            }
+        }
+    }
+    #undef VL_SM
+    #undef VL_GR
+    #undef VL_B
+
+    // Output: C[b * out_stride + m]
+    int cg=lane_id/4, ct=lane_id%4;
+    for(int n=0;n<WCT;n++){
+        float* cf=reinterpret_cast<float*>(c[n]);
+        int nb=block_n+n*MMA_N;
+        int m0=block_m+warp_id*MMA_M+cg, m1=m0+8;
+        int b0=nb+ct*2, b1=b0+1;
+        if(m0<M&&b0<N) C_matrix[b0*out_stride+m0]=cf[0];
+        if(m0<M&&b1<N) C_matrix[b1*out_stride+m0]=cf[1];
+        if(m1<M&&b0<N) C_matrix[b0*out_stride+m1]=cf[2];
+        if(m1<M&&b1<N) C_matrix[b1*out_stride+m1]=cf[3];
     }
 }

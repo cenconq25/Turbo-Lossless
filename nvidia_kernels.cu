@@ -38,13 +38,7 @@ float bf16_to_float(int16_t raw) {
     return c.f;
 }
 
-__device__ __forceinline__
-__nv_bfloat16 decode_split12_bf16(uint8_t sm, uint8_t group, int base_exp) {
-    uint16_t bf16_bits = ((uint16_t)(sm >> 7) << 15) |
-                         ((uint16_t)(base_exp + group) << 7) |
-                         (sm & 0x7F);
-    return *reinterpret_cast<__nv_bfloat16*>(&bf16_bits);
-}
+// decode_split12_bf16 defined in split12_gemm.cuh
 
 // ============================================================
 // B=1 Split12 Matvec (per-row, bandwidth-optimized)
