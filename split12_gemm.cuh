@@ -27,7 +27,7 @@ using namespace nvcuda;
 
 // Tile dimensions
 #define S12_TILE_M 64      // 4 warp rows × 16
-#define S12_TILE_K 64      // 4 K-slices × 16 (MMA_K)
+#define S12_TILE_K 32      // 4 K-slices × 16 (MMA_K)
 #define S12_TILE_N_MAX 64  // max batch tile (adaptive)
 #define S12_N_WARPS 4      // warps per block
 #define S12_BLOCK (S12_N_WARPS * 32)  // 128 threads
@@ -215,27 +215,55 @@ __global__ void split12_fused_gemm(
             uint32_t a_regs[4];
             int k0 = kk + twg * 2, k1 = kk + 8 + twg * 2;
 
-            // Optimized decode: precompute pointers, extract nibbles without conditionals
-            // k0 = kk + twg*2 is always EVEN (twg*2 = 0,2,4,6 + kk which is multiple of 16)
-            // So k0 is even → low nibble, k0+1 is odd → high nibble
-            // k1 = kk + 8 + twg*2: also even → same pattern
+            // Vectorized shared memory reads: load uint32 and extract bytes
+            // Eliminates 2-4x bank conflicts from individual byte reads
+            // k0 = kk + twg*2 is always even; k0 and k0+1 are in the same 4-byte word
             {
-                const uint8_t* sr0 = sm_read + row0 * S12_TILE_K;
-                const uint8_t* sr1 = sm_read + row1 * S12_TILE_K;
-                const uint8_t* gr0 = gr_read + row0 * (S12_TILE_K/2);
-                const uint8_t* gr1 = gr_read + row1 * (S12_TILE_K/2);
+                // Load sm as uint32 (4 bytes at once) then extract 2 bytes
+                const uint32_t* sr0_4 = (const uint32_t*)(sm_read + row0 * S12_TILE_K);
+                const uint32_t* sr1_4 = (const uint32_t*)(sm_read + row1 * S12_TILE_K);
 
-                // k0 is even: group byte at k0/2, low nibble = even element, high = odd
-                uint8_t gb0_r0 = gr0[k0/2], gb1_r0 = gr0[k1/2];
-                uint8_t gb0_r1 = gr1[k0/2], gb1_r1 = gr1[k1/2];
+                // k0/2 gives the word index containing bytes k0 and k0+1
+                // Since k0 is always even: k0/4 gives uint32 word, (k0%4) gives byte offset
+                uint32_t w0_r0 = sr0_4[k0/4];  // contains sm bytes [k0..k0+3]
+                uint32_t w0_r1 = sr1_4[k0/4];
+                uint32_t w1_r0 = sr0_4[k1/4];  // k1 = k0+8, always 4-aligned? k1/4 = (kk+8+twg*2)/4
+                uint32_t w1_r1 = sr1_4[k1/4];
 
-                a_regs[0] = decode_split12_pair(sr0[k0], sr0[k0+1],
+                int sh0 = (k0 % 4) * 8;  // bit shift for byte k0 within word
+                uint8_t sm0_r0 = (w0_r0 >> sh0) & 0xFF;
+                uint8_t sm1_r0 = (w0_r0 >> (sh0 + 8)) & 0xFF;  // k0+1 is k0+1 byte
+                uint8_t sm0_r1 = (w0_r1 >> sh0) & 0xFF;
+                uint8_t sm1_r1 = (w0_r1 >> (sh0 + 8)) & 0xFF;
+
+                int sh1 = (k1 % 4) * 8;
+                uint8_t sm2_r0 = (w1_r0 >> sh1) & 0xFF;
+                uint8_t sm3_r0 = (w1_r0 >> (sh1 + 8)) & 0xFF;
+                uint8_t sm2_r1 = (w1_r1 >> sh1) & 0xFF;
+                uint8_t sm3_r1 = (w1_r1 >> (sh1 + 8)) & 0xFF;
+
+                // Load gr as uint32 and extract nibbles (one byte has 2 nibbles)
+                const uint32_t* gr0_4 = (const uint32_t*)(gr_read + row0 * (S12_TILE_K/2));
+                const uint32_t* gr1_4 = (const uint32_t*)(gr_read + row1 * (S12_TILE_K/2));
+                uint32_t gw0_r0 = gr0_4[k0/8];  // byte k0/2 is at word k0/8
+                uint32_t gw0_r1 = gr1_4[k0/8];
+                uint32_t gw1_r0 = gr0_4[k1/8];
+                uint32_t gw1_r1 = gr1_4[k1/8];
+
+                int gsh0 = ((k0/2) % 4) * 8;  // bit shift for gr byte within word
+                uint8_t gb0_r0 = (gw0_r0 >> gsh0) & 0xFF;
+                uint8_t gb0_r1 = (gw0_r1 >> gsh0) & 0xFF;
+                int gsh1 = ((k1/2) % 4) * 8;
+                uint8_t gb1_r0 = (gw1_r0 >> gsh1) & 0xFF;
+                uint8_t gb1_r1 = (gw1_r1 >> gsh1) & 0xFF;
+
+                a_regs[0] = decode_split12_pair(sm0_r0, sm1_r0,
                     gb0_r0 & 0xF, gb0_r0 >> 4, base_exp);
-                a_regs[1] = decode_split12_pair(sr1[k0], sr1[k0+1],
+                a_regs[1] = decode_split12_pair(sm0_r1, sm1_r1,
                     gb0_r1 & 0xF, gb0_r1 >> 4, base_exp);
-                a_regs[2] = decode_split12_pair(sr0[k1], sr0[k1+1],
+                a_regs[2] = decode_split12_pair(sm2_r0, sm3_r0,
                     gb1_r0 & 0xF, gb1_r0 >> 4, base_exp);
-                a_regs[3] = decode_split12_pair(sr1[k1], sr1[k1+1],
+                a_regs[3] = decode_split12_pair(sm2_r1, sm3_r1,
                     gb1_r1 & 0xF, gb1_r1 >> 4, base_exp);
             }
 
