@@ -232,7 +232,52 @@ __global__ void nv_apply_patches_batch(
 // ============================================================
 #include "split12_gemm.cuh"
 #include "split12_gemm_v2.cuh"
-// V3 TMA kernel in separate CU (device pointer descriptors)
+// V3 TMA kernel — MUST be in same CU (cross-CU __grid_constant__ crashes on SM120)
+#include <cuda.h>
+#include "split12_gemm_v3.cuh"
+
+static int launch_v3_same_cu(
+    const void* sm, const void* gr, int base_exp,
+    const void* act, int act_stride, void* out, int out_stride,
+    int M, int K, int B, void* stream,
+    const void* p_ro, const void* p_co, const void* p_cv, const void* p_wv)
+{
+    auto launch = [&](auto TN_v, auto WCT_v) {
+        constexpr int TN = decltype(TN_v)::value, WCT = decltype(WCT_v)::value;
+        dim3 grid((B+TN-1)/TN, (M+V3_TILE_M-1)/V3_TILE_M);
+        int smem = V3_TILE_M*V3_TILE_K*2 + V3_TILE_M*V3_TILE_K/2*2 + V3_TILE_K*TN*2*2 + 128;
+        static bool c=false; if(!c){cudaFuncSetAttribute(split12_fused_gemm_v3<TN,WCT>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,smem);c=true;}
+        // Device-resident TMA descriptors
+        static CUtensorMap *d_sd=0,*d_gd=0,*d_bd=0;
+        if(!d_sd){cudaMalloc(&d_sd,sizeof(CUtensorMap));cudaMalloc(&d_gd,sizeof(CUtensorMap));cudaMalloc(&d_bd,sizeof(CUtensorMap));}
+        alignas(64) CUtensorMap sd,gd,bd; cuuint32_t se[2]={1,1};
+        cuuint64_t s1[2]={(cuuint64_t)K,(cuuint64_t)M},s2[1]={(cuuint64_t)K};
+        cuuint32_t s3[2]={V3_TILE_K,V3_TILE_M};
+        cuTensorMapEncodeTiled(&sd,CU_TENSOR_MAP_DATA_TYPE_UINT8,2,(void*)sm,s1,s2,s3,se,
+            CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_64B,CU_TENSOR_MAP_L2_PROMOTION_NONE,CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+        cuuint64_t g1[2]={(cuuint64_t)(K/2),(cuuint64_t)M},g2[1]={(cuuint64_t)(K/2)};
+        cuuint32_t g3[2]={V3_TILE_K/2,V3_TILE_M};
+        cuTensorMapEncodeTiled(&gd,CU_TENSOR_MAP_DATA_TYPE_UINT8,2,(void*)gr,g1,g2,g3,se,
+            CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_32B,CU_TENSOR_MAP_L2_PROMOTION_NONE,CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+        cuuint64_t b1[2]={(cuuint64_t)K,(cuuint64_t)B},b2[1]={(cuuint64_t)(K*2)};
+        cuuint32_t b3[2]={V3_TILE_K,(cuuint32_t)TN};
+        cuTensorMapEncodeTiled(&bd,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,2,(void*)act,b1,b2,b3,se,
+            CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_128B,CU_TENSOR_MAP_L2_PROMOTION_NONE,CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+        cudaMemcpyAsync(d_sd,&sd,sizeof(CUtensorMap),cudaMemcpyHostToDevice,(cudaStream_t)stream);
+        cudaMemcpyAsync(d_gd,&gd,sizeof(CUtensorMap),cudaMemcpyHostToDevice,(cudaStream_t)stream);
+        cudaMemcpyAsync(d_bd,&bd,sizeof(CUtensorMap),cudaMemcpyHostToDevice,(cudaStream_t)stream);
+        split12_fused_gemm_v3<TN,WCT><<<grid,V3_BLOCK,smem,(cudaStream_t)stream>>>(
+            d_sd,d_gd,d_bd,base_exp,(float*)out,M,K,B,out_stride,
+            (const int32_t*)p_ro,(const int32_t*)p_co,(const int16_t*)p_cv,(const int16_t*)p_wv);
+    };
+    if(B>=128)launch(std::integral_constant<int,64>{},std::integral_constant<int,8>{});
+    else if(B>=32)launch(std::integral_constant<int,32>{},std::integral_constant<int,4>{});
+    else launch(std::integral_constant<int,16>{},std::integral_constant<int,2>{});
+    return 0;
+}
+
+// Keep extern for nvidia_kernels_v3.cu backward compat (disabled)
 extern "C" int nv_launch_split12_fused_gemm_v3_async(
     const void* sm, const void* gr, int base_exp,
     const void* act, int act_stride,
@@ -395,7 +440,7 @@ int nv_launch_split12_fused_gemm_async(
     }
 
     if (s_kernel_ver == 3) {
-        return nv_launch_split12_fused_gemm_v3_async(
+        return launch_v3_same_cu(
             sm, gr, base_exp, act, act_stride, out, out_stride,
             M, K, B, stream, patch_row_off, patch_cols, patch_correct, patch_wrong);
     }
