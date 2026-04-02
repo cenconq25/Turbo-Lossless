@@ -190,10 +190,30 @@ static bool load_compressed(const std::string& dir, const std::string& prefix, C
     return true;
 }
 
-Model* load_model(const std::string& model_path, int device_id) {
+// Try to load a TP-sharded compressed weight; fall back to full weight if not found
+static bool load_compressed_tp(const std::string& dir, const std::string& prefix,
+                               CompressedWeight& w, int tp_rank, int tp_size) {
+    if (tp_size > 1) {
+        // Try TP shard file first
+        char tp_prefix[256];
+        snprintf(tp_prefix, sizeof(tp_prefix), "%s.tp%d", prefix.c_str(), tp_rank);
+        std::string tp_dims = dir + "/" + tp_prefix + ".dims";
+        std::ifstream tf(tp_dims);
+        if (tf.good()) {
+            tf.close();
+            return load_compressed(dir, tp_prefix, w);
+        }
+        // Fall back to full weight (backward compatible)
+    }
+    return load_compressed(dir, prefix, w);
+}
+
+Model* load_model(const std::string& model_path, int device_id, int tp_rank, int tp_size) {
     hipSetDevice(device_id);
 
     Model* m = new Model();
+    m->tp_rank = tp_rank;
+    m->tp_size = tp_size;
     std::string dir = model_path;
 
     // Check if this is a turbo-converted directory
@@ -220,6 +240,8 @@ Model* load_model(const std::string& model_path, int device_id) {
 
     printf("  Config: vocab=%d embd=%d heads=%d/%d layers=%d ff=%d\n",
            cfg.n_vocab, cfg.n_embd, cfg.n_head, cfg.n_head_kv, cfg.n_layer, cfg.n_ff);
+    if (tp_size > 1)
+        printf("  TP: rank %d/%d\n", tp_rank, tp_size);
 
     // Token embeddings (BF16 on GPU)
     auto embd = read_file(dir + "/tok_embd.bin");
@@ -234,7 +256,7 @@ Model* load_model(const std::string& model_path, int device_id) {
     }
 
     // Output projection
-    if (!load_compressed(dir, "output_proj", m->output_proj)) {
+    if (!load_compressed_tp(dir, "output_proj", m->output_proj, tp_rank, tp_size)) {
         fprintf(stderr, "Warning: no output_proj\n");
     }
 
@@ -253,34 +275,37 @@ Model* load_model(const std::string& model_path, int device_id) {
         auto fn = read_file(dir + "/" + prefix);
         if (!fn.empty()) layer.ffn_norm = upload_gpu<float>(fn.data(), fn.size() / sizeof(float));
 
-        // Compressed weights
+        // Compressed weights (TP-aware: tries .tp{rank} files first)
         snprintf(prefix, sizeof(prefix), "layer.%d.wq", i);
-        load_compressed(dir, prefix, layer.wq);
+        load_compressed_tp(dir, prefix, layer.wq, tp_rank, tp_size);
         snprintf(prefix, sizeof(prefix), "layer.%d.wk", i);
-        load_compressed(dir, prefix, layer.wk);
+        load_compressed_tp(dir, prefix, layer.wk, tp_rank, tp_size);
         snprintf(prefix, sizeof(prefix), "layer.%d.wv", i);
-        load_compressed(dir, prefix, layer.wv);
+        load_compressed_tp(dir, prefix, layer.wv, tp_rank, tp_size);
         snprintf(prefix, sizeof(prefix), "layer.%d.wo", i);
-        load_compressed(dir, prefix, layer.wo);
+        load_compressed_tp(dir, prefix, layer.wo, tp_rank, tp_size);
         snprintf(prefix, sizeof(prefix), "layer.%d.w_gate", i);
-        load_compressed(dir, prefix, layer.w_gate);
+        load_compressed_tp(dir, prefix, layer.w_gate, tp_rank, tp_size);
         snprintf(prefix, sizeof(prefix), "layer.%d.w_up", i);
-        load_compressed(dir, prefix, layer.w_up);
+        load_compressed_tp(dir, prefix, layer.w_up, tp_rank, tp_size);
         snprintf(prefix, sizeof(prefix), "layer.%d.w_down", i);
-        load_compressed(dir, prefix, layer.w_down);
+        load_compressed_tp(dir, prefix, layer.w_down, tp_rank, tp_size);
 
         if ((i + 1) % 8 == 0 || i == cfg.n_layer - 1)
             printf("  Loaded layer %d/%d\n", i + 1, cfg.n_layer);
     }
 
-    // Allocate KV cache
+    // Allocate KV cache (TP: each rank handles n_head_kv/tp_size heads)
     int head_dim = cfg.n_embd / cfg.n_head;
+    int kv_heads_local = cfg.n_head_kv / tp_size;
     // Max context length — configurable via TURBO_CTX env var (default 2048)
     const char* ctx_env = getenv("TURBO_CTX");
     m->max_seq_len = ctx_env ? atoi(ctx_env) : 2048;
     if (m->max_seq_len < 128) m->max_seq_len = 128;
     printf("  Context length: %d\n", m->max_seq_len);
-    size_t kv_size = (size_t)cfg.n_layer * m->max_seq_len * cfg.n_head_kv * head_dim;
+    if (tp_size > 1)
+        printf("  KV heads per rank: %d (of %d total)\n", kv_heads_local, cfg.n_head_kv);
+    size_t kv_size = (size_t)cfg.n_layer * m->max_seq_len * kv_heads_local * head_dim;
     GPU_CHECK(hipMalloc(&m->kv_cache_k, kv_size * sizeof(int16_t)));
     GPU_CHECK(hipMalloc(&m->kv_cache_v, kv_size * sizeof(int16_t)));
     hipMemset(m->kv_cache_k, 0, kv_size * sizeof(int16_t));

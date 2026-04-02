@@ -21,6 +21,7 @@ set(ENGINE_SOURCES
     tokenizer.cpp
     sampler.cpp
     kernels.hip
+    multi_gpu.cpp
 )
 
 if(GPU_PLATFORM STREQUAL "AMD")
@@ -42,5 +43,11 @@ elseif(GPU_PLATFORM STREQUAL "NVIDIA")
     endif()
     target_compile_options(turbo-engine PRIVATE -O3)
     set_target_properties(turbo-engine PROPERTIES CUDA_ARCHITECTURES "80")
-    target_link_libraries(turbo-engine PRIVATE cublas sentencepiece)
+
+    # NCCL for multi-GPU tensor parallelism
+    set(NCCL_INCLUDE_DIR "/home/roy/miniconda3/lib/python3.13/site-packages/nvidia/nccl/include")
+    set(NCCL_LIB_DIR "/home/roy/miniconda3/lib/python3.13/site-packages/nvidia/nccl/lib")
+    target_include_directories(turbo-engine PRIVATE ${NCCL_INCLUDE_DIR})
+    target_link_directories(turbo-engine PRIVATE ${NCCL_LIB_DIR})
+    target_link_libraries(turbo-engine PRIVATE cublas sentencepiece nccl)
 endif()

@@ -9,7 +9,7 @@ Outputs a directory with:
   layer.N.{wq,wk,wv,wo,w_gate,w_up,w_down}.{packed,codebook,esc_off,esc_val}.bin
 """
 
-import sys, os, json, struct, time
+import sys, os, json, struct, time, argparse
 import numpy as np
 import torch
 from safetensors import safe_open
@@ -37,7 +37,27 @@ _pack_lib.pack_structured12_csr.argtypes = [
 ]
 _pack_lib.pack_structured12_csr.restype = ctypes.c_int64
 
-def convert(model_dir, output_dir):
+# Load C split12 packer
+_split12_lib_path = os.path.join(_dir, "split12_pack.so")
+if not os.path.exists(_split12_lib_path):
+    os.system(f"gcc -O3 -shared -fPIC -o {_split12_lib_path} {os.path.join(_dir, 'split12_pack.c')}")
+_split12_lib = ctypes.CDLL(_split12_lib_path)
+_split12_lib.split12_find_base_exp.argtypes = [ctypes.POINTER(ctypes.c_uint16), ctypes.c_int]
+_split12_lib.split12_find_base_exp.restype = ctypes.c_int
+_split12_lib.pack_split12.argtypes = [
+    ctypes.POINTER(ctypes.c_uint16), ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_uint8),
+    ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
+    ctypes.POINTER(ctypes.c_int16), ctypes.POINTER(ctypes.c_int16),
+]
+_split12_lib.pack_split12.restype = ctypes.c_int
+
+# Tensors that are row-split (split M axis) for tensor parallelism
+ROW_SPLIT_NAMES = {"wq", "wk", "wv", "w_gate", "w_up", "output_proj"}
+# Tensors that are column-split (split K axis) for tensor parallelism
+COL_SPLIT_NAMES = {"wo", "w_down"}
+
+def convert(model_dir, output_dir, tp=1):
     os.makedirs(output_dir, exist_ok=True)
 
     # Load config
@@ -61,6 +81,8 @@ def convert(model_dir, output_dir):
     with open(os.path.join(output_dir, "config.bin"), "wb") as f:
         f.write(config_data)
     print(f"Config: vocab={n_vocab} embd={n_embd} heads={n_head}/{n_head_kv} layers={n_layer} ff={n_ff}")
+    if tp > 1:
+        print(f"Tensor Parallelism: tp={tp}, row-split={ROW_SPLIT_NAMES}, col-split={COL_SPLIT_NAMES}")
 
     # Load all safetensors shards
     shards = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
@@ -90,7 +112,7 @@ def convert(model_dir, output_dir):
         return os.path.getsize(path)
 
     def save_compressed(prefix, W):
-        """Compress BF16 weight using structured 12-bit and save packed + CSR escape data."""
+        """Compress BF16 weight using structured 12-bit and save packed + split12 + CSR escape data."""
         M, K = W.shape
         n = M * K
 
@@ -126,16 +148,65 @@ def convert(model_dir, output_dir):
             ctypes.c_int32(M), ctypes.c_int32(K),
         )
 
-        # Save files
+        # Save packed12 files
         save_raw(f"{prefix}.packed.bin", packed[:num_words])
-        # No codebook needed for structured 12-bit (decode is pure arithmetic)
         save_raw(f"{prefix}.row_off.bin", row_offsets)
         save_raw(f"{prefix}.patch_cols.bin", patch_cols[:num_patches])
         save_raw(f"{prefix}.patch_correct.bin", patch_correct[:num_patches])
         save_raw(f"{prefix}.patch_wrong.bin", patch_wrong[:num_patches])
         with open(os.path.join(output_dir, f"{prefix}.dims"), "w") as f:
             f.write(f"{M} {K} {num_patches} {base_exp}")
+
+        # Also generate split12 format (byte-aligned, zero read amplification)
+        sm_out = np.zeros(n, dtype=np.uint8)
+        gr_out = np.zeros((n + 1) // 2, dtype=np.uint8)
+        s12_row_offsets = np.zeros(M + 1, dtype=np.int32)
+        s12_patch_cols = np.zeros(max_patches, dtype=np.int32)
+        s12_patch_correct = np.zeros(max_patches, dtype=np.int16)
+        s12_patch_wrong = np.zeros(max_patches, dtype=np.int16)
+
+        _split12_lib.pack_split12(
+            raw.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+            ctypes.c_int(M), ctypes.c_int(K), ctypes.c_int(base_exp),
+            sm_out.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            gr_out.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            s12_row_offsets.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            s12_patch_cols.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            s12_patch_correct.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
+            s12_patch_wrong.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
+        )
+        save_raw(f"{prefix}.sm.bin", sm_out)
+        save_raw(f"{prefix}.gr.bin", gr_out)
+
         return int(num_patches)
+
+    def save_compressed_shard(prefix, W):
+        """Compress a TP shard — same as save_compressed but for a shard tensor."""
+        return save_compressed(prefix, W)
+
+    def shard_and_save(our_name, prefix, W):
+        """For tp > 1: shard a weight tensor and save each shard."""
+        M, K = W.shape
+        is_row_split = our_name in ROW_SPLIT_NAMES
+        is_col_split = our_name in COL_SPLIT_NAMES
+
+        for rank in range(tp):
+            if is_row_split:
+                shard_m_start = rank * M // tp
+                shard_m_end = (rank + 1) * M // tp
+                shard = W[shard_m_start:shard_m_end, :].contiguous()
+            elif is_col_split:
+                shard_k_start = rank * K // tp
+                shard_k_end = (rank + 1) * K // tp
+                shard = W[:, shard_k_start:shard_k_end].contiguous()
+            else:
+                # Replicate (should not happen for weight tensors, but safety)
+                shard = W.contiguous()
+
+            tp_prefix = f"{prefix}.tp{rank}"
+            save_compressed_shard(tp_prefix, shard)
+
+        return tp  # number of shards saved
 
     total_size = 0
     t0 = time.time()
@@ -159,8 +230,12 @@ def convert(model_dir, output_dir):
     if out_name:
         W = load_tensor(out_name)
         if W.dtype == torch.bfloat16 and W.ndim == 2:
-            esc = save_compressed("output_proj", W)
-            print(f"  output_proj: {W.shape} escapes={esc}")
+            if tp > 1:
+                shard_and_save("output_proj", "output_proj", W)
+                print(f"  output_proj: {W.shape} -> {tp} TP shards (row-split)")
+            else:
+                esc = save_compressed("output_proj", W)
+                print(f"  output_proj: {W.shape} escapes={esc}")
 
     # Layers
     for layer in range(n_layer):
@@ -189,7 +264,11 @@ def convert(model_dir, output_dir):
             if hf_name:
                 W = load_tensor(hf_name)
                 if W.dtype == torch.bfloat16 and W.ndim == 2:
-                    esc = save_compressed(f"layer.{layer}.{our_name}", W)
+                    prefix = f"layer.{layer}.{our_name}"
+                    if tp > 1:
+                        shard_and_save(our_name, prefix, W)
+                    else:
+                        save_compressed(prefix, W)
 
         print(f" done")
 
@@ -199,9 +278,13 @@ def convert(model_dir, output_dir):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <model_dir> [output_dir]")
-        sys.exit(1)
-    model_dir = sys.argv[1]
-    output_dir = sys.argv[2] if len(sys.argv) > 2 else model_dir + "-turbo"
-    convert(model_dir, output_dir)
+    parser = argparse.ArgumentParser(description="Convert BF16 safetensors to Turbo Lossless format")
+    parser.add_argument("model_dir", help="Path to HuggingFace model directory")
+    parser.add_argument("output_dir", nargs="?", default=None, help="Output directory (default: <model_dir>-turbo)")
+    parser.add_argument("--tp", type=int, default=1, help="Tensor parallelism degree (default: 1)")
+    args = parser.parse_args()
+
+    output_dir = args.output_dir if args.output_dir else args.model_dir + "-turbo"
+    if args.tp > 1:
+        print(f"Tensor Parallelism: splitting weights for {args.tp} GPUs")
+    convert(args.model_dir, output_dir, tp=args.tp)

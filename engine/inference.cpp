@@ -1,5 +1,6 @@
 #include "inference.h"
 #include "sampler.h"
+#include "multi_gpu.h"
 #include <cstdio>
 #include <cmath>
 #include "../gpu_compat.h"
@@ -108,29 +109,38 @@ static void check_force_cublas() {
 } while(0)
 #endif
 
-InferenceState* create_inference_state(Model* model, int batch_size, int max_seq_len) {
+InferenceState* create_inference_state(Model* model, int batch_size, int max_seq_len, int tp_size) {
     auto* s = new InferenceState();
     s->model = model;
     s->batch_size = batch_size;
     s->positions = new int[batch_size]();
+    s->tp = nullptr;
+    s->tp_rank = 0;
     int n = model->config.n_embd, n_ff = model->config.n_ff, n_vocab = model->config.n_vocab;
     int kv_dim = model->config.n_head_kv * (n / model->config.n_head);
     int bs = batch_size;
 
+    // When TP is active, row-split weights produce smaller local outputs
+    int local_n = n / tp_size;           // local head dim for q (row-split wq)
+    int local_kv = kv_dim / tp_size;     // local kv dim (row-split wk/wv)
+    int local_nff = n_ff / tp_size;      // local FFN dim (row-split w_gate/w_up)
+    int local_vocab = n_vocab / tp_size;  // local vocab (row-split output_proj)
+
+    // hidden/hidden2/res stay full size (hold all-reduced results)
     GPU_CHECK(hipMalloc(&s->hidden,   bs * n * sizeof(float)));
     GPU_CHECK(hipMalloc(&s->hidden2,  bs * n * sizeof(float)));
     GPU_CHECK(hipMalloc(&s->attn_out, bs * n * sizeof(float)));
-    GPU_CHECK(hipMalloc(&s->q_buf,    bs * n * sizeof(float)));
-    GPU_CHECK(hipMalloc(&s->k_buf,    bs * kv_dim * sizeof(float)));
-    GPU_CHECK(hipMalloc(&s->v_buf,    bs * kv_dim * sizeof(float)));
-    GPU_CHECK(hipMalloc(&s->ffn_gate, bs * n_ff * sizeof(float)));
-    GPU_CHECK(hipMalloc(&s->ffn_up,   bs * n_ff * sizeof(float)));
+    GPU_CHECK(hipMalloc(&s->q_buf,    bs * local_n * sizeof(float)));
+    GPU_CHECK(hipMalloc(&s->k_buf,    bs * local_kv * sizeof(float)));
+    GPU_CHECK(hipMalloc(&s->v_buf,    bs * local_kv * sizeof(float)));
+    GPU_CHECK(hipMalloc(&s->ffn_gate, bs * local_nff * sizeof(float)));
+    GPU_CHECK(hipMalloc(&s->ffn_up,   bs * local_nff * sizeof(float)));
     s->ffn_down = nullptr;  // unused — w_down writes directly to cur
-    GPU_CHECK(hipMalloc(&s->logits,   bs * n_vocab * sizeof(float)));
+    GPU_CHECK(hipMalloc(&s->logits,   bs * local_vocab * sizeof(float)));
     s->attn_scores_buf = nullptr;  // unused — flash attention uses tiled LDS
     GPU_CHECK(hipMalloc(&s->d_positions, bs * sizeof(int)));
     GPU_CHECK(hipMalloc(&s->d_tokens, bs * sizeof(int)));
-    int max_act = std::max(n, n_ff);
+    int max_act = std::max(n, local_nff);
     GPU_CHECK(hipMalloc(&s->bf16_act,  bs * max_act * sizeof(int16_t)));
     GPU_CHECK(hipMalloc(&s->bf16_act2, bs * max_act * sizeof(int16_t)));
     GPU_CHECK(hipStreamCreateWithFlags(&s->stream, hipStreamNonBlocking));
@@ -215,8 +225,11 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
     Model* m = state->model;
     auto& cfg = m->config;
     hipStream_t stream = state->stream;
+    int tp = m->tp_size > 1 ? m->tp_size : 1;
     int n = cfg.n_embd, head_dim = n / cfg.n_head;
-    int kv_dim = cfg.n_head_kv * head_dim;
+    int n_head_local = cfg.n_head / tp;
+    int n_head_kv_local = cfg.n_head_kv / tp;
+    int kv_dim = n_head_kv_local * head_dim;
     int pos = state->positions[0];
 
     hipMemcpyAsync(state->d_tokens, token_ids, sizeof(int), hipMemcpyHostToDevice, stream);
@@ -266,20 +279,23 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
         size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
         launch_rope_store_kv(state->q_buf, state->k_buf, state->v_buf,
                              m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
-                             head_dim, cfg.n_head, cfg.n_head_kv, pos,
+                             head_dim, n_head_local, n_head_kv_local, pos,
                              m->max_seq_len, cfg.rope_theta, stream);
         if (pos < 1024)
             launch_attention_all_heads(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
-                bf16_a, cfg.n_head, cfg.n_head_kv, head_dim, pos+1, m->max_seq_len, scale, stream);
+                bf16_a, n_head_local, n_head_kv_local, head_dim, pos+1, m->max_seq_len, scale, stream);
         else
             launch_flash_attention(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
-                bf16_a, cfg.n_head, cfg.n_head_kv, head_dim, pos+1, m->max_seq_len, scale, stream);
+                bf16_a, n_head_local, n_head_kv_local, head_dim, pos+1, m->max_seq_len, scale, stream);
 
         PROF_END_ATTN(stream);
 
         PROF_START(stream);
         MATVEC_B1(L.wo, bf16_a, res);
         PROF_END_MV(stream);
+        // TP: wo is column-split, output is partial sum — all-reduce to get full result
+        if (state->tp)
+            tp_allreduce_sum(res, n * 1, state->tp, state->tp_rank, (void*)stream);
 
         PROF_START(stream);
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
@@ -312,12 +328,15 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
         PROF_END_MV(stream);
 
         PROF_START(stream);
-        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, cfg.n_ff, 1, stream);
+        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, 1, stream);
         PROF_END_SILU(stream);
 
         PROF_START(stream);
         MATVEC_B1(L.w_down, bf16_b, cur);
         PROF_END_MV(stream);
+        // TP: w_down is column-split, output is partial sum — all-reduce to get full result
+        if (state->tp)
+            tp_allreduce_sum(cur, n * 1, state->tp, state->tp_rank, (void*)stream);
 
         PROF_START(stream);
         if (layer + 1 < cfg.n_layer) {
@@ -439,17 +458,26 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
 
 #ifdef TURBO_NVIDIA
         BATCH4_MATVEC(L.wo, bf16_a, res, n, n, stream);
+        // TP: wo is column-split — all-reduce partial sums
+        if (state->tp)
+            tp_allreduce_sum(res, n * BS, state->tp, state->tp_rank, (void*)stream);
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
         BATCH4_MATVEC(L.w_gate, bf16_a, state->ffn_gate, n, n_ff, stream);
         BATCH4_MATVEC(L.w_up, bf16_a, state->ffn_up, n, n_ff, stream);
         launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, BS, stream);
         BATCH4_MATVEC(L.w_down, bf16_b, cur, n_ff, n, stream);
+        // TP: w_down is column-split — all-reduce partial sums
+        if (state->tp)
+            tp_allreduce_sum(cur, n * BS, state->tp, state->tp_rank, (void*)stream);
 #else
         launch_structured12_batch4_async(L.wo.packed, L.wo.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.wo.escape_row_base, L.wo.escape_counts, L.wo.escape_vals,
             SEQ(res,0,n), SEQ(res,1,n), SEQ(res,2,n), SEQ(res,3,n),
             L.wo.M, L.wo.K, stream);
+        // TP: wo is column-split — all-reduce partial sums
+        if (state->tp)
+            tp_allreduce_sum(res, n * BS, state->tp, state->tp_rank, (void*)stream);
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
         launch_structured12_batch4_async(L.w_gate.packed, L.w_gate.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
@@ -467,6 +495,9 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
             L.w_down.escape_row_base, L.w_down.escape_counts, L.w_down.escape_vals,
             SEQ(cur,0,n), SEQ(cur,1,n), SEQ(cur,2,n), SEQ(cur,3,n),
             L.w_down.M, L.w_down.K, stream);
+        // TP: w_down is column-split — all-reduce partial sums
+        if (state->tp)
+            tp_allreduce_sum(cur, n * BS, state->tp, state->tp_rank, (void*)stream);
 #endif
 
         // Fuse add + next layer's RMSNorm (saves 1 kernel launch per layer)
@@ -542,6 +573,9 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
 
         // wo: attention now writes BF16 directly to bf16_a
         BATCH8_MATVEC(L.wo, bf16_a, res, n, n, stream);
+        // TP: wo is column-split — all-reduce partial sums
+        if (state->tp)
+            tp_allreduce_sum(res, n * BS, state->tp, state->tp_rank, (void*)stream);
         // Fused add + RMSNorm -> BF16
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
         BATCH8_MATVEC(L.w_gate, bf16_a, state->ffn_gate, n, n_ff, stream);
@@ -549,6 +583,9 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
         // Fused SiLU*mul -> BF16 for w_down
         launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, BS, stream);
         BATCH8_MATVEC(L.w_down, bf16_b, cur, n_ff, n, stream);
+        // TP: w_down is column-split — all-reduce partial sums
+        if (state->tp)
+            tp_allreduce_sum(cur, n * BS, state->tp, state->tp_rank, (void*)stream);
 
         // Fuse add + next layer's RMSNorm (saves 1 kernel launch per layer)
         if (layer + 1 < cfg.n_layer) {
@@ -662,6 +699,9 @@ static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
         GEMM_ONLY(L.wo, bf16_a, res, n, n, BS, s1);
         PATCHES_ASYNC(L.wo, bf16_a, res, n, n, BS, s1, s2, ev);
         SYNC_PATCHES(s1, s2, ev);
+        // TP: wo is column-split — all-reduce partial sums
+        if (state->tp)
+            tp_allreduce_sum(res, n * BS, state->tp, state->tp_rank, (void*)s1);
 
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, s1);
 
@@ -679,6 +719,9 @@ static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
         GEMM_ONLY(L.w_down, bf16_b, cur, n_ff, n, BS, s1);
         PATCHES_ASYNC(L.w_down, bf16_b, cur, n_ff, n, BS, s1, s2, ev);
         SYNC_PATCHES(s1, s2, ev);
+        // TP: w_down is column-split — all-reduce partial sums
+        if (state->tp)
+            tp_allreduce_sum(cur, n * BS, state->tp, state->tp_rank, (void*)s1);
 
         if (layer + 1 < cfg.n_layer)
             launch_add_rms_norm_bf16_batch(cur, res, m->layers[layer + 1].attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, s1);
@@ -746,13 +789,22 @@ std::vector<int> generate(InferenceState* state, const std::vector<int>& prompt_
     std::vector<int> output;
     int n_vocab = state->model->config.n_vocab;
 
+    // TP: each GPU has local_vocab logits; distributed argmax finds global max
+    int local_vocab = state->tp ? (n_vocab / state->tp->tp_size) : n_vocab;
+
     if (state->batch_size == 1) {
         for (int i = 0; i < (int)prompt_tokens.size(); i++) {
             state->positions[0] = i;
             forward(state, &prompt_tokens[i]);
         }
         for (int t = 0; t < max_tokens; t++) {
-            int next = sample_greedy(state->logits, n_vocab, state->stream);
+            int next;
+            if (state->tp) {
+                next = tp_distributed_argmax(state->logits, local_vocab, n_vocab,
+                                             state->tp, state->tp_rank, (void*)state->stream);
+            } else {
+                next = sample_greedy(state->logits, n_vocab, state->stream);
+            }
             if (next == 2) break;
             output.push_back(next);
             forward(state, &next);
@@ -766,11 +818,79 @@ std::vector<int> generate(InferenceState* state, const std::vector<int>& prompt_
             forward(state, tokens.data());
         }
         for (int t = 0; t < max_tokens; t++) {
-            // Single batched argmax launch + one sync (was: bs separate launches + syncs)
-            sample_greedy_batch(state->logits, tokens.data(), n_vocab, bs, state->stream);
+            if (state->tp) {
+                // TP batched: distributed argmax for each sequence
+                for (int s = 0; s < bs; s++) {
+                    tokens[s] = tp_distributed_argmax(state->logits + s * local_vocab,
+                                                      local_vocab, n_vocab,
+                                                      state->tp, state->tp_rank, (void*)state->stream);
+                }
+            } else {
+                // Single batched argmax launch + one sync (was: bs separate launches + syncs)
+                sample_greedy_batch(state->logits, tokens.data(), n_vocab, bs, state->stream);
+            }
             if (tokens[0] == 2) break;
             output.push_back(tokens[0]);
             forward(state, tokens.data());
+        }
+    }
+    return output;
+}
+
+// TP forward: drive both GPUs from single CPU thread
+// Both ranks must call forward() for NCCL collective ops to complete
+static void forward_tp(TPState* tp, const int* token_ids, int* device_ids) {
+    for (int rank = 0; rank < tp->tp_size; rank++) {
+        GPU_CHECK(hipSetDevice(device_ids[rank]));
+        forward(tp->states[rank], token_ids);
+    }
+}
+
+std::vector<int> generate_tp(TPState* tp, const std::vector<int>& prompt_tokens, int max_tokens, int* device_ids) {
+    std::vector<int> output;
+    InferenceState* s0 = tp->states[0];
+    int n_vocab = s0->model->config.n_vocab;
+    int local_vocab = n_vocab / tp->tp_size;
+
+    if (s0->batch_size == 1) {
+        // Prefill: process each prompt token on both GPUs
+        for (int i = 0; i < (int)prompt_tokens.size(); i++) {
+            for (int r = 0; r < tp->tp_size; r++)
+                tp->states[r]->positions[0] = i;
+            forward_tp(tp, &prompt_tokens[i], device_ids);
+        }
+        // Decode: generate tokens
+        for (int t = 0; t < max_tokens; t++) {
+            // Distributed argmax on rank 0 (it coordinates with rank 1 via NCCL)
+            GPU_CHECK(hipSetDevice(device_ids[0]));
+            int next = tp_distributed_argmax(s0->logits, local_vocab, n_vocab,
+                                              tp, 0, (void*)s0->stream);
+            if (next == 2 || next == s0->model->config.n_vocab - 1) break; // EOS
+            output.push_back(next);
+            forward_tp(tp, &next, device_ids);
+        }
+    } else {
+        int bs = s0->batch_size;
+        std::vector<int> tokens(bs);
+        // Prefill
+        for (int i = 0; i < (int)prompt_tokens.size(); i++) {
+            for (int r = 0; r < tp->tp_size; r++)
+                for (int s = 0; s < bs; s++)
+                    tp->states[r]->positions[s] = i;
+            for (int s = 0; s < bs; s++) tokens[s] = prompt_tokens[i];
+            forward_tp(tp, tokens.data(), device_ids);
+        }
+        // Decode
+        for (int t = 0; t < max_tokens; t++) {
+            GPU_CHECK(hipSetDevice(device_ids[0]));
+            for (int s = 0; s < bs; s++) {
+                tokens[s] = tp_distributed_argmax(s0->logits + s * local_vocab,
+                                                   local_vocab, n_vocab,
+                                                   tp, 0, (void*)s0->stream);
+            }
+            if (tokens[0] == 2) break;
+            output.push_back(tokens[0]);
+            forward_tp(tp, tokens.data(), device_ids);
         }
     }
     return output;

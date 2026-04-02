@@ -58,6 +58,10 @@ struct TransformerLayer {
 struct Model {
     ModelConfig config;
 
+    // Tensor parallelism
+    int tp_rank;    // 0 or 1 (default 0)
+    int tp_size;    // 1 (no TP) or 2
+
     // Embedding (BF16 on GPU — used for lookup, not matvec)
     int16_t* token_embd;  // [n_vocab, n_embd] as BF16
 
@@ -75,7 +79,7 @@ struct Model {
 };
 
 // Load model from safetensors directory
-Model* load_model(const std::string& model_path, int device_id = 0);
+Model* load_model(const std::string& model_path, int device_id = 0, int tp_rank = 0, int tp_size = 1);
 
 // Free model
 void free_model(Model* model);

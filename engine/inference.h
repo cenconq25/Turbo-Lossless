@@ -1,6 +1,8 @@
 #pragma once
 #include "model.h"
 
+struct TPState;  // forward declaration (defined in multi_gpu.h)
+
 // Inference state for one or more concurrent sequences
 struct InferenceState {
     Model* model;
@@ -34,10 +36,14 @@ struct InferenceState {
     void* weight_buf;       // [2 × max_M * max_K] BF16 ping-pong for cuBLAS decode+GEMM
     int weight_buf_half;    // elements per half-buffer (max_M × max_K)
 #endif
+
+    // Tensor parallelism (nullptr/0 when TP disabled, set by main.cpp)
+    TPState* tp;
+    int tp_rank;
 };
 
-// Create inference state
-InferenceState* create_inference_state(Model* model, int batch_size, int max_seq_len);
+// Create inference state (tp_size=1 for single GPU, tp_size=2 for 2-way tensor parallel)
+InferenceState* create_inference_state(Model* model, int batch_size, int max_seq_len, int tp_size = 1);
 void free_inference_state(InferenceState* state);
 
 // Run one forward pass: token_ids → logits
@@ -50,3 +56,6 @@ void forward(InferenceState* state, const int* token_ids);
 // max_tokens: max tokens to generate
 // Returns: generated token IDs
 std::vector<int> generate(InferenceState* state, const std::vector<int>& prompt_tokens, int max_tokens);
+
+// TP generation: drives both GPUs in lockstep (NCCL all-reduce requires both ranks)
+std::vector<int> generate_tp(TPState* tp, const std::vector<int>& prompt_tokens, int max_tokens, int* device_ids);
