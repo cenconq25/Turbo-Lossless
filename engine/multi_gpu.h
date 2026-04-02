@@ -22,8 +22,13 @@ struct TPState {
 TPState* init_tp(int tp_size, int* device_ids);
 
 // All-reduce sum across GPUs (in-place). buf is on device `rank`.
-// Synchronized on the given stream.
-void tp_allreduce_sum(float* buf, int count, TPState* tp, int rank, void* stream);
+// buf_id: 0=hidden, 1=hidden2 — identifies matching buffer across ranks.
+// Uses ncclGroupStart/End to batch both ranks from single thread.
+void tp_allreduce_sum(float* buf, int count, TPState* tp, int rank, void* stream, int buf_id);
+
+// Batch all-reduce: call for ALL ranks at once from single thread (avoids deadlock).
+// bufs[r] is the buffer on device r. Uses ncclGroupStart/End internally.
+void tp_allreduce_sum_all(float** bufs, int count, TPState* tp);
 
 // Distributed argmax: each GPU has local_logits[local_vocab].
 // Returns the global best token ID across all shards.

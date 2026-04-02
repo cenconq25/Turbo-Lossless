@@ -13,7 +13,8 @@
 #define NCCL_CHECK(call) do { \
     ncclResult_t _nccl_err = (call); \
     if (_nccl_err != ncclSuccess) { \
-        fprintf(stderr, "NCCL error at %s:%d: %d\n", __FILE__, __LINE__, (int)_nccl_err); \
+        fprintf(stderr, "NCCL error at %s:%d: %s (%d)\n", __FILE__, __LINE__, \
+                ncclGetErrorString(_nccl_err), (int)_nccl_err); \
         exit(1); \
     } \
 } while(0)
@@ -87,21 +88,41 @@ TPState* init_tp(int tp_size, int* device_ids) {
     return tp;
 }
 
-void tp_allreduce_sum(float* buf, int count, TPState* tp, int rank, void* stream) {
+void tp_allreduce_sum(float* buf, int count, TPState* tp, int rank, void* stream, int /*buf_id*/) {
     if (tp->tp_size <= 1) return;  // no-op for single GPU
 
 #if HAS_NCCL
     GPU_CHECK(hipSetDevice(tp->device_ids[rank]));
+    // Sync stream first to catch any prior kernel errors
+    cudaError_t sync_err = cudaStreamSynchronize((cudaStream_t)stream);
+    if (sync_err != cudaSuccess) {
+        fprintf(stderr, "CUDA kernel error before allreduce rank %d: %s\n", rank, cudaGetErrorString(sync_err));
+        exit(1);
+    }
     ncclComm_t comm = (ncclComm_t)tp->nccl_comms[rank];
     NCCL_CHECK(ncclAllReduce(
-        (const void*)buf,   // sendbuff
-        (void*)buf,         // recvbuff (in-place)
-        (size_t)count,
-        ncclFloat,
-        ncclSum,
-        comm,
+        (const void*)buf, (void*)buf, (size_t)count,
+        ncclFloat, ncclSum, comm,
         (cudaStream_t)stream
     ));
+#endif
+}
+
+// Batch all-reduce: call for ALL ranks at once (avoids deadlock from single thread)
+void tp_allreduce_sum_all(float** bufs, int count, TPState* tp) {
+    if (tp->tp_size <= 1) return;
+
+#if HAS_NCCL
+    NCCL_CHECK(ncclGroupStart());
+    for (int r = 0; r < tp->tp_size; r++) {
+        ncclComm_t comm = (ncclComm_t)tp->nccl_comms[r];
+        NCCL_CHECK(ncclAllReduce(
+            (const void*)bufs[r], (void*)bufs[r], (size_t)count,
+            ncclFloat, ncclSum, comm,
+            (cudaStream_t)tp->states[r]->stream
+        ));
+    }
+    NCCL_CHECK(ncclGroupEnd());
 #endif
 }
 

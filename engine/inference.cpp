@@ -295,7 +295,7 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
         PROF_END_MV(stream);
         // TP: wo is column-split, output is partial sum — all-reduce to get full result
         if (state->tp)
-            tp_allreduce_sum(res, n * 1, state->tp, state->tp_rank, (void*)stream);
+            tp_allreduce_sum(res, n * 1, state->tp, state->tp_rank, (void*)stream, 1);
 
         PROF_START(stream);
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
@@ -336,7 +336,7 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
         PROF_END_MV(stream);
         // TP: w_down is column-split, output is partial sum — all-reduce to get full result
         if (state->tp)
-            tp_allreduce_sum(cur, n * 1, state->tp, state->tp_rank, (void*)stream);
+            tp_allreduce_sum(cur, n * 1, state->tp, state->tp_rank, (void*)stream, 0);
 
         PROF_START(stream);
         if (layer + 1 < cfg.n_layer) {
@@ -460,7 +460,7 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
         BATCH4_MATVEC(L.wo, bf16_a, res, n, n, stream);
         // TP: wo is column-split — all-reduce partial sums
         if (state->tp)
-            tp_allreduce_sum(res, n * BS, state->tp, state->tp_rank, (void*)stream);
+            tp_allreduce_sum(res, n * BS, state->tp, state->tp_rank, (void*)stream, 1);
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
         BATCH4_MATVEC(L.w_gate, bf16_a, state->ffn_gate, n, n_ff, stream);
         BATCH4_MATVEC(L.w_up, bf16_a, state->ffn_up, n, n_ff, stream);
@@ -468,7 +468,7 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
         BATCH4_MATVEC(L.w_down, bf16_b, cur, n_ff, n, stream);
         // TP: w_down is column-split — all-reduce partial sums
         if (state->tp)
-            tp_allreduce_sum(cur, n * BS, state->tp, state->tp_rank, (void*)stream);
+            tp_allreduce_sum(cur, n * BS, state->tp, state->tp_rank, (void*)stream, 0);
 #else
         launch_structured12_batch4_async(L.wo.packed, L.wo.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
@@ -477,7 +477,7 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
             L.wo.M, L.wo.K, stream);
         // TP: wo is column-split — all-reduce partial sums
         if (state->tp)
-            tp_allreduce_sum(res, n * BS, state->tp, state->tp_rank, (void*)stream);
+            tp_allreduce_sum(res, n * BS, state->tp, state->tp_rank, (void*)stream, 1);
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
         launch_structured12_batch4_async(L.w_gate.packed, L.w_gate.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
@@ -497,7 +497,7 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
             L.w_down.M, L.w_down.K, stream);
         // TP: w_down is column-split — all-reduce partial sums
         if (state->tp)
-            tp_allreduce_sum(cur, n * BS, state->tp, state->tp_rank, (void*)stream);
+            tp_allreduce_sum(cur, n * BS, state->tp, state->tp_rank, (void*)stream, 0);
 #endif
 
         // Fuse add + next layer's RMSNorm (saves 1 kernel launch per layer)
@@ -575,7 +575,7 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
         BATCH8_MATVEC(L.wo, bf16_a, res, n, n, stream);
         // TP: wo is column-split — all-reduce partial sums
         if (state->tp)
-            tp_allreduce_sum(res, n * BS, state->tp, state->tp_rank, (void*)stream);
+            tp_allreduce_sum(res, n * BS, state->tp, state->tp_rank, (void*)stream, 1);
         // Fused add + RMSNorm -> BF16
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
         BATCH8_MATVEC(L.w_gate, bf16_a, state->ffn_gate, n, n_ff, stream);
@@ -585,7 +585,7 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
         BATCH8_MATVEC(L.w_down, bf16_b, cur, n_ff, n, stream);
         // TP: w_down is column-split — all-reduce partial sums
         if (state->tp)
-            tp_allreduce_sum(cur, n * BS, state->tp, state->tp_rank, (void*)stream);
+            tp_allreduce_sum(cur, n * BS, state->tp, state->tp_rank, (void*)stream, 0);
 
         // Fuse add + next layer's RMSNorm (saves 1 kernel launch per layer)
         if (layer + 1 < cfg.n_layer) {
@@ -701,7 +701,7 @@ static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
         SYNC_PATCHES(s1, s2, ev);
         // TP: wo is column-split — all-reduce partial sums
         if (state->tp)
-            tp_allreduce_sum(res, n * BS, state->tp, state->tp_rank, (void*)s1);
+            tp_allreduce_sum(res, n * BS, state->tp, state->tp_rank, (void*)s1, 1);
 
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, s1);
 
@@ -721,7 +721,7 @@ static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
         SYNC_PATCHES(s1, s2, ev);
         // TP: w_down is column-split — all-reduce partial sums
         if (state->tp)
-            tp_allreduce_sum(cur, n * BS, state->tp, state->tp_rank, (void*)s1);
+            tp_allreduce_sum(cur, n * BS, state->tp, state->tp_rank, (void*)s1, 0);
 
         if (layer + 1 < cfg.n_layer)
             launch_add_rms_norm_bf16_batch(cur, res, m->layers[layer + 1].attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, s1);
@@ -837,13 +837,20 @@ std::vector<int> generate(InferenceState* state, const std::vector<int>& prompt_
     return output;
 }
 
-// TP forward: drive both GPUs from single CPU thread
-// Both ranks must call forward() for NCCL collective ops to complete
+// TP forward: run both GPUs in parallel using 2 threads.
+// NCCL allreduce inside forward() naturally synchronizes both ranks.
+#include <thread>
+
+static void forward_rank(InferenceState* state, const int* token_ids, int device_id) {
+    GPU_CHECK(hipSetDevice(device_id));
+    forward(state, token_ids);
+    GPU_CHECK(hipStreamSynchronize(state->stream));
+}
+
 static void forward_tp(TPState* tp, const int* token_ids, int* device_ids) {
-    for (int rank = 0; rank < tp->tp_size; rank++) {
-        GPU_CHECK(hipSetDevice(device_ids[rank]));
-        forward(tp->states[rank], token_ids);
-    }
+    std::thread t1(forward_rank, tp->states[1], token_ids, device_ids[1]);
+    forward_rank(tp->states[0], token_ids, device_ids[0]);
+    t1.join();
 }
 
 std::vector<int> generate_tp(TPState* tp, const std::vector<int>& prompt_tokens, int max_tokens, int* device_ids) {
