@@ -1,6 +1,6 @@
 # Turbo Lossless: BF16 Compression Engine
 
-100% bit-perfect lossless compression for BF16 LLM weights. BF16 in, BF16 out — no precision loss, 1.33x smaller, 29% less VRAM. Beats llama.cpp BF16 at B=1, ~3x faster at B=8.
+100% bit-perfect lossless compression for BF16 LLM weights. BF16 in, BF16 out — no precision loss, 1.33x smaller. Runs Llama 3.1 8B on 16 GB cards where vLLM OOMs. 2.93x faster than vLLM at B=256.
 
 **BF16 safetensors only.** No GGUF, no FP16, no FP32, no quantized formats.
 
@@ -67,32 +67,57 @@ B=8:  decode -> 8x FMA    (2.4x faster than BF16)
 
 #### Mistral 7B Instruct (7.25B params, escape rate 0.031%)
 
-| Batch | Kernel | vLLM BF16 | Turbo 12-bit | vs vLLM | Compression | VRAM |
-|------:|:------:|----------:|-------------:|:-------:|:-----------:|-----:|
-| B=1 | V2 | 54.7 tok/s | **60.0 tok/s** | **1.10x** | **1.36x** | 13.5 vs **~10 GB** |
-| B=8 | V2 | 414.6 tok/s | **162.6 tok/s** | — | **1.36x** | **~10 GB** |
-| B=16 | V2 | 687.9 tok/s | **673.1 tok/s** | — | **1.36x** | **~10 GB** |
-| B=32 | V2 | 694.2 tok/s | **1136.3 tok/s** | **1.64x** | **1.36x** | **~10 GB** |
-| B=64 | V3 TMA | 853 tok/s | **1514.2 tok/s** | **1.77x** | **1.36x** | **~10 GB** |
-| B=128 | V3 TMA | 942 tok/s | **2196.6 tok/s** | **2.33x** | **1.36x** | **~10 GB** |
-| B=256 | V3 TMA | 872 tok/s | **2553.5 tok/s** | **2.93x** | **1.36x** | **~10 GB** |
+| Batch | Kernel | vLLM BF16 | Turbo 12-bit | vs vLLM | Model VRAM | Overhead |
+|------:|:------:|----------:|-------------:|:-------:|-----------:|---------:|
+| B=1 | V2 | 54.7 tok/s | **60.0 tok/s** | **1.10x** | 10.2 GB | 0.9 GB |
+| B=8 | V2 | 414.6 tok/s | **162.6 tok/s** | — | 10.2 GB | 0.9 GB |
+| B=16 | V2 | 687.9 tok/s | **673.1 tok/s** | — | 10.2 GB | 1.0 GB |
+| B=32 | V2 | 694.2 tok/s | **1136.3 tok/s** | **1.64x** | 10.2 GB | 1.0 GB |
+| B=64 | V3 TMA | 853 tok/s | **1514.2 tok/s** | **1.77x** | 10.2 GB | 2.5 GB |
+| B=128 | V3 TMA | 942 tok/s | **2196.6 tok/s** | **2.33x** | 10.2 GB | 2.5 GB |
+| B=256 | V3 TMA | 872 tok/s | **2553.5 tok/s** | **2.93x** | 10.2 GB | 2.5 GB |
 
-**2.93x faster than vLLM** at B=256 with 200-token generation. V3 TMA (B>=64): hardware tensor memory loads (Blackwell SM120) with swizzle-aware decode, mbarrier synchronization. V2 cp.async (B<64): pipelined DRAM->shared loads. ZipServ-derived K-slice interleaving. Uses **1.35x less VRAM**. 100% lossless.
+vLLM: model 13.2 GB + overhead 2.1 GB = **15.3 GB** (max 1 user). Turbo: **12.7 GB** at B=256 — 3.3 GB free on 16 GB card.
 
 #### Llama 3.1 8B Instruct (8.03B params, escape rate 0.021%)
 
-| Batch | Kernel | vLLM BF16 | Turbo 12-bit | Compression | VRAM |
-|------:|:------:|----------:|-------------:|:-----------:|-----:|
-| B=1 | V2 | OOM | **57.0 tok/s** | **1.42x** | 15.0 vs **~10.5 GB** |
-| B=4 | V2 | OOM | **113.5 tok/s** | **1.42x** | **~10.5 GB** |
-| B=8 | V2 | OOM | **154.3 tok/s** | **1.42x** | **~10.5 GB** |
-| B=16 | V2 | OOM | **627.5 tok/s** | **1.42x** | **~10.5 GB** |
-| B=32 | V2 | OOM | **1068.6 tok/s** | **1.42x** | **~10.5 GB** |
-| B=64 | V3 TMA | OOM | **1438.6 tok/s** | **1.42x** | **~10.5 GB** |
-| B=128 | V3 TMA | OOM | **2110.8 tok/s** | **1.42x** | **~10.5 GB** |
-| B=256 | V3 TMA | OOM | **2470.7 tok/s** | **1.42x** | **~10.5 GB** |
+| Batch | Kernel | vLLM BF16 | Turbo 12-bit | Model VRAM | Overhead |
+|------:|:------:|----------:|-------------:|-----------:|---------:|
+| B=1 | V2 | OOM | **57.0 tok/s** | 11.5 GB | 0.9 GB |
+| B=4 | V2 | OOM | **113.5 tok/s** | 11.5 GB | 0.9 GB |
+| B=8 | V2 | OOM | **154.3 tok/s** | 11.5 GB | 0.9 GB |
+| B=16 | V2 | OOM | **627.5 tok/s** | 11.5 GB | 1.0 GB |
+| B=32 | V2 | OOM | **1068.6 tok/s** | 11.5 GB | 1.0 GB |
+| B=64 | V3 TMA | OOM | **1438.6 tok/s** | 11.5 GB | 2.5 GB |
+| B=128 | V3 TMA | OOM | **2110.8 tok/s** | 11.5 GB | 2.5 GB |
+| B=256 | V3 TMA | OOM | **2470.7 tok/s** | 11.5 GB | 2.6 GB |
 
-vLLM **cannot load** Llama 3.1 8B BF16 on a 16GB card (needs ~16 GB weights + overhead). Turbo runs it comfortably at **~10.5 GB** with room to spare. **2471 tok/s** at B=256 with V3 TMA. No OOM up to B=1024.
+vLLM OOMs loading Llama 8B BF16 (needs ~15 GB weights + ~2 GB overhead > 16 GB). Turbo: **14.1 GB** at B=256, serving 256 users. **2471 tok/s** with V3 TMA.
+
+### VRAM Breakdown: Turbo vs vLLM (RTX 5070 Ti 16 GB)
+
+|  | vLLM BF16 (Mistral) | Turbo (Mistral) | vLLM BF16 (Llama) | Turbo (Llama) |
+|--|---------------------:|----------------:|-------------------:|--------------:|
+| **Model weights** | 13,510 MiB | **10,433 MiB** | ~15,050 MiB | **11,738 MiB** |
+| **Compression ratio** | 1.00x | **1.33x** | 1.00x | **1.33x** |
+| **Runtime overhead (B=1)** | ~2,115 MiB | **~917 MiB** | OOM | **~938 MiB** |
+| **Total VRAM (B=1)** | 15,625 MiB | **11,350 MiB** | OOM | **12,676 MiB** |
+| **Total VRAM (B=256)** | OOM (1 max) | **13,028 MiB** | OOM | **14,448 MiB** |
+| **Max concurrent users** | ~1 | **>256** | 0 (OOM) | **>256** |
+
+#### Where the overhead goes
+
+| Component | vLLM | Turbo | Notes |
+|-----------|-----:|------:|-------|
+| CUDA / PyTorch context | ~800 MiB | ~300 MiB | Turbo is lean C++, no Python runtime |
+| cuBLAS workspace | ~600 MiB | ~1,560 MiB | Turbo: only at B>=64 (wk/wv via cuBLAS) |
+| KV cache (ctx=2048) | ~260 MiB | 256 MiB | Similar — both use BF16 KV |
+| FlashAttention library | ~200 MiB | 0 MiB | Turbo has custom fused attention kernel |
+| TURBO_FAST escape table | — | 344-367 MiB | Optional: disable with `TURBO_FAST=0` to save VRAM |
+| Activation buffers | ~200 MiB | 1-190 MiB | Scales with batch size |
+| **Total overhead (B=1)** | **~2,115 MiB** | **~917 MiB** | **Turbo: 57% less overhead** |
+
+The VRAM jump at B>=64 is cuBLAS workspace (~1.5 GB), allocated lazily when `forward_batch_tiled` first calls cuBLAS for small tensors (wk/wv, M=1024). At B<=32, the engine uses `forward_b8` slicing which avoids cuBLAS entirely.
 
 ### MI50 32GB (AMD GCN, 1.0 TB/s)
 
