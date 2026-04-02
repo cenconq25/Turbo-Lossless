@@ -69,19 +69,39 @@ __device__ __forceinline__ int swiz64(int a) { return a ^ ((a >> 3) & 0x60); }
 __device__ __forceinline__ int swiz32(int a) { return a ^ ((a >> 3) & 0x20); }
 __device__ __forceinline__ int swiz128(int a) { return a ^ ((a >> 3) & 0xE0); }
 
+// Swizzle-aware decode: TMA stores data with per-row XOR offset
+// For Swizzle<B,M,S>: XOR offset = ((row_addr >> (M+S)) & ((1<<B)-1)) << M
+// All uint32 reads are 4-byte aligned → never cross 8-byte boundary → safe with swizzle
+//
+// SM 64B swizzle: Swizzle<2,4,3> → offset = ((r >> 1) & 3) << 4  (rows grouped by 2)
+// GR 32B swizzle: Swizzle<1,4,3> → offset = ((r >> 2) & 1) << 4  (rows grouped by 4)
+
 __device__ __forceinline__ void v3_decode_a(uint32_t a[4],
     const uint8_t* sm, const uint8_t* gr, int r0, int r1, int twg, int kk, int be)
 {
-    // Linear layout (SWIZZLE_NONE) — same as V2
     int k0=kk+twg*2, k1=kk+8+twg*2;
-    const uint32_t* s0=(const uint32_t*)(sm+r0*V3_TILE_K);
-    const uint32_t* s1=(const uint32_t*)(sm+r1*V3_TILE_K);
-    uint32_t w0r0=s0[k0/4],w0r1=s1[k0/4],w1r0=s0[k1/4],w1r1=s1[k1/4];
+
+    // Per-row swizzle offsets for SM (64B: Swizzle<2,4,3>)
+    int sx0 = ((r0 >> 1) & 3) << 4;  // XOR offset for row r0
+    int sx1 = ((r1 >> 1) & 3) << 4;  // XOR offset for row r1
+
+    // Read uint32 from swizzled sm_buf: physical_col = (k & ~3) ^ swiz_offset
+    uint32_t w0r0=*(const uint32_t*)(sm + r0*V3_TILE_K + ((k0&~3) ^ sx0));
+    uint32_t w0r1=*(const uint32_t*)(sm + r1*V3_TILE_K + ((k0&~3) ^ sx1));
+    uint32_t w1r0=*(const uint32_t*)(sm + r0*V3_TILE_K + ((k1&~3) ^ sx0));
+    uint32_t w1r1=*(const uint32_t*)(sm + r1*V3_TILE_K + ((k1&~3) ^ sx1));
     int h0=(k0%4)*8,h1=(k1%4)*8;
-    const uint32_t* g0=(const uint32_t*)(gr+r0*(V3_TILE_K/2));
-    const uint32_t* g1=(const uint32_t*)(gr+r1*(V3_TILE_K/2));
-    uint32_t gw0r0=g0[k0/8],gw0r1=g1[k0/8],gw1r0=g0[k1/8],gw1r1=g1[k1/8];
+
+    // Per-row swizzle for GR (32B: Swizzle<1,4,3>)
+    int gx0 = ((r0 >> 2) & 1) << 4;
+    int gx1 = ((r1 >> 2) & 1) << 4;
+
+    uint32_t gw0r0=*(const uint32_t*)(gr + r0*(V3_TILE_K/2) + (((k0/2)&~3) ^ gx0));
+    uint32_t gw0r1=*(const uint32_t*)(gr + r1*(V3_TILE_K/2) + (((k0/2)&~3) ^ gx1));
+    uint32_t gw1r0=*(const uint32_t*)(gr + r0*(V3_TILE_K/2) + (((k1/2)&~3) ^ gx0));
+    uint32_t gw1r1=*(const uint32_t*)(gr + r1*(V3_TILE_K/2) + (((k1/2)&~3) ^ gx1));
     int gh0=((k0/2)%4)*8,gh1=((k1/2)%4)*8;
+
     a[0]=v3_dec((w0r0>>h0)&0xFF,(w0r0>>(h0+8))&0xFF,(gw0r0>>gh0)&0xF,(gw0r0>>(gh0+4))&0xF,be);
     a[1]=v3_dec((w0r1>>h0)&0xFF,(w0r1>>(h0+8))&0xFF,(gw0r1>>gh0)&0xF,(gw0r1>>(gh0+4))&0xF,be);
     a[2]=v3_dec((w1r0>>h1)&0xFF,(w1r0>>(h1+8))&0xFF,(gw1r0>>gh1)&0xF,(gw1r0>>(gh1+4))&0xF,be);
@@ -144,13 +164,19 @@ __global__ void split12_fused_gemm_v3(
     if (warp_id == 0) mbar_wait(mbar0, phase);
     __syncthreads();
 
+    // B read helper: 128B swizzle (Swizzle<3,4,3>)
+    // B layout: [TILE_N rows][TILE_K bf16 cols] = [N][64] bf16, 128 bytes/row
+    // swiz offset = ((row & 7) << 4) — XOR into byte address within row
+    #define B_READ(base, row, byte_col) \
+        (*(const uint32_t*)((const uint8_t*)(base) + (row)*V3_TILE_K*2 + ((byte_col) ^ (((row)&7)<<4))))
+
     uint8_t *sm_r=sm_buf, *gr_r=gr_buf; __nv_bfloat16* B_r=B_buf;
     v3_decode_a(a[0], sm_r, gr_r, r0, r1, twg, 0, base_exp);
     #pragma unroll
     for(int n=0;n<WCT;n++){
-        const __nv_bfloat16* bp=B_r+(n*8+bg)*V3_TILE_K;
-        b_reg[n][0][0]=*reinterpret_cast<const uint32_t*>(&bp[bt*2]);
-        b_reg[n][0][1]=*reinterpret_cast<const uint32_t*>(&bp[8+bt*2]);
+        int brow = n*8+bg;
+        b_reg[n][0][0]=B_READ(B_r, brow, bt*4);
+        b_reg[n][0][1]=B_READ(B_r, brow, 16+bt*4);
     }
 
     int num_k = K / V3_TILE_K;
@@ -173,9 +199,9 @@ __global__ void split12_fused_gemm_v3(
             v3_decode_a(a[cur], sm_r, gr_r, r0, r1, twg, ks*16, base_exp);
             #pragma unroll
             for(int n=0;n<WCT;n++){
-                const __nv_bfloat16* bp=B_r+(n*8+bg)*V3_TILE_K+ks*16;
-                b_reg[n][cur][0]=*reinterpret_cast<const uint32_t*>(&bp[bt*2]);
-                b_reg[n][cur][1]=*reinterpret_cast<const uint32_t*>(&bp[8+bt*2]);
+                int brow = n*8+bg;
+                b_reg[n][cur][0]=B_READ(B_r, brow, ks*32+bt*4);
+                b_reg[n][cur][1]=B_READ(B_r, brow, ks*32+16+bt*4);
             }
             #pragma unroll
             for(int n=0;n<WCT;n++) v3_mma(c[n], a[prev], b_reg[n][prev]);
@@ -195,9 +221,9 @@ __global__ void split12_fused_gemm_v3(
             v3_decode_a(a[0], sm_r, gr_r, r0, r1, twg, 0, base_exp);
             #pragma unroll
             for(int n=0;n<WCT;n++){
-                const __nv_bfloat16* bp=B_r+(n*8+bg)*V3_TILE_K;
-                b_reg[n][0][0]=*reinterpret_cast<const uint32_t*>(&bp[bt*2]);
-                b_reg[n][0][1]=*reinterpret_cast<const uint32_t*>(&bp[8+bt*2]);
+                int brow = n*8+bg;
+                b_reg[n][0][0]=B_READ(B_r, brow, bt*4);
+                b_reg[n][0][1]=B_READ(B_r, brow, 16+bt*4);
             }
         }
 

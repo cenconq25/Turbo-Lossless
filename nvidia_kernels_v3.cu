@@ -37,26 +37,28 @@ int nv_launch_split12_fused_gemm_v3_async(
         {
             cuuint64_t sd[2]={(cuuint64_t)K,(cuuint64_t)M}, ss[1]={(cuuint64_t)K};
             cuuint32_t sb[2]={V3_TILE_K, V3_TILE_M}, se[2]={1,1};
-            // SWIZZLE_NONE for now — swizzle+vectorized reads need careful alignment
+            // 64B swizzle eliminates 4-way bank conflicts on sm reads
             CUresult r = cuTensorMapEncodeTiled(&sm_desc, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2,
                 (void*)sm, sd, ss, sb, se,
-                CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+                CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_64B,
                 CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
             if (r) { fprintf(stderr, "V3 SM desc err: %d\n", (int)r); return -1; }
 
             cuuint64_t gd[2]={(cuuint64_t)(K/2),(cuuint64_t)M}, gs[1]={(cuuint64_t)(K/2)};
             cuuint32_t gb[2]={V3_TILE_K/2, V3_TILE_M};
+            // 32B swizzle for gr (32 bytes/row)
             r = cuTensorMapEncodeTiled(&gr_desc, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2,
                 (void*)gr, gd, gs, gb, se,
-                CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+                CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_32B,
                 CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
             if (r) { fprintf(stderr, "V3 GR desc err: %d\n", (int)r); return -1; }
 
             cuuint64_t bd[2]={(cuuint64_t)K,(cuuint64_t)B}, bs[1]={(cuuint64_t)(K*2)};
             cuuint32_t bb[2]={V3_TILE_K,(cuuint32_t)TN};
+            // 128B swizzle for B (128 bytes/row = 64 bf16 elements)
             r = cuTensorMapEncodeTiled(&b_desc, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2,
                 (void*)act, bd, bs, bb, se,
-                CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+                CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
                 CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
             if (r) { fprintf(stderr, "V3 B desc err: %d\n", (int)r); return -1; }
         }
