@@ -64,9 +64,15 @@ __device__ __forceinline__ void tma_g2s(int dst, const void* tmap, int x, int y,
         :: "r"(dst), "l"(tmap), "r"(x), "r"(y), "r"(mbar) : "memory");
 }
 
+// Swizzle helpers (for future use when swizzle is enabled)
+__device__ __forceinline__ int swiz64(int a) { return a ^ ((a >> 3) & 0x60); }
+__device__ __forceinline__ int swiz32(int a) { return a ^ ((a >> 3) & 0x20); }
+__device__ __forceinline__ int swiz128(int a) { return a ^ ((a >> 3) & 0xE0); }
+
 __device__ __forceinline__ void v3_decode_a(uint32_t a[4],
     const uint8_t* sm, const uint8_t* gr, int r0, int r1, int twg, int kk, int be)
 {
+    // Linear layout (SWIZZLE_NONE) — same as V2
     int k0=kk+twg*2, k1=kk+8+twg*2;
     const uint32_t* s0=(const uint32_t*)(sm+r0*V3_TILE_K);
     const uint32_t* s1=(const uint32_t*)(sm+r1*V3_TILE_K);

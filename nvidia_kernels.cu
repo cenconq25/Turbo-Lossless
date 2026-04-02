@@ -232,11 +232,14 @@ __global__ void nv_apply_patches_batch(
 // ============================================================
 #include "split12_gemm.cuh"
 #include "split12_gemm_v2.cuh"
-// V3 TMA kernel disabled — compiles but hangs at runtime.
-// The TMA pattern works in standalone tests (see /tmp/tma_*.cu) but not in the full kernel.
-// Likely cause: elect.sync interaction with complex template or shared memory layout.
-// Reference: gau-nernst/learn-cuda/02c_matmul_sm120 (96% SOL working TMA on SM120)
-// #include "split12_gemm_v3.cuh"
+// V3 TMA kernel in separate compilation unit (nvidia_kernels_v3.cu)
+extern "C" int nv_launch_split12_fused_gemm_v3_async(
+    const void* sm, const void* gr, int base_exp,
+    const void* act, int act_stride,
+    void* out, int out_stride,
+    int M, int K, int B, void* stream,
+    const void* patch_row_off, const void* patch_cols,
+    const void* patch_correct, const void* patch_wrong);
 
 // ============================================================
 // Launch wrappers
@@ -317,11 +320,9 @@ int nv_launch_split12_fused_gemm_async(
             (const int16_t*)patch_correct, (const int16_t*)patch_wrong);
     };
 
-    // V3 TMA launcher — DISABLED (causes model loading hang when compiled)
-    // See split12_gemm_v3.cuh for the standalone-tested TMA patterns
-    // Reference: gau-nernst/learn-cuda/02c_matmul_sm120 (96% SOL)
-#if 0
-    auto launch_v3 = [&](auto TN_v, auto WCT_v) {
+    // V3 TMA launcher (separate compilation unit)
+#if 0  // V3 launcher code kept for reference — now in nvidia_kernels_v3.cu
+    auto launch_v3_old = [&](auto TN_v, auto WCT_v) {
         constexpr int TN = decltype(TN_v)::value, WCT = decltype(WCT_v)::value;
         dim3 grid((B + TN - 1) / TN, (M + V3_TILE_M - 1) / V3_TILE_M);
         // smem: mbarrier(128B align) + sm(2×64×64) + gr(2×64×32) + B(2×64×TN×2)
@@ -390,8 +391,21 @@ int nv_launch_split12_fused_gemm_async(
     }
 #endif
 
-    // V2 is default (V3 TMA disabled until runtime hang resolved)
-    {
+    // Kernel version selection
+    static int s_kernel_ver = -1;
+    if (s_kernel_ver < 0) {
+        const char* e = getenv("TURBO_KERNEL");
+        if (e && e[0] == '3') { s_kernel_ver = 3; printf("  GEMM: V3 TMA kernel (separate CU)\n"); }
+        else if (e && e[0] == '1') { s_kernel_ver = 1; printf("  GEMM: V1 kernel (8 warps, TM=128)\n"); }
+        else { s_kernel_ver = 2; printf("  GEMM: V2 high-occupancy kernel (4 warps, TM=64)\n"); }
+    }
+
+    if (s_kernel_ver == 3) {
+        return nv_launch_split12_fused_gemm_v3_async(
+            sm, gr, base_exp, act, act_stride, out, out_stride,
+            M, K, B, stream, patch_row_off, patch_cols, patch_correct, patch_wrong);
+    }
+    if (s_kernel_ver >= 2) {
         if (B >= 128) launch_v2(std::integral_constant<int,64>{}, std::integral_constant<int,8>{});
         else if (B >= 32) launch_v2(std::integral_constant<int,32>{}, std::integral_constant<int,4>{});
         else launch_v2(std::integral_constant<int,16>{}, std::integral_constant<int,2>{});
