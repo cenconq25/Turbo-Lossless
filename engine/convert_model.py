@@ -140,7 +140,7 @@ def convert(model_dir, output_dir):
     # Token embeddings (keep as BF16 — used for lookup not matvec)
     embd_name = find_tensor("embed_tokens")
     if embd_name:
-        W = load_tensor(embd_name)
+        W = load_tensor(embd_name).to(torch.bfloat16)
         sz = save_raw("tok_embd.bin", W.contiguous().view(torch.int16))
         total_size += sz
         print(f"  tok_embd: {W.shape} → {sz/1e6:.1f} MB")
@@ -155,7 +155,8 @@ def convert(model_dir, output_dir):
     out_name = find_tensor("lm_head")
     if out_name:
         W = load_tensor(out_name)
-        if W.dtype == torch.bfloat16 and W.ndim == 2:
+        if W.ndim == 2 and W.dtype in (torch.bfloat16, torch.float16, torch.float32):
+            W = W.to(torch.bfloat16)
             esc = save_compressed("output_proj", W)
             print(f"  output_proj: {W.shape} escapes={esc}")
 
@@ -185,7 +186,8 @@ def convert(model_dir, output_dir):
             hf_name = find_tensor(hf_pattern)
             if hf_name:
                 W = load_tensor(hf_name)
-                if W.dtype == torch.bfloat16 and W.ndim == 2:
+                if W.ndim == 2 and W.dtype in (torch.bfloat16, torch.float16, torch.float32):
+                    W = W.to(torch.bfloat16)
                     esc = save_compressed(f"layer.{layer}.{our_name}", W)
 
         print(f" done")

@@ -93,10 +93,24 @@ All values in tok/s. vLLM cannot fit Llama 8B on 16 GB (needs ~17 GB). llama.cpp
 
 Both llama.cpp and vLLM cannot load Yi 9B BF16 on a 16 GB card. Turbo fits it with 1.5 GB to spare.
 
+### Llama 2 7B Chat (true 7B, FP16→BF16 converted)
+
+| Batch | Kernel | llama.cpp | Turbo | vs llama.cpp | VRAM |
+|------:|:------:|----------:|------:|:------------:|-----:|
+| B=1 | split12 | 59.6 | **64.7** | **1.09x** | ~10.4 GB |
+| B=8 | split12 | — | **172.2** | — | ~10.4 GB |
+| B=32 | split12 | — | **1,289** | — | ~10.5 GB |
+| B=64 | V3 TMA | — | **1,605** | — | ~12.0 GB |
+| B=128 | V3 TMA | — | **2,576** | — | ~12.0 GB |
+| B=256 | V3 TMA | — | **2,931** | — | ~12.0 GB |
+
+All values in tok/s. Llama 2 7B is MHA (32/32 heads, not GQA) with smaller FFN (11008). Fastest at B=1 due to fewer params. Original FP16 model auto-cast to BF16 during conversion.
+
 ### Tested Models
 
 | Model | Family | Params | B=1 tok/s | Escape Rate | Compression | llama.cpp/vLLM |
 |-------|--------|-------:|----------:|------------:|:-----------:|:--------------:|
+| Llama 2 7B Chat | Meta | 6.74B | 64.7 | — | 1.33x | Both fit |
 | Mistral 7B Instruct | Mistral | 7.25B | 60.0 | 0.031% | 1.33x | Both fit |
 | Llama 3.1 8B Instruct | Meta | 8.03B | 57.0 | 0.021% | 1.33x | vLLM OOM |
 | Yi 1.5 9B Chat | 01.AI | 8.83B | 48.1 | — | 1.33x | Both OOM |
