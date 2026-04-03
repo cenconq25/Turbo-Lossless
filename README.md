@@ -127,14 +127,17 @@ The V3 fused decode+GEMM kernel uses tensor core patterns inspired by [ZipServ /
 
 ## File Map
 
-~3,500 lines of C++/CUDA.
+~5,500 lines of C++/CUDA/Python.
 
-| File | Purpose |
-|------|---------|
-| `decompress_v2.hip` | Split12 per-row matvec kernels (B=1/4/8) |
-| `nvidia_kernels.cu` | NVIDIA fused decode+GEMM (V1/V2/V3 TMA) |
-| `engine/inference.cpp` | Forward pass + generation loop |
-| `engine/kernels.hip` | RMSNorm, RoPE, Flash Attention, SiLU, argmax |
-| `engine/model.cpp` | Model loader + escape table builder |
-| `engine/tokenizer.cpp` | Sentencepiece + HF BPE auto-detect |
-| `engine/convert_model.py` | BF16/FP16 safetensors → Turbo format |
+| File | Lines | Purpose |
+|------|------:|---------|
+| `decompress_v2.hip` | 901 | Split12 per-row matvec kernels (B=1/4/8) |
+| `engine/kernels.hip` | 937 | RMSNorm, RoPE, Flash Attention, SiLU, argmax |
+| `engine/inference.cpp` | 732 | Forward pass + generation loop |
+| `nvidia_kernels.cu` | 586 | NVIDIA fused decode+GEMM (V1/V2/V3 TMA) |
+| `engine/tokenizer.cpp` | 363 | Sentencepiece + HF BPE auto-detect |
+| `engine/model.cpp` | 303 | Model loader + escape table builder |
+| `engine/convert_model.py` | 206 | BF16/FP16 safetensors → Turbo format |
+| `split12_pack.c` | 128 | C packer library (find_base_exp + pack) |
+| `gpu_compat.h` | 100 | AMD/NVIDIA kernel compatibility layer |
+| `engine/main.cpp` | 104 | CLI entry point + signal handler |
