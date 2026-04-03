@@ -70,10 +70,9 @@ __global__ void rms_norm_kernel(
 // RoPE: Rotary Position Embeddings (with precomputed frequencies)
 // ============================================================
 
-// Precomputed frequency table on GPU (per-device for TP multi-GPU)
-static constexpr int MAX_DEVICES = 8;
-static float* d_rope_freqs[MAX_DEVICES] = {};
-static int d_rope_freqs_dim[MAX_DEVICES] = {};
+// Precomputed frequency table on GPU (set once during init)
+static float* d_rope_freqs = nullptr;
+static int d_rope_freqs_dim = 0;
 
 __global__ void rope_kernel(
     float* __restrict__ q,   // [n_head, head_dim]
@@ -214,17 +213,15 @@ void launch_rms_norm(const float* x, const float* weight, float* y,
 }
 
 void launch_rope_init(int head_dim, float theta_base) {
-    int dev = 0;
-    GPU_CHECK(hipGetDevice(&dev));
-    if (d_rope_freqs[dev] && d_rope_freqs_dim[dev] == head_dim) return;
+    if (d_rope_freqs && d_rope_freqs_dim == head_dim) return;
     int half_dim = head_dim / 2;
     float* h_freqs = new float[half_dim];
     for (int d = 0; d < half_dim; d++)
         h_freqs[d] = 1.0f / powf(theta_base, (float)(2 * d) / head_dim);
-    if (d_rope_freqs[dev]) hipFree(d_rope_freqs[dev]);
-    GPU_CHECK(hipMalloc(&d_rope_freqs[dev], half_dim * sizeof(float)));
-    hipMemcpy(d_rope_freqs[dev], h_freqs, half_dim * sizeof(float), hipMemcpyHostToDevice);
-    d_rope_freqs_dim[dev] = head_dim;
+    if (d_rope_freqs) hipFree(d_rope_freqs);
+    GPU_CHECK(hipMalloc(&d_rope_freqs, half_dim * sizeof(float)));
+    hipMemcpy(d_rope_freqs, h_freqs, half_dim * sizeof(float), hipMemcpyHostToDevice);
+    d_rope_freqs_dim = head_dim;
     delete[] h_freqs;
 }
 
@@ -235,8 +232,7 @@ void launch_rope(float* q, float* k, int head_dim, int n_head, int n_head_kv,
     int max_threads = max(n_head, n_head_kv) * half_dim;
     int threads = 256;
     int blocks = (max_threads + threads - 1) / threads;
-    int dev = 0; GPU_CHECK(hipGetDevice(&dev));
-    rope_kernel<<<blocks, threads, 0, stream>>>(q, k, d_rope_freqs[dev], head_dim, n_head, n_head_kv, position);
+    rope_kernel<<<blocks, threads, 0, stream>>>(q, k, d_rope_freqs, head_dim, n_head, n_head_kv, position);
 }
 
 void launch_embed_lookup(const int16_t* embd_table, const int* token_ids,
@@ -369,9 +365,8 @@ void launch_rope_store_kv(float* q, float* k, const float* v,
     int max_threads = max(rope_threads, kv_threads);
     int threads = 256;
     int blocks = (max_threads + threads - 1) / threads;
-    int dev = 0; GPU_CHECK(hipGetDevice(&dev));
     rope_store_kv_kernel<<<blocks, threads, 0, stream>>>(
-        q, k, v, kv_k, kv_v, d_rope_freqs[dev],
+        q, k, v, kv_k, kv_v, d_rope_freqs,
         head_dim, n_head, n_head_kv, position, max_seq);
 }
 
@@ -922,9 +917,8 @@ void launch_rope_batch(float* q, float* k, const int* positions,
     int half_dim = head_dim / 2;
     int max_threads = max(n_head, n_head_kv) * half_dim;
     dim3 grid((max_threads + 255) / 256, batch_size);
-    int dev = 0; GPU_CHECK(hipGetDevice(&dev));
     rope_batch_kernel<<<grid, 256, 0, stream>>>(
-        q, k, positions, d_rope_freqs[dev], head_dim, n_head, n_head_kv, q_stride, k_stride);
+        q, k, positions, d_rope_freqs, head_dim, n_head, n_head_kv, q_stride, k_stride);
 }
 
 void launch_store_kv_batch(const float* k, const float* v,
@@ -1180,454 +1174,4 @@ void launch_flash_attention_batch(const float* q, const int16_t* kv_k, const int
         q, kv_k, kv_v, output, positions, n_head, n_head_kv, head_dim,
         max_seq, gqa_ratio, scale, kv_stride);
 }
-}
-
-// ============================================================================
-// Gemma 4 Support Kernels
-// ============================================================================
-
-// ============================================================
-// GeGLU activation: GELU(tanh) * up → BF16
-// gelu_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-// ============================================================
-__global__ void gelu_mul_bf16_batch_kernel(
-    const float* __restrict__ gate,
-    const float* __restrict__ up,
-    int16_t* __restrict__ out,
-    int n, int batch_size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= batch_size * n) return;
-    float g = gate[idx];
-    float inner = 0.7978845608f * (g + 0.044715f * g * g * g);
-    float gelu = 0.5f * g * (1.0f + tanhf(inner));
-    out[idx] = float_to_bf16(gelu * up[idx]);
-}
-
-// ============================================================
-// Logit softcap: logits = cap * tanh(logits / cap)
-// ============================================================
-__global__ void softcap_kernel(
-    float* __restrict__ logits,
-    int n, float cap)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-    logits[idx] = cap * tanhf(logits[idx] / cap);
-}
-
-// ============================================================
-// Per-head RMSNorm: each block handles one head
-// x is [n_heads * head_dim], weight is [head_dim] (shared)
-// ============================================================
-__global__ void rms_norm_per_head_kernel(
-    float* __restrict__ x,
-    const float* __restrict__ weight,
-    int head_dim, float eps)
-{
-    int head = blockIdx.x;
-    int tid = threadIdx.x;
-    int offset = head * head_dim;
-    extern __shared__ float sdata[];
-
-    float sum_sq = 0.0f;
-    for (int i = tid; i < head_dim; i += blockDim.x) {
-        float v = x[offset + i];
-        sum_sq += v * v;
-    }
-    // Warp shuffle reduction
-    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
-        sum_sq += __shfl_xor(sum_sq, off, WARP_SIZE);
-    int warp_id = tid / WARP_SIZE;
-    int lane = tid & (WARP_SIZE - 1);
-    if (lane == 0) sdata[warp_id] = sum_sq;
-    __syncthreads();
-    // Cross-warp reduction using shared memory (safe for any thread count)
-    int n_warps = blockDim.x / WARP_SIZE;
-    if (tid == 0) {
-        float total = sdata[0];
-        for (int i = 1; i < n_warps; i++)
-            total += sdata[i];
-        sdata[0] = total;
-    }
-    __syncthreads();
-    float rms = rsqrtf(sdata[0] / head_dim + eps);
-    for (int i = tid; i < head_dim; i += blockDim.x)
-        x[offset + i] *= rms * weight[i];
-}
-
-// ============================================================
-// Embedding scale: x *= scale (Gemma scales by sqrt(hidden_size))
-// ============================================================
-__global__ void scale_kernel(
-    float* __restrict__ x,
-    float scale, int n)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) x[idx] *= scale;
-}
-
-// ============================================================
-// Partial RoPE: only rotates first rotary_dim dimensions
-// Remaining dims pass through unchanged
-// ============================================================
-static float* d_rope_freqs_partial[MAX_DEVICES] = {};
-static int d_rope_freqs_partial_dim[MAX_DEVICES] = {};
-
-__global__ void rope_partial_kernel(
-    float* __restrict__ q,   // [n_head, head_dim]
-    float* __restrict__ k,   // [n_head_kv, head_dim]
-    const float* __restrict__ freqs,  // [rotary_half] precomputed
-    int head_dim, int rotary_dim, int n_head, int n_head_kv,
-    int position)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int rotary_half = rotary_dim / 2;
-
-    // Apply to Q heads (only first rotary_dim dimensions)
-    if (idx < n_head * rotary_half) {
-        int head = idx / rotary_half;
-        int d = idx % rotary_half;
-        float angle = position * freqs[d];
-        float cos_a, sin_a;
-        __sincosf(angle, &sin_a, &cos_a);
-
-        int base = head * head_dim;
-        float x0 = q[base + d];
-        float x1 = q[base + d + rotary_half];
-        q[base + d]               = x0 * cos_a - x1 * sin_a;
-        q[base + d + rotary_half] = x0 * sin_a + x1 * cos_a;
-    }
-
-    // Apply to K heads (only first rotary_dim dimensions)
-    if (idx < n_head_kv * rotary_half) {
-        int head = idx / rotary_half;
-        int d = idx % rotary_half;
-        float angle = position * freqs[d];
-        float cos_a, sin_a;
-        __sincosf(angle, &sin_a, &cos_a);
-
-        int base = head * head_dim;
-        float x0 = k[base + d];
-        float x1 = k[base + d + rotary_half];
-        k[base + d]               = x0 * cos_a - x1 * sin_a;
-        k[base + d + rotary_half] = x0 * sin_a + x1 * cos_a;
-    }
-}
-
-__global__ void rope_partial_batch_kernel(
-    float* __restrict__ q,   // [batch_size * n_head * head_dim]
-    float* __restrict__ k,   // [batch_size * n_head_kv * head_dim]
-    const int* __restrict__ positions,  // [batch_size]
-    const float* __restrict__ freqs,    // [rotary_half] precomputed
-    int head_dim, int rotary_dim, int n_head, int n_head_kv,
-    int q_stride, int k_stride)
-{
-    int seq = blockIdx.y;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int rotary_half = rotary_dim / 2;
-    int position = positions[seq];
-
-    // Q heads
-    if (idx < n_head * rotary_half) {
-        int head = idx / rotary_half;
-        int d = idx % rotary_half;
-        float angle = position * freqs[d];
-        float cos_a, sin_a;
-        __sincosf(angle, &sin_a, &cos_a);
-        int base = seq * q_stride + head * head_dim;
-        float x0 = q[base + d], x1 = q[base + d + rotary_half];
-        q[base + d]               = x0 * cos_a - x1 * sin_a;
-        q[base + d + rotary_half] = x0 * sin_a + x1 * cos_a;
-    }
-    // K heads
-    if (idx < n_head_kv * rotary_half) {
-        int head = idx / rotary_half;
-        int d = idx % rotary_half;
-        float angle = position * freqs[d];
-        float cos_a, sin_a;
-        __sincosf(angle, &sin_a, &cos_a);
-        int base = seq * k_stride + head * head_dim;
-        float x0 = k[base + d], x1 = k[base + d + rotary_half];
-        k[base + d]               = x0 * cos_a - x1 * sin_a;
-        k[base + d + rotary_half] = x0 * sin_a + x1 * cos_a;
-    }
-}
-
-// ============================================================
-// Windowed Attention: mask positions where (current_pos - t) >= window_size
-// B=1 variant
-// ============================================================
-__global__ void attention_all_heads_windowed_kernel(
-    const float* __restrict__ q,
-    const int16_t* __restrict__ k_cache,
-    const int16_t* __restrict__ v_cache,
-    int16_t* __restrict__ output,
-    int seq_len, int max_seq, int n_head_kv, int head_dim,
-    int gqa_ratio, float scale, int window_size)
-{
-    int head = blockIdx.x;
-    int kv_head = head / gqa_ratio;
-    int tid = threadIdx.x;
-
-    extern __shared__ float smem[];
-    float* scores = smem;
-    float* q_shared = smem + seq_len;
-
-    for (int i = tid; i < head_dim; i += blockDim.x)
-        q_shared[i] = q[head * head_dim + i];
-    __syncthreads();
-
-    int current_pos = seq_len - 1;
-
-    // Q·K^T with window masking
-    for (int t = tid; t < seq_len; t += blockDim.x) {
-        if (window_size > 0 && (current_pos - t) >= window_size) {
-            scores[t] = -1e30f;
-        } else {
-            int k_base = t * n_head_kv * head_dim + kv_head * head_dim;
-            float dot = 0.0f;
-            for (int d = 0; d < head_dim; d++)
-                dot += q_shared[d] * bf16_to_float(k_cache[k_base + d]);
-            scores[t] = dot * scale;
-        }
-    }
-    __syncthreads();
-
-    // Softmax (same warp-shuffle reduction as original)
-    __shared__ float warp_reduce[16];
-    int lane = tid % WARP_SIZE;
-    int warp_id = tid / WARP_SIZE;
-
-    float local_max = -1e30f;
-    for (int t = tid; t < seq_len; t += blockDim.x)
-        local_max = fmaxf(local_max, scores[t]);
-    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
-        local_max = fmaxf(local_max, __shfl_xor(local_max, off, WARP_SIZE));
-    if (lane == 0) warp_reduce[warp_id] = local_max;
-    __syncthreads();
-    if (tid == 0) {
-        float m = warp_reduce[0];
-        for (int i = 1; i < (blockDim.x + WARP_SIZE - 1) / WARP_SIZE; i++)
-            m = fmaxf(m, warp_reduce[i]);
-        warp_reduce[0] = m;
-    }
-    __syncthreads();
-    float gmax = warp_reduce[0];
-
-    float local_sum = 0.0f;
-    for (int t = tid; t < seq_len; t += blockDim.x) {
-        float e = expf(scores[t] - gmax);
-        scores[t] = e;
-        local_sum += e;
-    }
-    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
-        local_sum += __shfl_xor(local_sum, off, WARP_SIZE);
-    if (lane == 0) warp_reduce[warp_id] = local_sum;
-    __syncthreads();
-    if (tid == 0) {
-        float s = 0;
-        for (int i = 0; i < (blockDim.x + WARP_SIZE - 1) / WARP_SIZE; i++)
-            s += warp_reduce[i];
-        warp_reduce[0] = s;
-    }
-    __syncthreads();
-    float inv_sum = 1.0f / warp_reduce[0];
-
-    for (int t = tid; t < seq_len; t += blockDim.x)
-        scores[t] *= inv_sum;
-    __syncthreads();
-
-    // Weighted sum of V
-    for (int d = tid; d < head_dim; d += blockDim.x) {
-        float acc = 0.0f;
-        int v_off = kv_head * head_dim + d;
-        for (int t = 0; t < seq_len; t++)
-            acc += scores[t] * bf16_to_float(v_cache[t * n_head_kv * head_dim + v_off]);
-        output[head * head_dim + d] = float_to_bf16(acc);
-    }
-}
-
-// ============================================================
-// Windowed Attention: batched variant
-// ============================================================
-__global__ void attention_all_heads_batch_windowed_kernel(
-    const float* __restrict__ q,
-    const int16_t* __restrict__ kv_cache_k,
-    const int16_t* __restrict__ kv_cache_v,
-    int16_t* __restrict__ output,
-    const int* __restrict__ positions,
-    int n_head, int n_head_kv, int head_dim,
-    int max_seq, int gqa_ratio, float scale,
-    int kv_stride, int window_size)
-{
-    int head = blockIdx.x;
-    int seq = blockIdx.y;
-    int kv_head = head / gqa_ratio;
-    int tid = threadIdx.x;
-    int pos = positions[seq];
-    int seq_len = pos + 1;
-
-    int n_total = n_head * head_dim;
-
-    extern __shared__ float smem[];
-    float* scores = smem;
-    float* q_shared = smem + seq_len;
-
-    for (int i = tid; i < head_dim; i += blockDim.x)
-        q_shared[i] = q[seq * n_total + head * head_dim + i];
-    __syncthreads();
-
-    const int16_t* k = kv_cache_k + (size_t)seq * kv_stride;
-    const int16_t* v = kv_cache_v + (size_t)seq * kv_stride;
-
-    // Q·K^T with window masking
-    for (int t = tid; t < seq_len; t += blockDim.x) {
-        if (window_size > 0 && (pos - t) >= window_size) {
-            scores[t] = -1e30f;
-        } else {
-            int k_base = t * n_head_kv * head_dim + kv_head * head_dim;
-            float dot = 0.0f;
-            for (int d = 0; d < head_dim; d++)
-                dot += q_shared[d] * bf16_to_float(k[k_base + d]);
-            scores[t] = dot * scale;
-        }
-    }
-    __syncthreads();
-
-    // Softmax
-    __shared__ float warp_reduce[16];
-    int lane = tid % WARP_SIZE;
-    int warp_id = tid / WARP_SIZE;
-
-    float local_max = -1e30f;
-    for (int t = tid; t < seq_len; t += blockDim.x)
-        local_max = fmaxf(local_max, scores[t]);
-    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
-        local_max = fmaxf(local_max, __shfl_xor(local_max, off, WARP_SIZE));
-    if (lane == 0) warp_reduce[warp_id] = local_max;
-    __syncthreads();
-    if (tid == 0) { float m = warp_reduce[0]; for (int i=1;i<(blockDim.x + WARP_SIZE - 1) / WARP_SIZE;i++) m=fmaxf(m,warp_reduce[i]); warp_reduce[0]=m; }
-    __syncthreads();
-    float gmax = warp_reduce[0];
-
-    float local_sum = 0.0f;
-    for (int t = tid; t < seq_len; t += blockDim.x) {
-        float e = expf(scores[t] - gmax); scores[t] = e; local_sum += e;
-    }
-    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) local_sum += __shfl_xor(local_sum, off, WARP_SIZE);
-    if (lane == 0) warp_reduce[warp_id] = local_sum;
-    __syncthreads();
-    if (tid == 0) { float s=0; for (int i=0;i<(blockDim.x + WARP_SIZE - 1) / WARP_SIZE;i++) s+=warp_reduce[i]; warp_reduce[0]=s; }
-    __syncthreads();
-    float inv_sum = 1.0f / warp_reduce[0];
-    for (int t = tid; t < seq_len; t += blockDim.x) scores[t] *= inv_sum;
-    __syncthreads();
-
-    // Weighted sum of V
-    for (int d = tid; d < head_dim; d += blockDim.x) {
-        float acc = 0.0f;
-        int v_off = kv_head * head_dim + d;
-        for (int t = 0; t < seq_len; t++)
-            acc += scores[t] * bf16_to_float(v[t * n_head_kv * head_dim + v_off]);
-        output[seq * n_total + head * head_dim + d] = float_to_bf16(acc);
-    }
-}
-
-// ============================================================
-// Launch wrappers for all Gemma 4 kernels
-// ============================================================
-extern "C" {
-
-void launch_gelu_mul_bf16_batch(const float* gate, const float* up, int16_t* out,
-                                int n, int batch_size, hipStream_t stream) {
-    int total = batch_size * n;
-    gelu_mul_bf16_batch_kernel<<<(total + 255) / 256, 256, 0, stream>>>(gate, up, out, n, batch_size);
-}
-
-void launch_softcap(float* logits, int n, float cap, hipStream_t stream) {
-    softcap_kernel<<<(n + 255) / 256, 256, 0, stream>>>(logits, n, cap);
-}
-
-void launch_rms_norm_per_head(float* x, const float* weight, int n_heads, int head_dim,
-                              float eps, hipStream_t stream) {
-    int threads = min(256, head_dim);
-    int smem = (threads / WARP_SIZE + 1) * sizeof(float);
-    rms_norm_per_head_kernel<<<n_heads, threads, smem, stream>>>(x, weight, head_dim, eps);
-}
-
-void launch_scale(float* x, float scale, int n, hipStream_t stream) {
-    scale_kernel<<<(n + 255) / 256, 256, 0, stream>>>(x, scale, n);
-}
-
-void launch_rope_init_partial(int rotary_dim, float theta_base) {
-    int dev = 0;
-    GPU_CHECK(hipGetDevice(&dev));
-    if (d_rope_freqs_partial[dev] && d_rope_freqs_partial_dim[dev] == rotary_dim) return;
-    int rotary_half = rotary_dim / 2;
-    float* h_freqs = new float[rotary_half];
-    for (int d = 0; d < rotary_half; d++)
-        h_freqs[d] = 1.0f / powf(theta_base, (float)(2 * d) / rotary_dim);
-    if (d_rope_freqs_partial[dev]) hipFree(d_rope_freqs_partial[dev]);
-    GPU_CHECK(hipMalloc(&d_rope_freqs_partial[dev], rotary_half * sizeof(float)));
-    hipMemcpy(d_rope_freqs_partial[dev], h_freqs, rotary_half * sizeof(float), hipMemcpyHostToDevice);
-    d_rope_freqs_partial_dim[dev] = rotary_dim;
-    delete[] h_freqs;
-}
-
-void launch_rope_partial(float* q, float* k, int head_dim, int rotary_dim,
-                         int n_head, int n_head_kv, int position,
-                         float theta, hipStream_t stream) {
-    launch_rope_init_partial(rotary_dim, theta);
-    int rotary_half = rotary_dim / 2;
-    int max_threads = max(n_head, n_head_kv) * rotary_half;
-    int threads = 256;
-    int blocks = (max_threads + threads - 1) / threads;
-    int dev = 0; GPU_CHECK(hipGetDevice(&dev));
-    rope_partial_kernel<<<blocks, threads, 0, stream>>>(
-        q, k, d_rope_freqs_partial[dev], head_dim, rotary_dim, n_head, n_head_kv, position);
-}
-
-void launch_rope_partial_batch(float* q, float* k, const int* positions,
-                               int head_dim, int rotary_dim,
-                               int n_head, int n_head_kv,
-                               int q_stride, int k_stride,
-                               float theta, int batch_size, hipStream_t stream) {
-    launch_rope_init_partial(rotary_dim, theta);
-    int rotary_half = rotary_dim / 2;
-    int max_threads = max(n_head, n_head_kv) * rotary_half;
-    dim3 grid((max_threads + 255) / 256, batch_size);
-    int dev = 0; GPU_CHECK(hipGetDevice(&dev));
-    rope_partial_batch_kernel<<<grid, 256, 0, stream>>>(
-        q, k, positions, d_rope_freqs_partial[dev],
-        head_dim, rotary_dim, n_head, n_head_kv, q_stride, k_stride);
-}
-
-void launch_attention_all_heads_windowed(const float* q, const int16_t* k_cache, const int16_t* v_cache,
-    int16_t* output, int n_head, int n_head_kv, int head_dim, int seq_len, int max_seq,
-    float scale, int window_size, hipStream_t stream)
-{
-    int gqa_ratio = n_head / n_head_kv;
-    int threads = 128;
-    int smem = (seq_len + head_dim) * sizeof(float) + 16 * sizeof(float);
-    attention_all_heads_windowed_kernel<<<n_head, threads, smem, stream>>>(
-        q, k_cache, v_cache, output, seq_len, max_seq, n_head_kv, head_dim, gqa_ratio, scale, window_size);
-}
-
-void launch_attention_all_heads_batch_windowed(
-    const float* q, const int16_t* kv_k, const int16_t* kv_v,
-    int16_t* output, const int* positions,
-    int n_head, int n_head_kv, int head_dim,
-    int max_seq, float scale, int batch_size, int kv_stride,
-    int window_size, hipStream_t stream)
-{
-    int gqa_ratio = n_head / n_head_kv;
-    int threads = 128;
-    int smem = (max_seq + head_dim) * sizeof(float) + 16 * sizeof(float);
-    dim3 grid(n_head, batch_size);
-    attention_all_heads_batch_windowed_kernel<<<grid, threads, smem, stream>>>(
-        q, kv_k, kv_v, output, positions, n_head, n_head_kv, head_dim,
-        max_seq, gqa_ratio, scale, kv_stride, window_size);
-}
-
 }

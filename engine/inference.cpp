@@ -1,6 +1,5 @@
 #include "inference.h"
 #include "sampler.h"
-#include "multi_gpu.h"
 #include <cstdio>
 #include <cmath>
 #include "../gpu_compat.h"
@@ -19,16 +18,6 @@ extern "C" {
     void launch_flash_attention(const float* q, const int16_t* k_cache, const int16_t* v_cache, int16_t* output, int n_head, int n_head_kv, int head_dim, int seq_len, int max_seq, float scale, hipStream_t stream);
     void launch_flash_attention_batch(const float* q, const int16_t* kv_k, const int16_t* kv_v, int16_t* output, const int* positions, int n_head, int n_head_kv, int head_dim, int max_seq, float scale, int batch_size, int kv_stride, hipStream_t stream);
     void launch_rope_store_kv(float* q, float* k, const float* v, int16_t* kv_k, int16_t* kv_v, int head_dim, int n_head, int n_head_kv, int position, int max_seq, float theta, hipStream_t stream);
-
-    // Gemma4 kernel wrappers (Dev 2 implements these in kernels.hip/kernels.cu)
-    void launch_gelu_mul_bf16_batch(const float* gate, const float* up, int16_t* out, int n, int bs, hipStream_t stream);
-    void launch_softcap(float* logits, int n, float cap, hipStream_t stream);
-    void launch_rms_norm_per_head(float* x, const float* weight, int n_heads, int head_dim, float eps, hipStream_t stream);
-    void launch_scale(float* x, float scale, int n, hipStream_t stream);
-    void launch_rope_init_partial(int rotary_dim, float theta_base);
-    void launch_attention_all_heads_windowed(const float* q, const int16_t* k_cache, const int16_t* v_cache,
-        int16_t* output, int n_head, int n_head_kv, int head_dim, int seq_len, int max_seq, float scale,
-        int window_size, hipStream_t stream);
 
     // Matvec launch wrappers (decompress_v2.hip)
     int launch_patches_v2_async(const void* row_offsets, const void* patch_cols, const void* correct_vals, const void* wrong_vals, const void* activations, void* output, int M, void* stream);
@@ -119,60 +108,31 @@ static void check_force_cublas() {
 } while(0)
 #endif
 
-InferenceState* create_inference_state(Model* model, int batch_size, int max_seq_len, int tp_size) {
+InferenceState* create_inference_state(Model* model, int batch_size, int max_seq_len) {
     auto* s = new InferenceState();
     s->model = model;
     s->batch_size = batch_size;
     s->positions = new int[batch_size]();
-    s->tp = nullptr;
-    s->tp_rank = 0;
     int n = model->config.n_embd, n_ff = model->config.n_ff, n_vocab = model->config.n_vocab;
     int kv_dim = model->config.n_head_kv * (n / model->config.n_head);
     int bs = batch_size;
 
-    // When TP is active, row-split weights produce smaller local outputs
-    int local_n = n / tp_size;           // local head dim for q (row-split wq)
-    int local_kv = kv_dim / tp_size;     // local kv dim (row-split wk/wv)
-    int local_nff = n_ff / tp_size;      // local FFN dim (row-split w_gate/w_up)
-    int local_vocab = n_vocab / tp_size;  // local vocab (row-split output_proj)
-
-    // Gemma4: q_buf/k_buf/v_buf must be sized for the MAX across layer types
-    int max_q_dim = local_n;
-    int max_kv_dim = local_kv;
-    if (model->config.head_dim_sliding > 0) {
-        // Full attention layers may have larger head_dim (e.g., 512 vs 256)
-        int max_head_dim = std::max(model->config.head_dim_sliding, model->config.head_dim_full);
-        int n_head_local = model->config.n_head / tp_size;
-        int n_kv_local = model->config.n_head_kv / tp_size;
-        max_q_dim = std::max(max_q_dim, n_head_local * max_head_dim);
-        max_kv_dim = std::max(max_kv_dim, n_kv_local * max_head_dim);
-    }
-
-    // hidden/hidden2/res stay full size (hold all-reduced results)
     GPU_CHECK(hipMalloc(&s->hidden,   bs * n * sizeof(float)));
     GPU_CHECK(hipMalloc(&s->hidden2,  bs * n * sizeof(float)));
     GPU_CHECK(hipMalloc(&s->attn_out, bs * n * sizeof(float)));
-    GPU_CHECK(hipMalloc(&s->q_buf,    bs * max_q_dim * sizeof(float)));
-    GPU_CHECK(hipMalloc(&s->k_buf,    bs * max_kv_dim * sizeof(float)));
-    GPU_CHECK(hipMalloc(&s->v_buf,    bs * max_kv_dim * sizeof(float)));
-    GPU_CHECK(hipMalloc(&s->ffn_gate, bs * local_nff * sizeof(float)));
-    GPU_CHECK(hipMalloc(&s->ffn_up,   bs * local_nff * sizeof(float)));
+    GPU_CHECK(hipMalloc(&s->q_buf,    bs * n * sizeof(float)));
+    GPU_CHECK(hipMalloc(&s->k_buf,    bs * kv_dim * sizeof(float)));
+    GPU_CHECK(hipMalloc(&s->v_buf,    bs * kv_dim * sizeof(float)));
+    GPU_CHECK(hipMalloc(&s->ffn_gate, bs * n_ff * sizeof(float)));
+    GPU_CHECK(hipMalloc(&s->ffn_up,   bs * n_ff * sizeof(float)));
     s->ffn_down = nullptr;  // unused — w_down writes directly to cur
-    GPU_CHECK(hipMalloc(&s->logits,   bs * local_vocab * sizeof(float)));
+    GPU_CHECK(hipMalloc(&s->logits,   bs * n_vocab * sizeof(float)));
     s->attn_scores_buf = nullptr;  // unused — flash attention uses tiled LDS
     GPU_CHECK(hipMalloc(&s->d_positions, bs * sizeof(int)));
     GPU_CHECK(hipMalloc(&s->d_tokens, bs * sizeof(int)));
-    int max_act = std::max(n, local_nff);
-    // Gemma4: activation buffer must also cover max Q dim for BF16 attention output
-    if (model->config.head_dim_sliding > 0)
-        max_act = std::max(max_act, max_q_dim);
-    // Pad batch dimension to 64 for GEMM tile alignment: the fused decode+GEMM
-    // kernel loads full TILE_N-wide activation tiles via cp.async without bounds
-    // checking. When bs is not a multiple of TILE_N (e.g., B=48 with TILE_N=32),
-    // the last tile reads past the allocation. Padding to 64 (max TILE_N) avoids OOB.
-    int bs_padded = ((bs + 63) / 64) * 64;
-    GPU_CHECK(hipMalloc(&s->bf16_act,  bs_padded * max_act * sizeof(int16_t)));
-    GPU_CHECK(hipMalloc(&s->bf16_act2, bs_padded * max_act * sizeof(int16_t)));
+    int max_act = std::max(n, n_ff);
+    GPU_CHECK(hipMalloc(&s->bf16_act,  bs * max_act * sizeof(int16_t)));
+    GPU_CHECK(hipMalloc(&s->bf16_act2, bs * max_act * sizeof(int16_t)));
     GPU_CHECK(hipStreamCreateWithFlags(&s->stream, hipStreamNonBlocking));
     GPU_CHECK(hipStreamCreateWithFlags(&s->stream2, hipStreamNonBlocking));
     GPU_CHECK(hipEventCreateWithFlags(&s->sync_event, hipEventDisableTiming));
@@ -236,44 +196,31 @@ static float s_prof_matvec = 0, s_prof_nonmv = 0;
     float _ms; hipEventElapsedTime(&_ms, _pE0, _pE1); s_prof_matvec += _ms; } } while(0)
 #define PROF_END_NM(strm) do { if (s_profile) { hipEventRecord(_pE1, strm); hipEventSynchronize(_pE1); \
     float _ms; hipEventElapsedTime(&_ms, _pE0, _pE1); s_prof_nonmv += _ms; } } while(0)
-static float s_prof_attn = 0, s_prof_norm = 0, s_prof_silu = 0, s_prof_misc = 0, s_prof_nccl = 0;
+static float s_prof_attn = 0, s_prof_norm = 0, s_prof_silu = 0, s_prof_misc = 0;
 #define PROF_END_ATTN(strm) do { if (s_profile) { hipEventRecord(_pE1, strm); hipEventSynchronize(_pE1); \
     float _ms; hipEventElapsedTime(&_ms, _pE0, _pE1); s_prof_attn += _ms; s_prof_nonmv += _ms; } } while(0)
 #define PROF_END_NORM(strm) do { if (s_profile) { hipEventRecord(_pE1, strm); hipEventSynchronize(_pE1); \
     float _ms; hipEventElapsedTime(&_ms, _pE0, _pE1); s_prof_norm += _ms; s_prof_nonmv += _ms; } } while(0)
 #define PROF_END_SILU(strm) do { if (s_profile) { hipEventRecord(_pE1, strm); hipEventSynchronize(_pE1); \
     float _ms; hipEventElapsedTime(&_ms, _pE0, _pE1); s_prof_silu += _ms; s_prof_nonmv += _ms; } } while(0)
-#define PROF_END_NCCL(strm) do { if (s_profile) { hipEventRecord(_pE1, strm); hipEventSynchronize(_pE1); \
-    float _ms; hipEventElapsedTime(&_ms, _pE0, _pE1); s_prof_nccl += _ms; s_prof_nonmv += _ms; } } while(0)
 #define PROF_TOKEN() do { if (s_profile && ++s_profile_tokens % 10 == 0) { \
     float total = s_prof_matvec + s_prof_nonmv; \
-    printf("  [PROFILE] %d tok: mv %.1f (%.0f%%) | attn %.1f norm %.1f silu %.1f nccl %.1f misc %.1f | total %.1f (%.1f t/s)\n", \
+    printf("  [PROFILE] %d tok: mv %.1f (%.0f%%) | attn %.1f norm %.1f silu %.1f misc %.1f | total %.1f (%.1f t/s)\n", \
         s_profile_tokens, s_prof_matvec, 100*s_prof_matvec/total, s_prof_attn, s_prof_norm, s_prof_silu, \
-        s_prof_nccl, s_prof_nonmv - s_prof_attn - s_prof_norm - s_prof_silu - s_prof_nccl, total, 10000.0f/total); \
-    s_prof_matvec = s_prof_nonmv = s_prof_attn = s_prof_norm = s_prof_silu = s_prof_misc = s_prof_nccl = 0; } } while(0)
+        s_prof_nonmv - s_prof_attn - s_prof_norm - s_prof_silu, total, 10000.0f/total); \
+    s_prof_matvec = s_prof_nonmv = s_prof_attn = s_prof_norm = s_prof_silu = s_prof_misc = 0; } } while(0)
 
 // B=1 forward — optimized: no redundant memcpy, single sync at end
 static void forward_b1(InferenceState* state, const int* token_ids) {
     Model* m = state->model;
     auto& cfg = m->config;
     hipStream_t stream = state->stream;
-    int tp = m->tp_size > 1 ? m->tp_size : 1;
     int n = cfg.n_embd, head_dim = n / cfg.n_head;
-    int n_head_local = cfg.n_head / tp;
-    int n_head_kv_local = cfg.n_head_kv / tp;
-    int kv_dim = n_head_kv_local * head_dim;
+    int kv_dim = cfg.n_head_kv * head_dim;
     int pos = state->positions[0];
-    bool is_gemma4 = (cfg.head_dim_sliding > 0);
 
     hipMemcpyAsync(state->d_tokens, token_ids, sizeof(int), hipMemcpyHostToDevice, stream);
-    // Gemma4 B=1 uses launch_rope_batch which needs d_positions on GPU
-    if (is_gemma4)
-        hipMemcpyAsync(state->d_positions, &pos, sizeof(int), hipMemcpyHostToDevice, stream);
     launch_embed_lookup(m->token_embd, state->d_tokens, state->hidden, n, 1, cfg.n_vocab, stream);
-
-    // Gemma4: scale embeddings by sqrt(n_embd)
-    if (is_gemma4)
-        launch_scale(state->hidden, sqrtf((float)n), n, stream);
 
     // Ping-pong between hidden and hidden2 to avoid unnecessary copies
     float* cur = state->hidden;
@@ -303,111 +250,39 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
     for (int layer = 0; layer < cfg.n_layer; layer++) {
         auto& L = m->layers[layer];
 
-        // Per-layer dimensions (Gemma4: varies per layer; legacy: constant)
-        int l_head_dim = L.head_dim;
-        int l_kv_dim = L.kv_dim;
-        int l_n_head_local = n_head_local;
-        int l_n_head_kv_local = n_head_kv_local;
-        float l_scale = 1.0f / sqrtf((float)l_head_dim);
-
         // Fused RMSNorm → BF16 for Q/K/V input
         PROF_START(stream);
         if (layer == 0)
             launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
         PROF_END_NORM(stream);
 
-
         PROF_START(stream);
         MATVEC_B1(L.wq, bf16_a, state->q_buf);
-
         MATVEC_B1(L.wk, bf16_a, state->k_buf);
-
         MATVEC_B1(L.wv, bf16_a, state->v_buf);
-
         PROF_END_MV(stream);
 
-        // Gemma4: per-head Q/K norms
-        if (L.q_norm) {
-            launch_rms_norm_per_head(state->q_buf, L.q_norm, l_n_head_local, l_head_dim, cfg.rms_norm_eps, stream);
-        }
-        if (L.k_norm) {
-            launch_rms_norm_per_head(state->k_buf, L.k_norm, l_n_head_kv_local, l_head_dim, cfg.rms_norm_eps, stream);
-        }
-
         PROF_START(stream);
-        // Get per-layer KV cache pointers
-        int16_t* kv_k = m->kv_k_ptrs[layer];
-        int16_t* kv_v = m->kv_v_ptrs[layer];
-
-        if (is_gemma4) {
-            // Gemma4: per-layer RoPE with variable theta and partial rotary
-            float l_theta;
-            int rotary_dim;
-            if (L.is_full_attn) {
-                l_theta = cfg.rope_theta_full;
-                rotary_dim = (int)(l_head_dim * cfg.partial_rotary);
-            } else {
-                l_theta = cfg.rope_theta;
-                rotary_dim = l_head_dim;  // full rotation for sliding layers
-            }
-
-            // Partial RoPE: only rotate first rotary_dim dimensions
-            if (rotary_dim < l_head_dim) {
-                launch_rope_init_partial(rotary_dim, l_theta);
-            }
-
-            // RoPE (in-place on q and k)
-            launch_rope_batch(state->q_buf, state->k_buf, state->d_positions,
-                              l_head_dim, l_n_head_local, l_n_head_kv_local,
-                              l_n_head_local * l_head_dim, l_kv_dim, l_theta, 1, stream);
-
-            // Store K/V to cache
-            launch_store_kv_batch(state->k_buf, state->v_buf, kv_k, kv_v,
-                                  state->d_positions, l_kv_dim, m->max_seq_len, 1, stream);
-
-            // Windowed or full attention
-            int window = L.is_full_attn ? 0 : cfg.sliding_window;
-            launch_attention_all_heads_windowed(state->q_buf, kv_k, kv_v,
-                bf16_a, l_n_head_local, l_n_head_kv_local, l_head_dim, pos+1, m->max_seq_len, l_scale,
-                window, stream);
-        } else {
-            // Legacy Llama/Mistral path (unchanged)
-            launch_rope_store_kv(state->q_buf, state->k_buf, state->v_buf,
-                                 kv_k, kv_v,
-                                 head_dim, n_head_local, n_head_kv_local, pos,
-                                 m->max_seq_len, cfg.rope_theta, stream);
-
-            if (pos < 1024)
-                launch_attention_all_heads(state->q_buf, kv_k, kv_v,
-                    bf16_a, n_head_local, n_head_kv_local, head_dim, pos+1, m->max_seq_len, scale, stream);
-            else
-                launch_flash_attention(state->q_buf, kv_k, kv_v,
-                    bf16_a, n_head_local, n_head_kv_local, head_dim, pos+1, m->max_seq_len, scale, stream);
-        }
+        size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
+        launch_rope_store_kv(state->q_buf, state->k_buf, state->v_buf,
+                             m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+                             head_dim, cfg.n_head, cfg.n_head_kv, pos,
+                             m->max_seq_len, cfg.rope_theta, stream);
+        if (pos < 1024)
+            launch_attention_all_heads(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+                bf16_a, cfg.n_head, cfg.n_head_kv, head_dim, pos+1, m->max_seq_len, scale, stream);
+        else
+            launch_flash_attention(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+                bf16_a, cfg.n_head, cfg.n_head_kv, head_dim, pos+1, m->max_seq_len, scale, stream);
 
         PROF_END_ATTN(stream);
 
         PROF_START(stream);
         MATVEC_B1(L.wo, bf16_a, res);
-
         PROF_END_MV(stream);
-        // TP: wo is column-split, output is partial sum — all-reduce to get full result
-        if (state->tp) {
-            PROF_START(stream);
-            tp_allreduce_sum(res, n * 1, state->tp, state->tp_rank, (void*)stream, 1);
-            PROF_END_NCCL(stream);
-        }
 
-        // Gemma4: pre-FFN norm (separate from add+norm)
         PROF_START(stream);
-        if (is_gemma4 && L.pre_ffn_norm) {
-            // Add residual first, then separate FFN norm
-            launch_add_batch(res, cur, n, 1, stream);
-            // res now holds the residual sum; norm into bf16_a for FFN input
-            launch_rms_norm_bf16_batch(res, L.pre_ffn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
-        } else {
-            launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
-        }
+        launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
         PROF_END_NORM(stream);
 
         PROF_START(stream);
@@ -437,49 +312,19 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
         PROF_END_MV(stream);
 
         PROF_START(stream);
-        // Gemma4: GELU activation; legacy: SiLU
-        if (cfg.activation_type == 1) {
-            launch_gelu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, 1, stream);
-        } else {
-            launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, 1, stream);
-        }
+        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, cfg.n_ff, 1, stream);
         PROF_END_SILU(stream);
 
         PROF_START(stream);
         MATVEC_B1(L.w_down, bf16_b, cur);
         PROF_END_MV(stream);
 
-        // Gemma4: post-FFN norm
-        if (is_gemma4 && L.post_ffn_norm) {
-            launch_rms_norm_bf16_batch(cur, L.post_ffn_norm, bf16_b, n, cfg.rms_norm_eps, 1, stream);
-            // cur is post-FFN output; need to continue with it as FP32 for add
-            // post_ffn_norm was applied in-place concept; we keep cur as the result
-        }
-
-        // TP: w_down is column-split, output is partial sum — all-reduce to get full result
-        if (state->tp) {
-            PROF_START(stream);
-            tp_allreduce_sum(cur, n * 1, state->tp, state->tp_rank, (void*)stream, 0);
-            PROF_END_NCCL(stream);
-        }
-
         PROF_START(stream);
-        if (is_gemma4 && L.pre_ffn_norm) {
-            // Gemma4: residual is in res (from attn add), cur is FFN output
-            // Next layer needs: add(cur, res) -> new residual, then attn_norm -> bf16_a
-            if (layer + 1 < cfg.n_layer) {
-                auto& nextL = m->layers[layer + 1];
-                launch_add_rms_norm_bf16_batch(cur, res, nextL.attn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
-            } else {
-                launch_add_rms_norm_bf16_batch(cur, res, m->output_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
-            }
+        if (layer + 1 < cfg.n_layer) {
+            auto& nextL = m->layers[layer + 1];
+            launch_add_rms_norm_bf16_batch(cur, res, nextL.attn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
         } else {
-            if (layer + 1 < cfg.n_layer) {
-                auto& nextL = m->layers[layer + 1];
-                launch_add_rms_norm_bf16_batch(cur, res, nextL.attn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
-            } else {
-                launch_add_rms_norm_bf16_batch(cur, res, m->output_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
-            }
+            launch_add_rms_norm_bf16_batch(cur, res, m->output_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
         }
         PROF_END_NORM(stream);
     }
@@ -488,11 +333,6 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
     PROF_START(stream);
     MATVEC_B1(m->output_proj, bf16_a, state->logits);
     PROF_END_MV(stream);
-
-    // Gemma4: logit softcap
-    if (cfg.logit_softcap > 0)
-        launch_softcap(state->logits, cfg.n_vocab, cfg.logit_softcap, stream);
-
     PROF_EVENT_DESTROY();
     PROF_TOKEN();
     state->positions[0] = pos + 1;
@@ -533,20 +373,13 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
     Model* m = state->model;
     auto& cfg = m->config;
     hipStream_t stream = state->stream;
-    int tp = m->tp_size > 1 ? m->tp_size : 1;
-    int n = cfg.n_embd, head_dim = n / cfg.n_head;
-    int n_head_local = cfg.n_head / tp;
-    int n_head_kv_local = cfg.n_head_kv / tp;
-    int kv_dim = n_head_kv_local * head_dim;
+    int n = cfg.n_embd, n_ff = cfg.n_ff, head_dim = n / cfg.n_head;
+    int kv_dim = cfg.n_head_kv * head_dim;
     const int BS = 4;
 
     hipMemcpyAsync(state->d_positions, state->positions, BS * sizeof(int), hipMemcpyHostToDevice, stream);
     hipMemcpyAsync(state->d_tokens, token_ids, BS * sizeof(int), hipMemcpyHostToDevice, stream);
     launch_embed_lookup(m->token_embd, state->d_tokens, state->hidden, n, BS, cfg.n_vocab, stream);
-
-    // Gemma4: scale embeddings by sqrt(n_embd)
-    if (cfg.head_dim_sliding > 0)
-        launch_scale(state->hidden, sqrtf((float)n), n * BS, stream);
 
     float* cur = state->hidden;
     float* res = state->hidden2;
@@ -564,7 +397,7 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
 
 #ifdef TURBO_NVIDIA
         // NVIDIA: auto-select split12 when available (saves 10 GB VRAM)
-        BATCH4_MATVEC(L.wq, bf16_a, state->q_buf, n, L.wq.M, stream);
+        BATCH4_MATVEC(L.wq, bf16_a, state->q_buf, n, n, stream);
         BATCH4_MATVEC(L.wk, bf16_a, state->k_buf, n, kv_dim, stream);
         BATCH4_MATVEC(L.wv, bf16_a, state->v_buf, n, kv_dim, stream);
 #else
@@ -572,7 +405,7 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
         launch_structured12_batch4_async(L.wq.packed, L.wq.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.wq.escape_row_base, L.wq.escape_counts, L.wq.escape_vals,
-            SEQ(state->q_buf,0,L.wq.M), SEQ(state->q_buf,1,L.wq.M), SEQ(state->q_buf,2,L.wq.M), SEQ(state->q_buf,3,L.wq.M),
+            SEQ(state->q_buf,0,n), SEQ(state->q_buf,1,n), SEQ(state->q_buf,2,n), SEQ(state->q_buf,3,n),
             L.wq.M, L.wq.K, stream);
         launch_structured12_batch4_async(L.wk.packed, L.wk.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
@@ -586,73 +419,54 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
             L.wv.M, L.wv.K, stream);
 #endif
 
-        int16_t* kv_k = m->kv_k_ptrs[layer];
-        int16_t* kv_v = m->kv_v_ptrs[layer];
+        size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
         launch_rope_batch(state->q_buf, state->k_buf, state->d_positions,
-                          head_dim, n_head_local, n_head_kv_local, n_head_local * head_dim, kv_dim, cfg.rope_theta, BS, stream);
+                          head_dim, cfg.n_head, cfg.n_head_kv, n, kv_dim, cfg.rope_theta, BS, stream);
         launch_store_kv_batch(state->k_buf, state->v_buf,
-                              kv_k, kv_v,
+                              m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
                               state->d_positions, kv_dim, m->max_seq_len, BS, stream);
 
         int max_pos = 0;
         for (int s = 0; s < BS; s++) max_pos = std::max(max_pos, state->positions[s]);
         if (max_pos < 1024)
-            launch_attention_all_heads_batch(state->q_buf, kv_k, kv_v,
-                bf16_a, state->d_positions, n_head_local, n_head_kv_local, head_dim,
+            launch_attention_all_heads_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+                bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
                 max_pos + 1, scale, BS, 0, stream);
         else
-            launch_flash_attention_batch(state->q_buf, kv_k, kv_v,
-                bf16_a, state->d_positions, n_head_local, n_head_kv_local, head_dim,
+            launch_flash_attention_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+                bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
                 max_pos + 1, scale, BS, 0, stream);
 
 #ifdef TURBO_NVIDIA
-        BATCH4_MATVEC(L.wo, bf16_a, res, n_head_local * head_dim, n, stream);
-        // TP: wo is column-split — all-reduce partial sums
-        if (state->tp)
-            tp_allreduce_sum(res, n * BS, state->tp, state->tp_rank, (void*)stream, 1);
+        BATCH4_MATVEC(L.wo, bf16_a, res, n, n, stream);
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
-        BATCH4_MATVEC(L.w_gate, bf16_a, state->ffn_gate, n, L.w_gate.M, stream);
-        BATCH4_MATVEC(L.w_up, bf16_a, state->ffn_up, n, L.w_gate.M, stream);
-        if (cfg.activation_type == 1)
-            launch_gelu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, BS, stream);
-        else
-            launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, BS, stream);
-        BATCH4_MATVEC(L.w_down, bf16_b, cur, L.w_gate.M, n, stream);
-        // TP: w_down is column-split — all-reduce partial sums
-        if (state->tp)
-            tp_allreduce_sum(cur, n * BS, state->tp, state->tp_rank, (void*)stream, 0);
+        BATCH4_MATVEC(L.w_gate, bf16_a, state->ffn_gate, n, n_ff, stream);
+        BATCH4_MATVEC(L.w_up, bf16_a, state->ffn_up, n, n_ff, stream);
+        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, BS, stream);
+        BATCH4_MATVEC(L.w_down, bf16_b, cur, n_ff, n, stream);
 #else
         launch_structured12_batch4_async(L.wo.packed, L.wo.base_exp,
-            SEQI(bf16_a,0,n_head_local * head_dim), SEQI(bf16_a,1,n_head_local * head_dim), SEQI(bf16_a,2,n_head_local * head_dim), SEQI(bf16_a,3,n_head_local * head_dim),
+            SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.wo.escape_row_base, L.wo.escape_counts, L.wo.escape_vals,
             SEQ(res,0,n), SEQ(res,1,n), SEQ(res,2,n), SEQ(res,3,n),
             L.wo.M, L.wo.K, stream);
-        // TP: wo is column-split — all-reduce partial sums
-        if (state->tp)
-            tp_allreduce_sum(res, n * BS, state->tp, state->tp_rank, (void*)stream, 1);
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
         launch_structured12_batch4_async(L.w_gate.packed, L.w_gate.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.w_gate.escape_row_base, L.w_gate.escape_counts, L.w_gate.escape_vals,
-            SEQ(state->ffn_gate,0,L.w_gate.M), SEQ(state->ffn_gate,1,L.w_gate.M), SEQ(state->ffn_gate,2,L.w_gate.M), SEQ(state->ffn_gate,3,L.w_gate.M),
+            SEQ(state->ffn_gate,0,n_ff), SEQ(state->ffn_gate,1,n_ff), SEQ(state->ffn_gate,2,n_ff), SEQ(state->ffn_gate,3,n_ff),
             L.w_gate.M, L.w_gate.K, stream);
         launch_structured12_batch4_async(L.w_up.packed, L.w_up.base_exp,
             SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
             L.w_up.escape_row_base, L.w_up.escape_counts, L.w_up.escape_vals,
-            SEQ(state->ffn_up,0,L.w_gate.M), SEQ(state->ffn_up,1,L.w_gate.M), SEQ(state->ffn_up,2,L.w_gate.M), SEQ(state->ffn_up,3,L.w_gate.M),
+            SEQ(state->ffn_up,0,n_ff), SEQ(state->ffn_up,1,n_ff), SEQ(state->ffn_up,2,n_ff), SEQ(state->ffn_up,3,n_ff),
             L.w_up.M, L.w_up.K, stream);
-        if (cfg.activation_type == 1)
-            launch_gelu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, BS, stream);
-        else
-            launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, BS, stream);
+        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, BS, stream);
         launch_structured12_batch4_async(L.w_down.packed, L.w_down.base_exp,
-            SEQI(bf16_b,0,L.w_gate.M), SEQI(bf16_b,1,L.w_gate.M), SEQI(bf16_b,2,L.w_gate.M), SEQI(bf16_b,3,L.w_gate.M),
+            SEQI(bf16_b,0,n_ff), SEQI(bf16_b,1,n_ff), SEQI(bf16_b,2,n_ff), SEQI(bf16_b,3,n_ff),
             L.w_down.escape_row_base, L.w_down.escape_counts, L.w_down.escape_vals,
             SEQ(cur,0,n), SEQ(cur,1,n), SEQ(cur,2,n), SEQ(cur,3,n),
             L.w_down.M, L.w_down.K, stream);
-        // TP: w_down is column-split — all-reduce partial sums
-        if (state->tp)
-            tp_allreduce_sum(cur, n * BS, state->tp, state->tp_rank, (void*)stream, 0);
 #endif
 
         // Fuse add + next layer's RMSNorm (saves 1 kernel launch per layer)
@@ -666,18 +480,15 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
 
     // Output projection
 #ifdef TURBO_NVIDIA
-    BATCH4_MATVEC(m->output_proj, bf16_a, state->logits, n, m->output_proj.M, stream);
+    BATCH4_MATVEC(m->output_proj, bf16_a, state->logits, n, cfg.n_vocab, stream);
 #else
     launch_structured12_batch4_async(m->output_proj.packed, m->output_proj.base_exp,
         SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
         m->output_proj.escape_row_base, m->output_proj.escape_counts, m->output_proj.escape_vals,
-        SEQ(state->logits,0,m->output_proj.M), SEQ(state->logits,1,m->output_proj.M),
-        SEQ(state->logits,2,m->output_proj.M), SEQ(state->logits,3,m->output_proj.M),
+        SEQ(state->logits,0,cfg.n_vocab), SEQ(state->logits,1,cfg.n_vocab),
+        SEQ(state->logits,2,cfg.n_vocab), SEQ(state->logits,3,cfg.n_vocab),
         m->output_proj.M, m->output_proj.K, stream);
 #endif
-    // Gemma4: logit softcap
-    if (cfg.logit_softcap > 0)
-        launch_softcap(state->logits, cfg.n_vocab * BS, cfg.logit_softcap, stream);
     for (int s = 0; s < BS; s++) state->positions[s]++;
 }
 
@@ -686,24 +497,13 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
     Model* m = state->model;
     auto& cfg = m->config;
     hipStream_t stream = state->stream;
-    int tp = m->tp_size > 1 ? m->tp_size : 1;
-    int n = cfg.n_embd, head_dim = n / cfg.n_head;
-    int n_head_local = cfg.n_head / tp;
-    int n_head_kv_local = cfg.n_head_kv / tp;
-    int kv_dim = n_head_kv_local * head_dim;
+    int n = cfg.n_embd, n_ff = cfg.n_ff, head_dim = n / cfg.n_head;
+    int kv_dim = cfg.n_head_kv * head_dim;
     const int BS = 8;
-
-    PROF_INIT();
-    PROF_EVENT_DECL();
-    PROF_EVENT_CREATE();
 
     hipMemcpyAsync(state->d_positions, state->positions, BS * sizeof(int), hipMemcpyHostToDevice, stream);
     hipMemcpyAsync(state->d_tokens, token_ids, BS * sizeof(int), hipMemcpyHostToDevice, stream);
     launch_embed_lookup(m->token_embd, state->d_tokens, state->hidden, n, BS, cfg.n_vocab, stream);
-
-    // Gemma4: scale embeddings by sqrt(n_embd)
-    if (cfg.head_dim_sliding > 0)
-        launch_scale(state->hidden, sqrtf((float)n), n * BS, stream);
 
     float* cur = state->hidden;
     float* res = state->hidden2;
@@ -715,79 +515,41 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
     for (int layer = 0; layer < cfg.n_layer; layer++) {
         auto& L = m->layers[layer];
 
-        PROF_START(stream);
         // Fused RMSNorm -> BF16 for Q/K/V (layer 0 only; subsequent fused with prev add)
         if (layer == 0)
             launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
-        PROF_END_NORM(stream);
-
-        PROF_START(stream);
-        BATCH8_MATVEC(L.wq, bf16_a, state->q_buf, n, L.wq.M, stream);
+        BATCH8_MATVEC(L.wq, bf16_a, state->q_buf, n, n, stream);
         BATCH8_MATVEC(L.wk, bf16_a, state->k_buf, n, kv_dim, stream);
         BATCH8_MATVEC(L.wv, bf16_a, state->v_buf, n, kv_dim, stream);
-        PROF_END_MV(stream);
 
-        int16_t* kv_k = m->kv_k_ptrs[layer];
-        int16_t* kv_v = m->kv_v_ptrs[layer];
+        size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
         launch_rope_batch(state->q_buf, state->k_buf, state->d_positions,
-                          head_dim, n_head_local, n_head_kv_local, n_head_local * head_dim, kv_dim, cfg.rope_theta, BS, stream);
+                          head_dim, cfg.n_head, cfg.n_head_kv, n, kv_dim, cfg.rope_theta, BS, stream);
         launch_store_kv_batch(state->k_buf, state->v_buf,
-                              kv_k, kv_v,
+                              m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
                               state->d_positions, kv_dim, m->max_seq_len, BS, stream);
 
-        PROF_START(stream);
         int max_pos = 0;
         for (int s = 0; s < BS; s++) max_pos = std::max(max_pos, state->positions[s]);
         if (max_pos < 1024)
-            launch_attention_all_heads_batch(state->q_buf, kv_k, kv_v,
-                bf16_a, state->d_positions, n_head_local, n_head_kv_local, head_dim,
+            launch_attention_all_heads_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+                bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
                 max_pos + 1, scale, BS, 0, stream);
         else
-            launch_flash_attention_batch(state->q_buf, kv_k, kv_v,
-                bf16_a, state->d_positions, n_head_local, n_head_kv_local, head_dim,
+            launch_flash_attention_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+                bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
                 max_pos + 1, scale, BS, 0, stream);
-        PROF_END_ATTN(stream);
 
         // wo: attention now writes BF16 directly to bf16_a
-        PROF_START(stream);
-        BATCH8_MATVEC(L.wo, bf16_a, res, n_head_local * head_dim, n, stream);
-        PROF_END_MV(stream);
-        // TP: wo is column-split — all-reduce partial sums
-        if (state->tp) {
-            PROF_START(stream);
-            tp_allreduce_sum(res, n * BS, state->tp, state->tp_rank, (void*)stream, 1);
-            PROF_END_NCCL(stream);
-        }
-
-        PROF_START(stream);
+        BATCH8_MATVEC(L.wo, bf16_a, res, n, n, stream);
         // Fused add + RMSNorm -> BF16
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
-        PROF_END_NORM(stream);
+        BATCH8_MATVEC(L.w_gate, bf16_a, state->ffn_gate, n, n_ff, stream);
+        BATCH8_MATVEC(L.w_up, bf16_a, state->ffn_up, n, n_ff, stream);
+        // Fused SiLU*mul -> BF16 for w_down
+        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, BS, stream);
+        BATCH8_MATVEC(L.w_down, bf16_b, cur, n_ff, n, stream);
 
-        PROF_START(stream);
-        BATCH8_MATVEC(L.w_gate, bf16_a, state->ffn_gate, n, L.w_gate.M, stream);
-        BATCH8_MATVEC(L.w_up, bf16_a, state->ffn_up, n, L.w_gate.M, stream);
-        PROF_END_MV(stream);
-
-        PROF_START(stream);
-        // Activation: GELU for Gemma4, SiLU for legacy
-        if (cfg.activation_type == 1)
-            launch_gelu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, BS, stream);
-        else
-            launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, BS, stream);
-        PROF_END_SILU(stream);
-
-        PROF_START(stream);
-        BATCH8_MATVEC(L.w_down, bf16_b, cur, L.w_gate.M, n, stream);
-        PROF_END_MV(stream);
-        // TP: w_down is column-split — all-reduce partial sums
-        if (state->tp) {
-            PROF_START(stream);
-            tp_allreduce_sum(cur, n * BS, state->tp, state->tp_rank, (void*)stream, 0);
-            PROF_END_NCCL(stream);
-        }
-
-        PROF_START(stream);
         // Fuse add + next layer's RMSNorm (saves 1 kernel launch per layer)
         if (layer + 1 < cfg.n_layer) {
             auto& nextL = m->layers[layer + 1];
@@ -796,18 +558,10 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
             // Fuse last layer's add with output RMSNorm
             launch_add_rms_norm_bf16_batch(cur, res, m->output_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
         }
-        PROF_END_NORM(stream);
     }
 
     // Output projection (bf16_a already set by fused add+norm above)
-    PROF_START(stream);
-    BATCH8_MATVEC(m->output_proj, bf16_a, state->logits, n, m->output_proj.M, stream);
-    PROF_END_MV(stream);
-    // Gemma4: logit softcap
-    if (cfg.logit_softcap > 0)
-        launch_softcap(state->logits, cfg.n_vocab * BS, cfg.logit_softcap, stream);
-    PROF_EVENT_DESTROY();
-    PROF_TOKEN();
+    BATCH8_MATVEC(m->output_proj, bf16_a, state->logits, n, cfg.n_vocab, stream);
     for (int s = 0; s < BS; s++) state->positions[s]++;
 }
 
@@ -855,20 +609,13 @@ static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
     hipStream_t s1 = state->stream;      // main compute stream
     hipStream_t s2 = state->stream2;     // patch correction stream
     hipEvent_t ev = state->sync_event;
-    int tp = m->tp_size > 1 ? m->tp_size : 1;
-    int n = cfg.n_embd, head_dim = n / cfg.n_head;
-    int n_head_local = cfg.n_head / tp;
-    int n_head_kv_local = cfg.n_head_kv / tp;
-    int kv_dim = n_head_kv_local * head_dim;
+    int n = cfg.n_embd, n_ff = cfg.n_ff, head_dim = n / cfg.n_head;
+    int kv_dim = cfg.n_head_kv * head_dim;
     int BS = state->batch_size;
 
     hipMemcpyAsync(state->d_positions, state->positions, BS * sizeof(int), hipMemcpyHostToDevice, s1);
     hipMemcpyAsync(state->d_tokens, token_ids, BS * sizeof(int), hipMemcpyHostToDevice, s1);
     launch_embed_lookup(m->token_embd, state->d_tokens, state->hidden, n, BS, cfg.n_vocab, s1);
-
-    // Gemma4: scale embeddings by sqrt(n_embd)
-    if (cfg.head_dim_sliding > 0)
-        launch_scale(state->hidden, sqrtf((float)n), n * BS, s1);
 
     float* cur = state->hidden;
     float* res = state->hidden2;
@@ -883,8 +630,8 @@ static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
             launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, s1);
 
         // wq/wk/wv: GEMM on s1, patches on s2 (overlapped with next GEMM)
-        GEMM_ONLY(L.wq, bf16_a, state->q_buf, n, L.wq.M, BS, s1);
-        PATCHES_ASYNC(L.wq, bf16_a, state->q_buf, n, L.wq.M, BS, s1, s2, ev);
+        GEMM_ONLY(L.wq, bf16_a, state->q_buf, n, n, BS, s1);
+        PATCHES_ASYNC(L.wq, bf16_a, state->q_buf, n, n, BS, s1, s2, ev);
         GEMM_ONLY(L.wk, bf16_a, state->k_buf, n, kv_dim, BS, s1);
         PATCHES_ASYNC(L.wk, bf16_a, state->k_buf, n, kv_dim, BS, s1, s2, ev);
         GEMM_ONLY(L.wv, bf16_a, state->v_buf, n, kv_dim, BS, s1);
@@ -893,55 +640,45 @@ static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
         // Sync patches before consuming q/k/v
         SYNC_PATCHES(s1, s2, ev);
 
-        int16_t* kv_k = m->kv_k_ptrs[layer];
-        int16_t* kv_v = m->kv_v_ptrs[layer];
+        size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
         launch_rope_batch(state->q_buf, state->k_buf, state->d_positions,
-                          head_dim, n_head_local, n_head_kv_local, n_head_local * head_dim, kv_dim, cfg.rope_theta, BS, s1);
+                          head_dim, cfg.n_head, cfg.n_head_kv, n, kv_dim, cfg.rope_theta, BS, s1);
         launch_store_kv_batch(state->k_buf, state->v_buf,
-                              kv_k, kv_v,
+                              m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
                               state->d_positions, kv_dim, m->max_seq_len, BS, s1);
 
         int max_pos = 0;
         for (int s = 0; s < BS; s++) max_pos = std::max(max_pos, state->positions[s]);
         if (max_pos < 1024)
-            launch_attention_all_heads_batch(state->q_buf, kv_k, kv_v,
-                bf16_a, state->d_positions, n_head_local, n_head_kv_local, head_dim,
+            launch_attention_all_heads_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+                bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
                 max_pos + 1, scale, BS, 0, s1);
         else
-            launch_flash_attention_batch(state->q_buf, kv_k, kv_v,
-                bf16_a, state->d_positions, n_head_local, n_head_kv_local, head_dim,
+            launch_flash_attention_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+                bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
                 max_pos + 1, scale, BS, 0, s1);
 
         // wo: GEMM + patches (patches must finish before add_rms_norm reads res)
-        GEMM_ONLY(L.wo, bf16_a, res, n_head_local * head_dim, n, BS, s1);
-        PATCHES_ASYNC(L.wo, bf16_a, res, n_head_local * head_dim, n, BS, s1, s2, ev);
+        GEMM_ONLY(L.wo, bf16_a, res, n, n, BS, s1);
+        PATCHES_ASYNC(L.wo, bf16_a, res, n, n, BS, s1, s2, ev);
         SYNC_PATCHES(s1, s2, ev);
-        // TP: wo is column-split — all-reduce partial sums
-        if (state->tp)
-            tp_allreduce_sum(res, n * BS, state->tp, state->tp_rank, (void*)s1, 1);
 
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, s1);
 
         // w_gate + w_up: patches overlap with next GEMM
-        GEMM_ONLY(L.w_gate, bf16_a, state->ffn_gate, n, L.w_gate.M, BS, s1);
-        PATCHES_ASYNC(L.w_gate, bf16_a, state->ffn_gate, n, L.w_gate.M, BS, s1, s2, ev);
-        GEMM_ONLY(L.w_up, bf16_a, state->ffn_up, n, L.w_gate.M, BS, s1);
-        PATCHES_ASYNC(L.w_up, bf16_a, state->ffn_up, n, L.w_gate.M, BS, s1, s2, ev);
+        GEMM_ONLY(L.w_gate, bf16_a, state->ffn_gate, n, n_ff, BS, s1);
+        PATCHES_ASYNC(L.w_gate, bf16_a, state->ffn_gate, n, n_ff, BS, s1, s2, ev);
+        GEMM_ONLY(L.w_up, bf16_a, state->ffn_up, n, n_ff, BS, s1);
+        PATCHES_ASYNC(L.w_up, bf16_a, state->ffn_up, n, n_ff, BS, s1, s2, ev);
 
-        // Sync patches before activation consumes gate+up
+        // Sync patches before silu_mul consumes gate+up
         SYNC_PATCHES(s1, s2, ev);
-        if (cfg.activation_type == 1)
-            launch_gelu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, BS, s1);
-        else
-            launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, BS, s1);
+        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, BS, s1);
 
         // w_down: patches must finish before add_rms_norm
-        GEMM_ONLY(L.w_down, bf16_b, cur, L.w_gate.M, n, BS, s1);
-        PATCHES_ASYNC(L.w_down, bf16_b, cur, L.w_gate.M, n, BS, s1, s2, ev);
+        GEMM_ONLY(L.w_down, bf16_b, cur, n_ff, n, BS, s1);
+        PATCHES_ASYNC(L.w_down, bf16_b, cur, n_ff, n, BS, s1, s2, ev);
         SYNC_PATCHES(s1, s2, ev);
-        // TP: w_down is column-split — all-reduce partial sums
-        if (state->tp)
-            tp_allreduce_sum(cur, n * BS, state->tp, state->tp_rank, (void*)s1, 0);
 
         if (layer + 1 < cfg.n_layer)
             launch_add_rms_norm_bf16_batch(cur, res, m->layers[layer + 1].attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, s1);
@@ -950,13 +687,9 @@ static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
     }
 
     // output_proj: patches must finish before argmax
-    GEMM_ONLY(m->output_proj, bf16_a, state->logits, n, m->output_proj.M, BS, s1);
-    PATCHES_ASYNC(m->output_proj, bf16_a, state->logits, n, m->output_proj.M, BS, s1, s2, ev);
+    GEMM_ONLY(m->output_proj, bf16_a, state->logits, n, cfg.n_vocab, BS, s1);
+    PATCHES_ASYNC(m->output_proj, bf16_a, state->logits, n, cfg.n_vocab, BS, s1, s2, ev);
     SYNC_PATCHES(s1, s2, ev);
-
-    // Gemma4: logit softcap
-    if (cfg.logit_softcap > 0)
-        launch_softcap(state->logits, cfg.n_vocab * BS, cfg.logit_softcap, s1);
 
     for (int s = 0; s < BS; s++) state->positions[s]++;
 }
@@ -969,7 +702,6 @@ void forward(InferenceState* state, const int* token_ids) {
 #ifdef TURBO_NVIDIA
     // NVIDIA: decode+cuBLAS for B>8 (tensor cores win at high batch)
     // B<=8 uses hand-optimized split12 per-row kernels (faster for small batch)
-    // TP dimension bugs in forward_batch_tiled fixed — re-enabled for TP
     if (state->batch_size > 8 && state->model->layers[0].wq.split_sm) {
         forward_batch_tiled(state, token_ids); return;
     }
@@ -980,14 +712,9 @@ void forward(InferenceState* state, const int* token_ids) {
         // Process as multiple B=8 passes (e.g., B=16 = 2× B=8, B=32 = 4× B=8)
         int orig_bs = state->batch_size;
         int n = state->model->config.n_embd;
-        int tp = state->model->tp_size > 1 ? state->model->tp_size : 1;
-        int head_dim = n / state->model->config.n_head;
-        int n_head_local = state->model->config.n_head / tp;
-        int n_head_kv_local = state->model->config.n_head_kv / tp;
-        int local_n = n_head_local * head_dim;
-        int kv_dim = n_head_kv_local * head_dim;
-        int local_nff = state->model->config.n_ff / tp;
-        int local_vocab = state->model->config.n_vocab / tp;
+        int n_ff = state->model->config.n_ff;
+        int n_vocab = state->model->config.n_vocab;
+        int kv_dim = state->model->config.n_head_kv * (n / state->model->config.n_head);
 
         for (int chunk = 0; chunk < orig_bs; chunk += 8) {
             // Temporarily adjust state to point to this chunk's slice
@@ -997,16 +724,16 @@ void forward(InferenceState* state, const int* token_ids) {
             slice.hidden = state->hidden + chunk * n;
             slice.hidden2 = state->hidden2 + chunk * n;
             slice.attn_out = state->attn_out + chunk * n;
-            slice.q_buf = state->q_buf + chunk * local_n;
+            slice.q_buf = state->q_buf + chunk * n;
             slice.k_buf = state->k_buf + chunk * kv_dim;
             slice.v_buf = state->v_buf + chunk * kv_dim;
-            slice.ffn_gate = state->ffn_gate + chunk * local_nff;
-            slice.ffn_up = state->ffn_up + chunk * local_nff;
-            slice.logits = state->logits + chunk * local_vocab;
+            slice.ffn_gate = state->ffn_gate + chunk * n_ff;
+            slice.ffn_up = state->ffn_up + chunk * n_ff;
+            slice.logits = state->logits + chunk * n_vocab;
             slice.d_positions = state->d_positions + chunk;
             slice.d_tokens = state->d_tokens + chunk;
-            slice.bf16_act = state->bf16_act + chunk * std::max(n, local_nff);
-            slice.bf16_act2 = state->bf16_act2 + chunk * std::max(n, local_nff);
+            slice.bf16_act = state->bf16_act + chunk * std::max(n, n_ff);
+            slice.bf16_act2 = state->bf16_act2 + chunk * std::max(n, n_ff);
 
             forward_b8(&slice, token_ids + chunk);
         }
@@ -1019,22 +746,13 @@ std::vector<int> generate(InferenceState* state, const std::vector<int>& prompt_
     std::vector<int> output;
     int n_vocab = state->model->config.n_vocab;
 
-    // TP: each GPU has local_vocab logits; distributed argmax finds global max
-    int local_vocab = state->tp ? (n_vocab / state->tp->tp_size) : n_vocab;
-
     if (state->batch_size == 1) {
         for (int i = 0; i < (int)prompt_tokens.size(); i++) {
             state->positions[0] = i;
             forward(state, &prompt_tokens[i]);
         }
         for (int t = 0; t < max_tokens; t++) {
-            int next;
-            if (state->tp) {
-                next = tp_distributed_argmax(state->logits, local_vocab, n_vocab,
-                                             state->tp, state->tp_rank, (void*)state->stream);
-            } else {
-                next = sample_greedy(state->logits, n_vocab, state->stream);
-            }
+            int next = sample_greedy(state->logits, n_vocab, state->stream);
             if (next == 2) break;
             output.push_back(next);
             forward(state, &next);
@@ -1048,86 +766,11 @@ std::vector<int> generate(InferenceState* state, const std::vector<int>& prompt_
             forward(state, tokens.data());
         }
         for (int t = 0; t < max_tokens; t++) {
-            if (state->tp) {
-                // TP batched: distributed argmax for each sequence
-                for (int s = 0; s < bs; s++) {
-                    tokens[s] = tp_distributed_argmax(state->logits + s * local_vocab,
-                                                      local_vocab, n_vocab,
-                                                      state->tp, state->tp_rank, (void*)state->stream);
-                }
-            } else {
-                // Single batched argmax launch + one sync (was: bs separate launches + syncs)
-                sample_greedy_batch(state->logits, tokens.data(), n_vocab, bs, state->stream);
-            }
+            // Single batched argmax launch + one sync (was: bs separate launches + syncs)
+            sample_greedy_batch(state->logits, tokens.data(), n_vocab, bs, state->stream);
             if (tokens[0] == 2) break;
             output.push_back(tokens[0]);
             forward(state, tokens.data());
-        }
-    }
-    return output;
-}
-
-// TP forward: run both GPUs in parallel using 2 threads.
-// NCCL allreduce inside forward() naturally synchronizes both ranks.
-#include <thread>
-
-static void forward_rank(InferenceState* state, const int* token_ids, int device_id) {
-    GPU_CHECK(hipSetDevice(device_id));
-    forward(state, token_ids);
-    GPU_CHECK(hipStreamSynchronize(state->stream));
-}
-
-static void forward_tp(TPState* tp, const int* token_ids, int* device_ids) {
-    std::thread t1(forward_rank, tp->states[1], token_ids, device_ids[1]);
-    forward_rank(tp->states[0], token_ids, device_ids[0]);
-    t1.join();
-}
-
-std::vector<int> generate_tp(TPState* tp, const std::vector<int>& prompt_tokens, int max_tokens, int* device_ids) {
-    std::vector<int> output;
-    InferenceState* s0 = tp->states[0];
-    int n_vocab = s0->model->config.n_vocab;
-    int local_vocab = n_vocab / tp->tp_size;
-
-    if (s0->batch_size == 1) {
-        // Prefill: process each prompt token on both GPUs
-        for (int i = 0; i < (int)prompt_tokens.size(); i++) {
-            for (int r = 0; r < tp->tp_size; r++)
-                tp->states[r]->positions[0] = i;
-            forward_tp(tp, &prompt_tokens[i], device_ids);
-        }
-        // Decode: generate tokens
-        for (int t = 0; t < max_tokens; t++) {
-            // Distributed argmax on rank 0 (it coordinates with rank 1 via NCCL)
-            GPU_CHECK(hipSetDevice(device_ids[0]));
-            int next = tp_distributed_argmax(s0->logits, local_vocab, n_vocab,
-                                              tp, 0, (void*)s0->stream);
-            if (next == 2 || next == s0->model->config.n_vocab - 1) break; // EOS
-            output.push_back(next);
-            forward_tp(tp, &next, device_ids);
-        }
-    } else {
-        int bs = s0->batch_size;
-        std::vector<int> tokens(bs);
-        // Prefill
-        for (int i = 0; i < (int)prompt_tokens.size(); i++) {
-            for (int r = 0; r < tp->tp_size; r++)
-                for (int s = 0; s < bs; s++)
-                    tp->states[r]->positions[s] = i;
-            for (int s = 0; s < bs; s++) tokens[s] = prompt_tokens[i];
-            forward_tp(tp, tokens.data(), device_ids);
-        }
-        // Decode
-        for (int t = 0; t < max_tokens; t++) {
-            GPU_CHECK(hipSetDevice(device_ids[0]));
-            for (int s = 0; s < bs; s++) {
-                tokens[s] = tp_distributed_argmax(s0->logits + s * local_vocab,
-                                                   local_vocab, n_vocab,
-                                                   tp, 0, (void*)s0->stream);
-            }
-            if (tokens[0] == 2) break;
-            output.push_back(tokens[0]);
-            forward_tp(tp, tokens.data(), device_ids);
         }
     }
     return output;

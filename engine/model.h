@@ -15,18 +15,6 @@ struct ModelConfig {
     int n_ctx;          // max context length
     float rope_theta;   // RoPE base frequency
     float rms_norm_eps; // RMSNorm epsilon
-
-    // Gemma 4 extensions (all zero = legacy Llama/Mistral path)
-    int head_dim_sliding;    // 256, or 0 = use n_embd/n_head (legacy)
-    int head_dim_full;       // 512, or 0
-    int sliding_window;      // 512, or 0 = disabled
-    float logit_softcap;     // 30.0, or 0 = disabled
-    int num_kv_shared;       // 18, or 0
-    float rope_theta_full;   // 1000000
-    float partial_rotary;    // 0.25, or 1.0 default
-    int activation_type;     // 0=silu, 1=gelu_tanh
-    int tie_embeddings;      // 0 or 1
-    uint8_t layer_types[64]; // 0=sliding, 1=full (max 64 layers)
 };
 
 // Compressed weight tensor on GPU (CSR escape format + fused escape table)
@@ -64,26 +52,11 @@ struct TransformerLayer {
     // Norm weights (small, stored as FP32 on GPU)
     float* attn_norm;   // [n_embd]
     float* ffn_norm;    // [n_embd]
-
-    // Gemma 4 extensions (nullptr for Llama/Mistral)
-    float* q_norm;        // [head_dim] per-head Q norm
-    float* k_norm;        // [head_dim] per-head K norm
-    float* pre_ffn_norm;  // [n_embd]
-    float* post_ffn_norm; // [n_embd]
-    float layer_scalar;   // 1.0 default
-    int head_dim;         // per-layer (256 or 512 for Gemma4, n_embd/n_head for legacy)
-    int kv_dim;           // per-layer (n_kv_heads * head_dim)
-    int kv_cache_layer;   // which layer's KV slot to use (-1 = own slot)
-    bool is_full_attn;    // true for full attention layers
 };
 
 // Full model
 struct Model {
     ModelConfig config;
-
-    // Tensor parallelism
-    int tp_rank;    // 0 or 1 (default 0)
-    int tp_size;    // 1 (no TP) or 2
 
     // Embedding (BF16 on GPU — used for lookup, not matvec)
     int16_t* token_embd;  // [n_vocab, n_embd] as BF16
@@ -99,16 +72,10 @@ struct Model {
     int16_t* kv_cache_k;
     int16_t* kv_cache_v;
     int max_seq_len;
-
-    // Per-layer KV cache pointers (Gemma4: shared layers point to donor's cache)
-    // For legacy models, kv_k_ptrs[i] = kv_cache_k + i * max_seq * kv_dim
-    std::vector<int16_t*> kv_k_ptrs;
-    std::vector<int16_t*> kv_v_ptrs;
-    int num_kv_slots;  // actual allocated KV slots (n_layer - num_kv_shared)
 };
 
 // Load model from safetensors directory
-Model* load_model(const std::string& model_path, int device_id = 0, int tp_rank = 0, int tp_size = 1);
+Model* load_model(const std::string& model_path, int device_id = 0);
 
 // Free model
 void free_model(Model* model);

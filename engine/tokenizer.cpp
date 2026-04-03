@@ -36,9 +36,8 @@ struct HFTokenizer {
     std::unordered_map<std::string, int> token_to_id;
     std::unordered_map<int, std::string> id_to_token;
     std::vector<std::pair<std::string, std::string>> merges;
-    std::string byte_encoder[256];  // byte → unicode string mapping (GPT-2 style)
+    std::string byte_encoder[256];  // byte → unicode string mapping
     int bos_id, eos_id;
-    int tok_type;  // 1=GPT-2 byte-level BPE, 2=sentencepiece-style BPE (Gemma)
 };
 
 // Simple JSON string extraction (no external lib needed)
@@ -105,23 +104,6 @@ static bool load_hf_tokenizer(Tokenizer* tok, const std::string& model_dir) {
         int n_vocab, bos, eos;
         vf.read((char*)&n_vocab, 4); vf.read((char*)&bos, 4); vf.read((char*)&eos, 4);
         hf->bos_id = bos; hf->eos_id = eos;
-
-        // Try to read tok_type (new field, may not exist in older vocab.bin files)
-        int tok_type_val = 1;  // default: GPT-2 byte-level BPE
-        auto pos_before = vf.tellg();
-        // Peek: if next 4 bytes look like a small int (1 or 2), it's tok_type
-        // Otherwise it's the first token length (uint16), so we rewind
-        int32_t maybe_type;
-        if (vf.read((char*)&maybe_type, 4)) {
-            if (maybe_type == 1 || maybe_type == 2) {
-                tok_type_val = maybe_type;
-            } else {
-                // Old format without tok_type — rewind
-                vf.seekg(pos_before);
-            }
-        }
-        hf->tok_type = tok_type_val;
-
         for (int i = 0; i < n_vocab; i++) {
             uint16_t len; vf.read((char*)&len, 2);
             std::string t(len, 0); vf.read(&t[0], len);
@@ -136,26 +118,24 @@ static bool load_hf_tokenizer(Tokenizer* tok, const std::string& model_dir) {
             mf.read(&a[0], la); mf.read(&b[0], lb);
             hf->merges.push_back({a, b});
         }
-        // Load byte encoder mapping (only used for GPT-2 style)
-        if (tok_type_val == 1) {
-            std::string be_path = model_dir + "/byte_encoder.bin";
-            std::ifstream bef(be_path, std::ios::binary);
-            if (bef) {
-                for (int i = 0; i < 256; i++) {
-                    uint8_t len; bef.read((char*)&len, 1);
-                    std::string s(len, 0); bef.read(&s[0], len);
-                    hf->byte_encoder[i] = s;
-                }
-            } else {
-                for (int i = 0; i < 256; i++) hf->byte_encoder[i] = std::string(1, (char)i);
+        // Load byte encoder mapping
+        std::string be_path = model_dir + "/byte_encoder.bin";
+        std::ifstream bef(be_path, std::ios::binary);
+        if (bef) {
+            for (int i = 0; i < 256; i++) {
+                uint8_t len; bef.read((char*)&len, 1);
+                std::string s(len, 0); bef.read(&s[0], len);
+                hf->byte_encoder[i] = s;
             }
+        } else {
+            // Fallback: identity mapping (ASCII)
+            for (int i = 0; i < 256; i++) hf->byte_encoder[i] = std::string(1, (char)i);
         }
 
         tok->sp_model = hf; tok->bos_id = bos; tok->eos_id = eos;
         tok->vocab_size = n_vocab; tok->type = 1;
-        const char* style = (tok_type_val == 2) ? "SP-BPE" : "GPT2-BPE";
-        printf("  Tokenizer: HF %s (binary), vocab=%d bos=%d eos=%d merges=%zu\n",
-               style, n_vocab, bos, eos, hf->merges.size());
+        printf("  Tokenizer: HF BPE (binary), vocab=%d bos=%d eos=%d merges=%zu\n",
+               n_vocab, bos, eos, hf->merges.size());
         return true;
     }
 
@@ -204,23 +184,14 @@ static bool load_hf_tokenizer(Tokenizer* tok, const std::string& model_dir) {
         pos++;
     }
 
-    // Detect tokenizer style: check for sentencepiece-style ▁ tokens
-    int sp_count = 0;
-    for (auto& [k, v] : hf->token_to_id) {
-        if (k.find("\xe2\x96\x81") != std::string::npos) sp_count++;
-        if (sp_count > 100) break;
-    }
-    bool is_sp_style = (sp_count > 100);
-    hf->tok_type = is_sp_style ? 2 : 1;
-
     // Find BOS/EOS from added_tokens
-    hf->bos_id = -1;
-    hf->eos_id = -1;
+    hf->bos_id = 128000;  // Llama 3 default
+    hf->eos_id = 128009;  // Llama 3 default (<|eot_id|>)
 
     // Check added_tokens for bos/eos
     size_t added = json.find("\"added_tokens\"");
     if (added != std::string::npos) {
-        // Llama 3: <|begin_of_text|> / <|end_of_text|>
+        // Look for begin_of_text and eot_id
         size_t bos_pos = json.find("begin_of_text", added);
         if (bos_pos != std::string::npos) {
             size_t id_pos = json.rfind("\"id\"", bos_pos);
@@ -233,28 +204,7 @@ static bool load_hf_tokenizer(Tokenizer* tok, const std::string& model_dir) {
             if (id_pos != std::string::npos && id_pos > added)
                 hf->eos_id = extract_json_int(json.substr(id_pos - 1), "id");
         }
-        // Gemma: <bos> / <eos>
-        if (hf->bos_id == -1) {
-            size_t bp = json.find("\"<bos>\"", added);
-            if (bp != std::string::npos) {
-                size_t id_pos = json.rfind("\"id\"", bp);
-                if (id_pos != std::string::npos && id_pos > added)
-                    hf->bos_id = extract_json_int(json.substr(id_pos - 1), "id");
-            }
-        }
-        if (hf->eos_id == -1) {
-            size_t ep = json.find("\"<eos>\"", added);
-            if (ep != std::string::npos) {
-                size_t id_pos = json.rfind("\"id\"", ep);
-                if (id_pos != std::string::npos && id_pos > added)
-                    hf->eos_id = extract_json_int(json.substr(id_pos - 1), "id");
-            }
-        }
     }
-
-    // Fallback defaults
-    if (hf->bos_id == -1) hf->bos_id = is_sp_style ? 2 : 128000;
-    if (hf->eos_id == -1) hf->eos_id = is_sp_style ? 1 : 128009;
 
     // Parse merges for BPE encode
     size_t merges_start = json.find("\"merges\"");
@@ -287,26 +237,8 @@ static bool load_hf_tokenizer(Tokenizer* tok, const std::string& model_dir) {
     return true;
 }
 
-// Split a UTF-8 string into individual unicode characters
-static std::vector<std::string> utf8_chars(const std::string& s) {
-    std::vector<std::string> chars;
-    size_t i = 0;
-    while (i < s.size()) {
-        unsigned char c = s[i];
-        int len = 1;
-        if      ((c & 0x80) == 0)    len = 1;
-        else if ((c & 0xE0) == 0xC0) len = 2;
-        else if ((c & 0xF0) == 0xE0) len = 3;
-        else if ((c & 0xF8) == 0xF0) len = 4;
-        if (i + len > s.size()) len = 1;  // safety
-        chars.push_back(s.substr(i, len));
-        i += len;
-    }
-    return chars;
-}
-
-// BPE encode: GPT-2 byte-level BPE (Llama 3, GPT-style)
-static std::vector<int> bpe_encode_gpt2(HFTokenizer* hf, const std::string& text) {
+// BPE encode: byte-level BPE (GPT/Llama style)
+static std::vector<int> bpe_encode(HFTokenizer* hf, const std::string& text) {
     // Byte-level: map each byte through the GPT-2/Llama byte encoder
     // This maps bytes to unicode characters (e.g., 0x20→Ġ, 0x57→W)
     std::vector<std::string> tokens;
@@ -337,124 +269,6 @@ static std::vector<int> bpe_encode_gpt2(HFTokenizer* hf, const std::string& text
             ids.push_back(0);  // unknown
     }
     return ids;
-}
-
-// BPE encode: sentencepiece-style BPE (Gemma)
-// Normalizer: replace ' ' with ▁ (U+2581)
-// Pre-tokenizer: split on ' ' with MergedWithPrevious behavior
-// Byte fallback: unknown bytes → <0xNN> tokens
-static std::vector<int> bpe_encode_sp(HFTokenizer* hf, const std::string& text) {
-    // Step 1: Normalize — replace spaces with ▁
-    std::string normalized;
-    // Gemma pre-tokenizer: split on space, merge with previous
-    // The normalizer replaces " " with "▁", then pre-tokenizer splits on " "
-    // In practice for input text: prepend ▁ to start, replace all spaces with ▁
-    normalized = "\xe2\x96\x81";  // ▁ prefix (sentencepiece convention)
-    for (char c : text) {
-        if (c == ' ')
-            normalized += "\xe2\x96\x81";  // ▁
-        else
-            normalized += c;
-    }
-
-    // Step 2: Split into unicode characters
-    std::vector<std::string> tokens = utf8_chars(normalized);
-
-    // Step 3: Apply BPE merges
-    for (auto& [left, right] : hf->merges) {
-        for (size_t i = 0; i + 1 < tokens.size(); ) {
-            if (tokens[i] == left && tokens[i + 1] == right) {
-                tokens[i] = left + right;
-                tokens.erase(tokens.begin() + i + 1);
-            } else {
-                i++;
-            }
-        }
-    }
-
-    // Step 4: Convert to IDs, with byte fallback for unknown tokens
-    std::vector<int> ids;
-    for (auto& t : tokens) {
-        auto it = hf->token_to_id.find(t);
-        if (it != hf->token_to_id.end()) {
-            ids.push_back(it->second);
-        } else {
-            // Byte fallback: encode each byte as <0xNN>
-            for (unsigned char c : t) {
-                char buf[8];
-                snprintf(buf, sizeof(buf), "<0x%02X>", c);
-                auto bit = hf->token_to_id.find(buf);
-                if (bit != hf->token_to_id.end())
-                    ids.push_back(bit->second);
-                else
-                    ids.push_back(3);  // <unk>
-            }
-        }
-    }
-    return ids;
-}
-
-static std::vector<int> bpe_encode(HFTokenizer* hf, const std::string& text) {
-    if (hf->tok_type == 2)
-        return bpe_encode_sp(hf, text);
-    return bpe_encode_gpt2(hf, text);
-}
-
-// Reverse byte-level BPE encoding for display
-static std::string bpe_token_to_text(HFTokenizer* hf, const std::string& token) {
-    // Build reverse byte map (unicode char → original byte) on first call
-    static std::unordered_map<std::string, uint8_t> byte_decoder;
-    if (byte_decoder.empty()) {
-        for (int i = 0; i < 256; i++)
-            if (!hf->byte_encoder[i].empty())
-                byte_decoder[hf->byte_encoder[i]] = (uint8_t)i;
-    }
-    std::string result;
-    size_t i = 0;
-    while (i < token.size()) {
-        // Try matching multi-byte UTF-8 sequences first
-        bool found = false;
-        for (int len = 4; len >= 1; len--) {
-            if (i + len <= token.size()) {
-                std::string sub = token.substr(i, len);
-                auto it = byte_decoder.find(sub);
-                if (it != byte_decoder.end()) {
-                    result += (char)it->second;
-                    i += len;
-                    found = true;
-                    break;
-                }
-            }
-        }
-        if (!found) { result += token[i]; i++; }
-    }
-    return result;
-}
-
-// Decode a sentencepiece-style BPE token to text
-// Handles ▁ → space and <0xNN> → raw byte
-static std::string sp_bpe_token_to_text(const std::string& token) {
-    // Handle <0xNN> byte fallback tokens
-    if (token.size() == 6 && token[0] == '<' && token[1] == '0' && token[2] == 'x' && token[5] == '>') {
-        char hex[3] = {token[3], token[4], 0};
-        unsigned byte_val = strtoul(hex, nullptr, 16);
-        return std::string(1, (char)byte_val);
-    }
-    // Replace ▁ (U+2581, 3 bytes: E2 96 81) with space
-    std::string result;
-    for (size_t i = 0; i < token.size(); ) {
-        if (i + 2 < token.size() &&
-            (unsigned char)token[i] == 0xE2 &&
-            (unsigned char)token[i+1] == 0x96 &&
-            (unsigned char)token[i+2] == 0x81) {
-            result += ' ';
-            i += 3;
-        } else {
-            result += token[i];
-            i++;
-        }
-    }
-    return result;
 }
 
 // ============================================================
@@ -515,15 +329,41 @@ std::string detokenize(Tokenizer* tok, const std::vector<int>& tokens) {
         std::string text;
         for (int id : tokens) {
             auto it = hf->id_to_token.find(id);
-            if (it != hf->id_to_token.end()) {
-                if (hf->tok_type == 2)
-                    text += sp_bpe_token_to_text(it->second);
-                else
-                    text += it->second;
-            }
+            if (it != hf->id_to_token.end()) text += it->second;
         }
         return text;
     }
+}
+
+// Reverse byte-level BPE encoding for display
+static std::string bpe_token_to_text(HFTokenizer* hf, const std::string& token) {
+    // Build reverse byte map (unicode char → original byte) on first call
+    static std::unordered_map<std::string, uint8_t> byte_decoder;
+    if (byte_decoder.empty()) {
+        for (int i = 0; i < 256; i++)
+            if (!hf->byte_encoder[i].empty())
+                byte_decoder[hf->byte_encoder[i]] = (uint8_t)i;
+    }
+    std::string result;
+    size_t i = 0;
+    while (i < token.size()) {
+        // Try matching multi-byte UTF-8 sequences first
+        bool found = false;
+        for (int len = 4; len >= 1; len--) {
+            if (i + len <= token.size()) {
+                std::string sub = token.substr(i, len);
+                auto it = byte_decoder.find(sub);
+                if (it != byte_decoder.end()) {
+                    result += (char)it->second;
+                    i += len;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (!found) { result += token[i]; i++; }
+    }
+    return result;
 }
 
 std::string detokenize_one(Tokenizer* tok, int token) {
@@ -534,8 +374,6 @@ std::string detokenize_one(Tokenizer* tok, int token) {
         auto* hf = (HFTokenizer*)tok->sp_model;
         auto it = hf->id_to_token.find(token);
         if (it == hf->id_to_token.end()) return "";
-        if (hf->tok_type == 2)
-            return sp_bpe_token_to_text(it->second);
         return bpe_token_to_text(hf, it->second);
     }
 }

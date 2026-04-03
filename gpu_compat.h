@@ -36,7 +36,6 @@
 
 // Device management
 #define hipSetDevice             cudaSetDevice
-#define hipGetDevice             cudaGetDevice
 #define hipDeviceSynchronize     cudaDeviceSynchronize
 #define hipGetLastError          cudaGetLastError
 #define hipGetErrorString        cudaGetErrorString

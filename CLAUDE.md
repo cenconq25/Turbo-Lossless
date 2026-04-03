@@ -10,9 +10,7 @@
 - Do not push to remote repo unless explicitly told to.
 - When benchmarking, use a non-display GPU (not the one connected to the monitor).
 - Do not commit unless explicitly told to.
-- For single-GPU: use GPU 0 (`CUDA_VISIBLE_DEVICES=0`).
-- For multi-GPU TP=2: both GPUs used. Set `TURBO_TP=2`. Model must be converted with `--tp 2`.
-- Always update CLAUDE.md and README.md when making code changes.
+- GPU 1 may be degraded from previous crashes — use GPU 0 (HIP_VISIBLE_DEVICES=0).
 
 ## Build & Run
 
@@ -21,25 +19,12 @@
 gcc -O3 -shared -fPIC -o structured12_pack.so structured12_pack.c
 gcc -O3 -shared -fPIC -o split12_pack.so split12_pack.c
 
-# Build engine — NVIDIA single-GPU (RTX 5070 Ti, sm_120)
+# Build engine — NVIDIA (RTX 5070 Ti, sm_120)
 cd engine && ln -sf kernels.hip kernels.cu && ln -sf ../decompress_v2.hip decompress_v2.cu
 nvcc -O3 -arch=sm_120 -I.. -o turbo-engine \
-  main.cpp model.cpp inference.cpp tokenizer.cpp sampler.cpp multi_gpu.cpp \
+  main.cpp model.cpp inference.cpp tokenizer.cpp sampler.cpp \
   kernels.cu decompress_v2.cu ../nvidia_kernels.cu ../nvidia_kernels_v3.cu \
   -lcublas -lsentencepiece -lcuda -std=c++17
-
-# Build engine — NVIDIA multi-GPU TP=2 (requires NCCL)
-nvcc -O3 -arch=sm_120 -I.. -DTURBO_NCCL \
-  -I/home/roy/miniconda3/lib/python3.13/site-packages/nvidia/nccl/include \
-  -L/home/roy/miniconda3/lib/python3.13/site-packages/nvidia/nccl/lib \
-  -o turbo-engine \
-  main.cpp model.cpp inference.cpp tokenizer.cpp sampler.cpp multi_gpu.cpp \
-  kernels.cu decompress_v2.cu ../nvidia_kernels.cu ../nvidia_kernels_v3.cu \
-  -lcublas -lsentencepiece -lcuda -lnccl -std=c++17 -lpthread
-
-# Convert model for TP=2
-python3 engine/convert_model.py --tp 2 models/mistral-7b-instruct models/mistral-7b-instruct-turbo-tp2
-cp models/mistral-7b-instruct/tokenizer.model models/mistral-7b-instruct-turbo-tp2/
 
 # Build engine — AMD (MI50, gfx906)
 cd engine && /opt/rocm/bin/hipcc -O3 --offload-arch=gfx906 -o turbo-engine \
@@ -58,7 +43,6 @@ CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./turbo-engine <model_dir> "<prompt>" <max_t
 | `TURBO_PROFILE=1` | Print per-token timing: matvec/attn/norm/silu breakdown |
 | `TURBO_KERNEL=1\|2\|3` | NVIDIA kernel: 1=V1, 2=V2 cp.async, **3=V3 TMA** (default, auto-selects B>=64) |
 | `TURBO_CUBLAS=1` | Force cuBLAS path for all tensors (debug) |
-| `TURBO_TP=2` | Enable 2-GPU tensor parallelism (needs NCCL build + TP model) |
 
 ## Current Results
 
@@ -89,35 +73,6 @@ CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./turbo-engine <model_dir> "<prompt>" <max_t
 | B=128 | 2110.8 | ~10.5 GB | vLLM OOM |
 | **B=256** | **2470.7** | **~10.5 GB** | **vLLM OOM** |
 
-### 2x RTX 5070 Ti (TP=2, NCCL over PCIe 5.0) — Measured 2026-04-02
-
-Uses `forward_batch_tiled` with V3 TMA tensor cores at B>=16. Max batch: B=48 (Mistral) / B=32 (Llama) due to 16 GB VRAM.
-
-#### Mistral 7B (TP=2 vs 1-GPU)
-
-| Batch | 1-GPU | TP=2 | Kernel | Speedup | Winner |
-|------:|------:|-----:|:------:|--------:|:------:|
-| B=1 | 60.0 | **91.9** | V2 | **1.53x** | TP=2 |
-| B=4 | — | **187.6** | V2 | — | TP=2 |
-| B=8 | 162.6 | **261.0** | V2 | **1.60x** | TP=2 |
-| B=16 | 673.1 | **740.0** | V3 TMA | **1.10x** | TP=2 |
-| B=32 | 1136.3 | **1197.8** | V3 TMA | **1.05x** | TP=2 |
-| B=48 | — | **1338.8** | V3 TMA | — | TP=2 (max) |
-
-#### Llama 3.1 8B (TP=2 vs 1-GPU)
-
-| Batch | 1-GPU | TP=2 | Kernel | Speedup | Winner |
-|------:|------:|-----:|:------:|--------:|:------:|
-| B=1 | 57.0 | **86.6** | V2 | **1.52x** | TP=2 |
-| B=4 | 113.5 | **176.6** | V2 | **1.56x** | TP=2 |
-| B=8 | 154.3 | **240.3** | V2 | **1.56x** | TP=2 |
-| B=16 | 627.5 | **651.9** | V3 TMA | **1.04x** | TP=2 |
-| B=32 | 1068.6 | **1012.7** | V3 TMA | 0.95x | ~tied |
-| B=48 | — | **1158.7** | V3 TMA | — | TP=2 (max) |
-
-**TP=2 wins at B<=16** (1.1-1.6x) now that tensor cores are active. **~tied at B=32.**
-VRAM per GPU: ~6 GB (half model). Enables 13B+ models on 2x 16 GB.
-
 ### MI50 32GB (AMD GCN, 1.0 TB/s)
 
 #### Mistral 7B Instruct
@@ -132,7 +87,7 @@ VRAM per GPU: ~6 GB (half model). Enables 13B+ models on 2x 16 GB.
 
 | Model | tok/s B=1 (RTX 5070 Ti) | tok/s B=1 (MI50) | Tokenizer | Status |
 |-------|------------------------:|-----------------:|-----------|--------|
-| Mistral 7B Instruct | 60.0 (90.8 TP=2) | 32.6 | sentencepiece | Production (V2+V3+TP) |
+| Mistral 7B Instruct | 60.0 | 32.6 | sentencepiece | Production (V2+V3) |
 | Llama 3.1 8B Instruct | 57.0 | 31.8 | HF BPE | Production (V2+V3) |
 
 ### Compression
@@ -237,12 +192,12 @@ for each layer:
   MATVEC_B1(wv, bf16_a) -> v_buf
   rope_store_kv(q, k, v -> kv_cache)    // fused RoPE + KV store
   attention(q, kv_cache) -> bf16_a       // outputs BF16 directly (no fp32_to_bf16)
-  MATVEC_B1(wo, bf16_a) -> res           // TP: column-split, ALL_REDUCE after
+  MATVEC_B1(wo, bf16_a) -> res
   add_rms_norm_bf16(res, cur) -> bf16_a  // fused add + norm for FFN
-  split12_dual(gate+up, bf16_a) -> ffn_gate, ffn_up  // fused gate+up (TP: row-split)
+  split12_dual(gate+up, bf16_a) -> ffn_gate, ffn_up  // fused gate+up
   + patches for gate and up
   silu_mul_bf16(gate, up) -> bf16_b
-  MATVEC_B1(w_down, bf16_b) -> cur       // TP: column-split, ALL_REDUCE after
+  MATVEC_B1(w_down, bf16_b) -> cur
   add_rms_norm_bf16(cur, res, NEXT_attn_norm) -> bf16_a  // cross-layer fusion!
 
 MATVEC_B1(output_proj, bf16_a) -> logits
@@ -314,7 +269,6 @@ Example: `4096 4096 5358 107`
 | forward_b1/b4/b8 used stream=0 (race with sampling) | **Fixed** | Changed to `state->stream` (2026-04-02) |
 | Silent garbage on GPU OOM (no malloc error checking) | **Fixed** | All hipMalloc/cudaMalloc calls wrapped with GPU_CHECK macro (2026-04-03) |
 | Killed process leaves GPU memory dirty for 5-15s | **Fixed** | SIGTERM/SIGINT handler calls free_inference_state + free_model (2026-04-03) |
-| TP=2 crash: cross-device RoPE frequency pointer | **Fixed** | d_rope_freqs was single static shared across GPUs. Now per-device array (2026-04-03) |
 
 ## Tested and Rejected
 
@@ -349,11 +303,9 @@ Example: `4096 4096 5358 107`
 | `engine/tokenizer.cpp` | 379 | Auto-detect + BPE encode/decode with byte-level mapping |
 | `engine/sampler.h` | 11 | Sampler interface |
 | `engine/sampler.cpp` | 32 | Greedy + batched argmax |
-| `engine/convert_model.py` | 260 | HF safetensors -> turbo format (supports `--tp 2`) |
-| `engine/multi_gpu.h` | 35 | TPState struct, NCCL all-reduce, distributed argmax |
-| `engine/multi_gpu.cpp` | 200 | NCCL init/teardown, all-reduce, distributed argmax |
+| `engine/convert_model.py` | 207 | HF safetensors -> turbo format |
 
-**Total: ~5200 lines.**
+**Total: ~4450 lines.**
 
 ## Scope
 

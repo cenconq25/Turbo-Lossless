@@ -190,30 +190,10 @@ static bool load_compressed(const std::string& dir, const std::string& prefix, C
     return true;
 }
 
-// Try to load a TP-sharded compressed weight; fall back to full weight if not found
-static bool load_compressed_tp(const std::string& dir, const std::string& prefix,
-                               CompressedWeight& w, int tp_rank, int tp_size) {
-    if (tp_size > 1) {
-        // Try TP shard file first
-        char tp_prefix[256];
-        snprintf(tp_prefix, sizeof(tp_prefix), "%s.tp%d", prefix.c_str(), tp_rank);
-        std::string tp_dims = dir + "/" + tp_prefix + ".dims";
-        std::ifstream tf(tp_dims);
-        if (tf.good()) {
-            tf.close();
-            return load_compressed(dir, tp_prefix, w);
-        }
-        // Fall back to full weight (backward compatible)
-    }
-    return load_compressed(dir, prefix, w);
-}
-
-Model* load_model(const std::string& model_path, int device_id, int tp_rank, int tp_size) {
+Model* load_model(const std::string& model_path, int device_id) {
     hipSetDevice(device_id);
 
     Model* m = new Model();
-    m->tp_rank = tp_rank;
-    m->tp_size = tp_size;
     std::string dir = model_path;
 
     // Check if this is a turbo-converted directory
@@ -225,97 +205,21 @@ Model* load_model(const std::string& model_path, int device_id, int tp_rank, int
         return nullptr;
     }
 
-    // Parse config — check for v2 magic ("TLv2") at start
-    bool is_v2 = (config_data.size() >= 4 &&
-                  config_data[0] == 'T' && config_data[1] == 'L' &&
-                  config_data[2] == 'v' && config_data[3] == '2');
+    // Parse config
+    struct { int n_vocab, n_embd, n_head, n_head_kv, n_layer, n_ff, n_ctx; float rope_theta, rms_eps; } cfg;
+    memcpy(&cfg, config_data.data(), sizeof(cfg));
+    m->config.n_vocab = cfg.n_vocab;
+    m->config.n_embd = cfg.n_embd;
+    m->config.n_head = cfg.n_head;
+    m->config.n_head_kv = cfg.n_head_kv;
+    m->config.n_layer = cfg.n_layer;
+    m->config.n_ff = cfg.n_ff;
+    m->config.n_ctx = cfg.n_ctx;
+    m->config.rope_theta = cfg.rope_theta;
+    m->config.rms_norm_eps = cfg.rms_eps;
 
-    // Zero-init Gemma4 extensions
-    m->config.head_dim_sliding = 0;
-    m->config.head_dim_full = 0;
-    m->config.sliding_window = 0;
-    m->config.logit_softcap = 0;
-    m->config.num_kv_shared = 0;
-    m->config.rope_theta_full = 0;
-    m->config.partial_rotary = 1.0f;
-    m->config.activation_type = 0;
-    m->config.tie_embeddings = 0;
-    memset(m->config.layer_types, 0, sizeof(m->config.layer_types));
-
-    if (is_v2) {
-        // V2 config format: "TLv2" + legacy fields + extended fields
-        const uint8_t* p = config_data.data() + 4;  // skip magic
-        struct { int n_vocab, n_embd, n_head, n_head_kv, n_layer, n_ff, n_ctx; float rope_theta, rms_eps; } cfg;
-        memcpy(&cfg, p, sizeof(cfg));
-        p += sizeof(cfg);
-        m->config.n_vocab = cfg.n_vocab;
-        m->config.n_embd = cfg.n_embd;
-        m->config.n_head = cfg.n_head;
-        m->config.n_head_kv = cfg.n_head_kv;
-        m->config.n_layer = cfg.n_layer;
-        m->config.n_ff = cfg.n_ff;
-        m->config.n_ctx = cfg.n_ctx;
-        m->config.rope_theta = cfg.rope_theta;
-        m->config.rms_norm_eps = cfg.rms_eps;
-
-        // Extended v2 fields
-        struct {
-            int head_dim_sliding, head_dim_full, sliding_window;
-            float logit_softcap;
-            int num_kv_shared;
-            float rope_theta_full, partial_rotary;
-            int activation_type, tie_embeddings;
-        } ext;
-        size_t remaining = config_data.size() - 4 - sizeof(cfg);
-        if (remaining >= sizeof(ext)) {
-            memcpy(&ext, p, sizeof(ext));
-            p += sizeof(ext);
-            m->config.head_dim_sliding = ext.head_dim_sliding;
-            m->config.head_dim_full = ext.head_dim_full;
-            m->config.sliding_window = ext.sliding_window;
-            m->config.logit_softcap = ext.logit_softcap;
-            m->config.num_kv_shared = ext.num_kv_shared;
-            m->config.rope_theta_full = ext.rope_theta_full;
-            m->config.partial_rotary = ext.partial_rotary;
-            m->config.activation_type = ext.activation_type;
-            m->config.tie_embeddings = ext.tie_embeddings;
-
-            // Layer types array (up to 64 bytes)
-            size_t lt_remaining = config_data.size() - (p - config_data.data());
-            int lt_count = std::min((int)lt_remaining, std::min(cfg.n_layer, 64));
-            if (lt_count > 0) {
-                memcpy(m->config.layer_types, p, lt_count);
-            }
-        }
-
-        printf("  Config v2: vocab=%d embd=%d heads=%d/%d layers=%d ff=%d\n",
-               cfg.n_vocab, cfg.n_embd, cfg.n_head, cfg.n_head_kv, cfg.n_layer, cfg.n_ff);
-        if (m->config.head_dim_sliding > 0) {
-            printf("  Gemma4: sliding_hd=%d full_hd=%d window=%d softcap=%.1f shared=%d act=%s\n",
-                   m->config.head_dim_sliding, m->config.head_dim_full,
-                   m->config.sliding_window, m->config.logit_softcap,
-                   m->config.num_kv_shared,
-                   m->config.activation_type == 1 ? "gelu_tanh" : "silu");
-        }
-    } else {
-        // Legacy v1 config format (backward compatible)
-        struct { int n_vocab, n_embd, n_head, n_head_kv, n_layer, n_ff, n_ctx; float rope_theta, rms_eps; } cfg;
-        memcpy(&cfg, config_data.data(), sizeof(cfg));
-        m->config.n_vocab = cfg.n_vocab;
-        m->config.n_embd = cfg.n_embd;
-        m->config.n_head = cfg.n_head;
-        m->config.n_head_kv = cfg.n_head_kv;
-        m->config.n_layer = cfg.n_layer;
-        m->config.n_ff = cfg.n_ff;
-        m->config.n_ctx = cfg.n_ctx;
-        m->config.rope_theta = cfg.rope_theta;
-        m->config.rms_norm_eps = cfg.rms_eps;
-
-        printf("  Config: vocab=%d embd=%d heads=%d/%d layers=%d ff=%d\n",
-               cfg.n_vocab, cfg.n_embd, cfg.n_head, cfg.n_head_kv, cfg.n_layer, cfg.n_ff);
-    }
-    if (tp_size > 1)
-        printf("  TP: rank %d/%d\n", tp_rank, tp_size);
+    printf("  Config: vocab=%d embd=%d heads=%d/%d layers=%d ff=%d\n",
+           cfg.n_vocab, cfg.n_embd, cfg.n_head, cfg.n_head_kv, cfg.n_layer, cfg.n_ff);
 
     // Token embeddings (BF16 on GPU)
     auto embd = read_file(dir + "/tok_embd.bin");
@@ -329,48 +233,16 @@ Model* load_model(const std::string& model_path, int device_id, int tp_rank, int
         m->output_norm = upload_gpu<float>(norm.data(), norm.size() / sizeof(float));
     }
 
-    // Output projection (for tie_embeddings, output_proj may not exist — handled in inference)
-    if (!load_compressed_tp(dir, "output_proj", m->output_proj, tp_rank, tp_size)) {
-        if (m->config.tie_embeddings)
-            printf("  Tied embeddings: output_proj uses transposed embed_tokens\n");
-        else
-            fprintf(stderr, "Warning: no output_proj\n");
+    // Output projection
+    if (!load_compressed(dir, "output_proj", m->output_proj)) {
+        fprintf(stderr, "Warning: no output_proj\n");
     }
 
     // Layers
-    int n_layer = m->config.n_layer;
-    m->layers.resize(n_layer);
-    bool is_gemma4 = (m->config.head_dim_sliding > 0);
-    int legacy_head_dim = m->config.n_embd / m->config.n_head;
-
-    for (int i = 0; i < n_layer; i++) {
+    m->layers.resize(cfg.n_layer);
+    for (int i = 0; i < cfg.n_layer; i++) {
         auto& layer = m->layers[i];
         char prefix[64];
-
-        // Initialize Gemma4 extensions to defaults
-        layer.q_norm = nullptr;
-        layer.k_norm = nullptr;
-        layer.pre_ffn_norm = nullptr;
-        layer.post_ffn_norm = nullptr;
-        layer.layer_scalar = 1.0f;
-        layer.kv_cache_layer = i;  // default: own KV slot
-        layer.is_full_attn = false;
-
-        // Compute per-layer dimensions
-        if (is_gemma4) {
-            layer.is_full_attn = (m->config.layer_types[i] == 1);
-            layer.head_dim = layer.is_full_attn ? m->config.head_dim_full : m->config.head_dim_sliding;
-            layer.kv_dim = m->config.n_head_kv * layer.head_dim;
-
-            // KV sharing: layers num_kv_shared..n_layer-1 share with layers 0..n_layer-num_kv_shared-1
-            if (m->config.num_kv_shared > 0 && i >= (n_layer - m->config.num_kv_shared)) {
-                int donor = i - (n_layer - m->config.num_kv_shared);
-                layer.kv_cache_layer = donor;
-            }
-        } else {
-            layer.head_dim = legacy_head_dim;
-            layer.kv_dim = (m->config.n_head_kv / tp_size) * legacy_head_dim;
-        }
 
         // Norms
         snprintf(prefix, sizeof(prefix), "layer.%d.attn_norm.bin", i);
@@ -381,107 +253,39 @@ Model* load_model(const std::string& model_path, int device_id, int tp_rank, int
         auto fn = read_file(dir + "/" + prefix);
         if (!fn.empty()) layer.ffn_norm = upload_gpu<float>(fn.data(), fn.size() / sizeof(float));
 
-        // Gemma4 extra norms (silently skip if files don't exist)
-        snprintf(prefix, sizeof(prefix), "layer.%d.q_norm.bin", i);
-        auto qn = read_file(dir + "/" + prefix);
-        if (!qn.empty()) layer.q_norm = upload_gpu<float>(qn.data(), qn.size() / sizeof(float));
-
-        snprintf(prefix, sizeof(prefix), "layer.%d.k_norm.bin", i);
-        auto kn = read_file(dir + "/" + prefix);
-        if (!kn.empty()) layer.k_norm = upload_gpu<float>(kn.data(), kn.size() / sizeof(float));
-
-        snprintf(prefix, sizeof(prefix), "layer.%d.pre_ffn_norm.bin", i);
-        auto pfn = read_file(dir + "/" + prefix);
-        if (!pfn.empty()) layer.pre_ffn_norm = upload_gpu<float>(pfn.data(), pfn.size() / sizeof(float));
-
-        snprintf(prefix, sizeof(prefix), "layer.%d.post_ffn_norm.bin", i);
-        auto pofn = read_file(dir + "/" + prefix);
-        if (!pofn.empty()) layer.post_ffn_norm = upload_gpu<float>(pofn.data(), pofn.size() / sizeof(float));
-
-        // Compressed weights (TP-aware: tries .tp{rank} files first)
+        // Compressed weights
         snprintf(prefix, sizeof(prefix), "layer.%d.wq", i);
-        load_compressed_tp(dir, prefix, layer.wq, tp_rank, tp_size);
+        load_compressed(dir, prefix, layer.wq);
         snprintf(prefix, sizeof(prefix), "layer.%d.wk", i);
-        load_compressed_tp(dir, prefix, layer.wk, tp_rank, tp_size);
+        load_compressed(dir, prefix, layer.wk);
         snprintf(prefix, sizeof(prefix), "layer.%d.wv", i);
-        load_compressed_tp(dir, prefix, layer.wv, tp_rank, tp_size);
+        load_compressed(dir, prefix, layer.wv);
         snprintf(prefix, sizeof(prefix), "layer.%d.wo", i);
-        load_compressed_tp(dir, prefix, layer.wo, tp_rank, tp_size);
+        load_compressed(dir, prefix, layer.wo);
         snprintf(prefix, sizeof(prefix), "layer.%d.w_gate", i);
-        load_compressed_tp(dir, prefix, layer.w_gate, tp_rank, tp_size);
+        load_compressed(dir, prefix, layer.w_gate);
         snprintf(prefix, sizeof(prefix), "layer.%d.w_up", i);
-        load_compressed_tp(dir, prefix, layer.w_up, tp_rank, tp_size);
+        load_compressed(dir, prefix, layer.w_up);
         snprintf(prefix, sizeof(prefix), "layer.%d.w_down", i);
-        load_compressed_tp(dir, prefix, layer.w_down, tp_rank, tp_size);
+        load_compressed(dir, prefix, layer.w_down);
 
-        if ((i + 1) % 8 == 0 || i == n_layer - 1)
-            printf("  Loaded layer %d/%d\n", i + 1, n_layer);
+        if ((i + 1) % 8 == 0 || i == cfg.n_layer - 1)
+            printf("  Loaded layer %d/%d\n", i + 1, cfg.n_layer);
     }
 
-    // Allocate KV cache (TP: each rank handles n_head_kv/tp_size heads)
+    // Allocate KV cache
+    int head_dim = cfg.n_embd / cfg.n_head;
     // Max context length — configurable via TURBO_CTX env var (default 2048)
     const char* ctx_env = getenv("TURBO_CTX");
     m->max_seq_len = ctx_env ? atoi(ctx_env) : 2048;
     if (m->max_seq_len < 128) m->max_seq_len = 128;
     printf("  Context length: %d\n", m->max_seq_len);
-
-    if (is_gemma4) {
-        // Gemma4: per-layer KV cache with variable head_dim and KV sharing
-        int num_kv_shared = m->config.num_kv_shared;
-        m->num_kv_slots = n_layer - num_kv_shared;
-        m->kv_k_ptrs.resize(n_layer);
-        m->kv_v_ptrs.resize(n_layer);
-
-        // Allocate unique KV slots (non-shared layers only)
-        size_t total_kv_bytes = 0;
-        std::vector<int16_t*> slot_k(m->num_kv_slots), slot_v(m->num_kv_slots);
-        for (int i = 0; i < m->num_kv_slots; i++) {
-            auto& layer = m->layers[i];
-            int kv_heads_local = m->config.n_head_kv / tp_size;
-            size_t slot_size = (size_t)m->max_seq_len * kv_heads_local * layer.head_dim;
-            GPU_CHECK(hipMalloc(&slot_k[i], slot_size * sizeof(int16_t)));
-            GPU_CHECK(hipMalloc(&slot_v[i], slot_size * sizeof(int16_t)));
-            hipMemset(slot_k[i], 0, slot_size * sizeof(int16_t));
-            hipMemset(slot_v[i], 0, slot_size * sizeof(int16_t));
-            total_kv_bytes += slot_size * 2 * sizeof(int16_t);
-        }
-
-        // Assign per-layer pointers (shared layers point to donor's slot)
-        for (int i = 0; i < n_layer; i++) {
-            int slot = m->layers[i].kv_cache_layer;
-            m->kv_k_ptrs[i] = slot_k[slot];
-            m->kv_v_ptrs[i] = slot_v[slot];
-        }
-
-        // Legacy flat pointers unused for Gemma4
-        m->kv_cache_k = nullptr;
-        m->kv_cache_v = nullptr;
-        printf("  KV cache (Gemma4): %.1f MB total, %d unique slots, %d shared\n",
-               total_kv_bytes / 1e6, m->num_kv_slots, num_kv_shared);
-    } else {
-        // Legacy: single flat KV cache allocation
-        int head_dim_kv = m->config.n_embd / m->config.n_head;
-        int kv_heads_local = m->config.n_head_kv / tp_size;
-        if (tp_size > 1)
-            printf("  KV heads per rank: %d (of %d total)\n", kv_heads_local, m->config.n_head_kv);
-        size_t kv_size = (size_t)n_layer * m->max_seq_len * kv_heads_local * head_dim_kv;
-        GPU_CHECK(hipMalloc(&m->kv_cache_k, kv_size * sizeof(int16_t)));
-        GPU_CHECK(hipMalloc(&m->kv_cache_v, kv_size * sizeof(int16_t)));
-        hipMemset(m->kv_cache_k, 0, kv_size * sizeof(int16_t));
-        hipMemset(m->kv_cache_v, 0, kv_size * sizeof(int16_t));
-        printf("  KV cache: %.1f MB per K/V\n", kv_size * 2 / 1e6);
-
-        // Build per-layer pointers for uniform access in inference
-        int kv_dim_local = kv_heads_local * head_dim_kv;
-        m->kv_k_ptrs.resize(n_layer);
-        m->kv_v_ptrs.resize(n_layer);
-        for (int i = 0; i < n_layer; i++) {
-            size_t off = (size_t)i * m->max_seq_len * kv_dim_local;
-            m->kv_k_ptrs[i] = m->kv_cache_k + off;
-            m->kv_v_ptrs[i] = m->kv_cache_v + off;
-        }
-        m->num_kv_slots = n_layer;
-    }
+    size_t kv_size = (size_t)cfg.n_layer * m->max_seq_len * cfg.n_head_kv * head_dim;
+    GPU_CHECK(hipMalloc(&m->kv_cache_k, kv_size * sizeof(int16_t)));
+    GPU_CHECK(hipMalloc(&m->kv_cache_v, kv_size * sizeof(int16_t)));
+    hipMemset(m->kv_cache_k, 0, kv_size * sizeof(int16_t));
+    hipMemset(m->kv_cache_v, 0, kv_size * sizeof(int16_t));
+    printf("  KV cache: %.1f MB per K/V\n", kv_size * 2 / 1e6);
 
     size_t gpu_mem = 0;
     hipMemGetInfo(nullptr, &gpu_mem);
@@ -514,10 +318,6 @@ void free_model(Model* model) {
     for (auto& layer : model->layers) {
         if (layer.attn_norm) hipFree(layer.attn_norm);
         if (layer.ffn_norm)  hipFree(layer.ffn_norm);
-        if (layer.q_norm)       hipFree(layer.q_norm);
-        if (layer.k_norm)       hipFree(layer.k_norm);
-        if (layer.pre_ffn_norm) hipFree(layer.pre_ffn_norm);
-        if (layer.post_ffn_norm) hipFree(layer.post_ffn_norm);
         free_compressed_weight(layer.wq);
         free_compressed_weight(layer.wk);
         free_compressed_weight(layer.wv);
@@ -527,17 +327,8 @@ void free_model(Model* model) {
         free_compressed_weight(layer.w_down);
     }
 
-    // Free KV cache
-    if (model->config.head_dim_sliding > 0) {
-        // Gemma4: per-slot allocation (only free unique slots, not shared pointers)
-        for (int i = 0; i < model->num_kv_slots; i++) {
-            if (model->kv_k_ptrs[i]) hipFree(model->kv_k_ptrs[i]);
-            if (model->kv_v_ptrs[i]) hipFree(model->kv_v_ptrs[i]);
-        }
-    } else {
-        if (model->kv_cache_k) hipFree(model->kv_cache_k);
-        if (model->kv_cache_v) hipFree(model->kv_cache_v);
-    }
+    if (model->kv_cache_k) hipFree(model->kv_cache_k);
+    if (model->kv_cache_v) hipFree(model->kv_cache_v);
 
     delete model;
 }

@@ -2,13 +2,9 @@
 """Extract HuggingFace BPE tokenizer to binary format for Turbo engine.
 
 Reads tokenizer.json, writes:
-  vocab.bin:        [n_vocab:i32][bos_id:i32][eos_id:i32][tok_type:i32] + [len:u16][bytes] per token
+  vocab.bin:        [n_vocab:i32][bos_id:i32][eos_id:i32] + [len:u16][bytes] per token
   merges.bin:       [n_merges:i32] + [len_a:u16][len_b:u16][bytes_a][bytes_b] per merge
   byte_encoder.bin: 256 entries of [utf8_len:u8][utf8_bytes]
-
-tok_type in vocab.bin header:
-  1 = GPT-2 byte-level BPE (Llama 3, GPT-style) — uses byte_encoder.bin
-  2 = Sentencepiece-style BPE (Gemma) — uses ▁ for spaces, <0xNN> byte fallback
 """
 
 import json, struct, sys, os
@@ -24,22 +20,6 @@ def bytes_to_unicode():
             cs.append(256 + n)
             n += 1
     return {b: chr(c) for b, c in zip(bs, cs)}
-
-def detect_tokenizer_style(tok):
-    """Detect whether this is GPT-2 byte-level BPE or sentencepiece-style BPE.
-    Returns 1 for GPT-2, 2 for sentencepiece-style (Gemma)."""
-    model = tok.get("model", {})
-    vocab = model.get("vocab", {})
-
-    # Sentencepiece-style: uses ▁ prefix, has byte_fallback, <0xNN> tokens
-    has_sp_prefix = sum(1 for k in vocab if "▁" in k) > 1000
-    has_byte_fallback = model.get("byte_fallback", False)
-    has_hex_tokens = any(k.startswith("<0x") for k in vocab)
-
-    if has_sp_prefix and has_byte_fallback and has_hex_tokens:
-        return 2  # sentencepiece-style BPE (Gemma)
-
-    return 1  # GPT-2 byte-level BPE (Llama 3, GPT-style)
 
 def main():
     if len(sys.argv) < 2:
@@ -60,11 +40,6 @@ def main():
     with open(tok_path) as f:
         tok = json.load(f)
 
-    # Detect tokenizer style
-    tok_type = detect_tokenizer_style(tok)
-    style_name = "GPT-2 byte-level BPE" if tok_type == 1 else "sentencepiece-style BPE (Gemma)"
-    print(f"  Detected style: {style_name} (type={tok_type})")
-
     # Extract vocab
     model = tok.get("model", {})
     vocab = model.get("vocab", {})
@@ -74,40 +49,25 @@ def main():
     id_to_token = {v: k for k, v in vocab.items()}
 
     # Find BOS/EOS from added_tokens
-    bos_id, eos_id = -1, -1
+    bos_id, eos_id = 128000, 128001  # Llama 3 defaults
     for at in tok.get("added_tokens", []):
         content = at.get("content", "")
         tid = at.get("id", -1)
-        if not at.get("special", False):
-            continue
-        # Llama 3 style
         if content == "<|begin_of_text|>":
             bos_id = tid
         elif content == "<|end_of_text|>":
             eos_id = tid
-        # Sentencepiece / Gemma style
-        if content == "<bos>":
-            bos_id = tid
-        elif content == "<eos>":
-            eos_id = tid
-        # Generic
-        if content == "<s>":
-            bos_id = tid
-        if content == "</s>":
-            eos_id = tid
-
-    # Fallback defaults if not found
-    if bos_id == -1:
-        bos_id = 128000 if tok_type == 1 else 2
-    if eos_id == -1:
-        eos_id = 128001 if tok_type == 1 else 1
+        # Also check for generic BOS/EOS
+        if at.get("special", False):
+            if content == "<s>": bos_id = tid
+            if content == "</s>": eos_id = tid
 
     print(f"  vocab={n_vocab}, bos={bos_id}, eos={eos_id}")
 
-    # Write vocab.bin (with tok_type field)
+    # Write vocab.bin
     vocab_out = os.path.join(turbo_dir, "vocab.bin")
     with open(vocab_out, "wb") as f:
-        f.write(struct.pack("<iiii", n_vocab, bos_id, eos_id, tok_type))
+        f.write(struct.pack("<iii", n_vocab, bos_id, eos_id))
         for i in range(n_vocab):
             token = id_to_token.get(i, "")
             token_bytes = token.encode("utf-8")
@@ -134,7 +94,6 @@ def main():
     print(f"  Wrote {merges_out} ({len(merges)} merges)")
 
     # Write byte_encoder.bin (GPT-2 byte-to-unicode mapping)
-    # Only meaningful for tok_type==1, but write it anyway for compatibility
     byte_enc = bytes_to_unicode()
     be_out = os.path.join(turbo_dir, "byte_encoder.bin")
     with open(be_out, "wb") as f:
