@@ -46,14 +46,14 @@ The 0.03% of weights outside this window get group=0 (escape). Their exact BF16 
 
 All methods exploit the same observation: BF16 exponents have ~2.6 bits of entropy in 8 bits. The approaches differ in encoding, decode cost, and GPU integration.
 
-| Method | Venue | Bits/Weight | Decode | Fused GEMM? | B=1 vs BF16 | Notes |
-|--------|-------|:----------:|--------|:-----------:|:-----------:|-------|
-| **Turbo (ours)** | — | **12.0** | 1 ADD | Matvec | **~1.0x** | Fixed-width, byte-aligned, 0.03% escapes |
-| **ZipServ** | ASPLOS'26 | ~11.3 | Bitmap+popcount | Yes (tensor core) | N/A (B≥8 only) | 3-bit codeword, ~3% escapes, NVIDIA only |
-| **DFloat11** | NeurIPS'25 | ~11.0 | Huffman LUT | No (separate) | **0.6x** (40% slower) | Variable-length, 2-phase kernel |
-| **ZipNN** | IEEE'25 | ~11 | CPU zstd | No (CPU only) | N/A | Storage/transfer only, no VRAM savings |
-| **NeuZip** | arXiv'24 | ~10.6 | ANS | No | **0.67x** | Also supports training |
-| **Huff-LLM** | arXiv'25 | ~11.6 | CAM | ASIC only | N/A | Custom silicon, not GPU |
+| Method | Venue | Bits/Weight | Decode | Fused GEMM? | Notes |
+|--------|-------|:----------:|--------|:-----------:|-------|
+| **Turbo (ours)** | — | **12.0** | 1 ADD | Matvec | Fixed-width, byte-aligned, 0.03% escapes |
+| **ZipServ** | ASPLOS'26 | ~11.3 | Bitmap+popcount | Yes (tensor core) | 3-bit codeword, ~3% escapes, NVIDIA only |
+| **DFloat11** | NeurIPS'25 | ~11.0 | Huffman LUT | No (separate) | Variable-length, 2-phase kernel |
+| **ZipNN** | IEEE'25 | ~11 | CPU zstd | No (CPU only) | Storage/transfer only, no VRAM savings |
+| **NeuZip** | arXiv'24 | ~10.6 | ANS | No | Also supports training |
+| **Huff-LLM** | arXiv'25 | ~11.6 | CAM | ASIC only | Custom silicon, not GPU |
 
 **Key differences from ZipServ** (our closest competitor):
 - We use 4-bit fixed group codes (15 exponents, 0.03% escapes); they use 3-bit bitmap codewords (7 exponents, ~3% escapes)
