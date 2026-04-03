@@ -40,9 +40,9 @@ All benchmarks measured with 200-token generation, output verified coherent.
 
 | Batch | Kernel | vLLM BF16 | Turbo 12-bit | vs vLLM | VRAM |
 |------:|:------:|----------:|-------------:|:-------:|-----:|
-| B=1 | V2 | 54.7 tok/s | **60.0 tok/s** | **1.10x** | 11.1 GB |
-| B=8 | V2 | 414.6 | **162.6** | — | 11.1 GB |
-| B=32 | V2 | 694.2 | **1,136** | **1.64x** | 11.2 GB |
+| B=1 | split12 | 54.7 tok/s | **60.0 tok/s** | **1.10x** | 11.1 GB |
+| B=8 | split12 | 414.6 | **162.6** | — | 11.1 GB |
+| B=32 | split12 | 694.2 | **1,136** | **1.64x** | 11.2 GB |
 | B=64 | V3 TMA | 853 | **1,514** | **1.77x** | 12.7 GB |
 | B=128 | V3 TMA | 942 | **2,197** | **2.33x** | 12.7 GB |
 | B=256 | V3 TMA | 872 | **2,554** | **2.93x** | 12.7 GB |
@@ -53,16 +53,16 @@ vLLM fills the entire 16 GB card (15.3 GB) and can serve only ~1 user. Turbo ser
 
 | Batch | Kernel | vLLM BF16 | Turbo 12-bit | VRAM |
 |------:|:------:|----------:|-------------:|-----:|
-| B=1 | V2 | OOM | **57.0 tok/s** | 12.4 GB |
-| B=8 | V2 | OOM | **154.3** | 12.4 GB |
-| B=32 | V2 | OOM | **1,069** | 12.5 GB |
+| B=1 | split12 | OOM | **57.0 tok/s** | 12.4 GB |
+| B=8 | split12 | OOM | **154.3** | 12.4 GB |
+| B=32 | split12 | OOM | **1,069** | 12.5 GB |
 | B=64 | V3 TMA | OOM | **1,439** | 14.0 GB |
 | B=128 | V3 TMA | OOM | **2,111** | 14.0 GB |
 | B=256 | V3 TMA | OOM | **2,471** | 14.1 GB |
 
 vLLM **cannot load** Llama 8B BF16 on a 16 GB card (needs ~17 GB). Turbo runs it at 14.1 GB serving 256 users.
 
-Kernels: **V2** = cp.async pipeline (B<64), **V3 TMA** = Blackwell tensor memory loads (B>=64). Auto-selected.
+Kernels: **split12** = per-row bandwidth-optimized matvec (B<=32), **V3 TMA** = fused decode+GEMM with Blackwell tensor memory loads (B>=64). Auto-selected based on batch size.
 
 ### VRAM: Turbo vs vLLM
 
