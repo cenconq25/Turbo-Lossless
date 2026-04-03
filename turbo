@@ -27,7 +27,9 @@ show_banner() {
 BANNER
     echo -e "${RESET}"
     echo -e "  ${WHITE}BF16 → 12-bit lossless  •  Decode with 1 ADD${RESET}"
-    echo -e "  ${DIM}1.33x smaller  •  2.93x faster  •  Zero precision loss${RESET}"
+    echo -e "  ${DIM}1.33x smaller  •  up to 2.93x faster (B=256)  •  Zero precision loss${RESET}"
+    echo ""
+    echo -e "  ${YELLOW}Note: This is a proof of concept. The UI is not optimised and may have errors.${RESET}"
     echo ""
 }
 
@@ -180,8 +182,8 @@ interactive() {
     local fifo_in=$(mktemp -u) fifo_out=$(mktemp -u)
     mkfifo "$fifo_in" "$fifo_out"
 
-    # stdbuf forces line-buffered stdout so progress lines arrive immediately through the fifo
-    TURBO_FAST=1 stdbuf -oL "$ENGINE" "$model" --interactive "$max" < "$fifo_in" > "$fifo_out" 2>/dev/null &
+    # Engine sets stdout unbuffered in interactive mode, so no stdbuf needed
+    TURBO_FAST=1 "$ENGINE" "$model" --interactive "$max" < "$fifo_in" > "$fifo_out" 2>/dev/null &
     local epid=$!
     exec 3>"$fifo_in"
     exec 4<"$fifo_out"

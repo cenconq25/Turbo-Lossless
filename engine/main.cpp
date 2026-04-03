@@ -111,8 +111,11 @@ int main(int argc, char** argv) {
     fflush(stdout);
 
     if (interactive) {
-        // Interactive: read prompts from stdin, keep KV cache across turns
-        int current_pos = 0;
+        // Force unbuffered stdout so token output reaches the FIFO immediately
+        // (stdbuf -oL only flushes on \n, but tokens are printed without \n)
+        setvbuf(stdout, NULL, _IONBF, 0);
+
+        // Interactive: each turn is independent (reset KV cache)
         char line[4096];
         while (fgets(line, sizeof(line), stdin)) {
             // Strip trailing newline
@@ -122,81 +125,44 @@ int main(int argc, char** argv) {
             if (strcmp(line, "quit") == 0 || strcmp(line, "exit") == 0) break;
 
             auto tokens = tokenize(tok, std::string(line));
-            // tokenize() always prepends BOS — only keep it on the first turn
-            if (current_pos > 0 && !tokens.empty() && tokens[0] == tok->bos_id) {
-                tokens.erase(tokens.begin());
-            }
 
             printf("Generating...\n\n");
             struct timespec t0, t1;
             clock_gettime(CLOCK_MONOTONIC, &t0);
 
-            // Prefill: feed each prompt token, continuing from current_pos
-            state->positions[0] = current_pos;
+            // Prefill: feed each prompt token from position 0 (fresh context per turn)
+            state->positions[0] = 0;
             for (int i = 0; i < (int)tokens.size(); i++) {
                 forward(state, &tokens[i]);
                 // forward_b1 auto-increments positions[0]
             }
-            current_pos = state->positions[0];
 
             // Decode: generate new tokens
             int n_gen = 0;
             int n_vocab = model->config.n_vocab;
             int eos_id = tok->eos_id;
 
-            // Find stop token IDs (tokens that start a new instruction turn)
-            // These are model-specific but we check common ones
-            std::vector<int> stop_ids;
-            auto probe = [&](const std::string& s) {
-                auto ids = tokenize(tok, s);
-                if (!ids.empty()) stop_ids.push_back(ids.back());
-            };
-            probe("[INST]"); probe("[/INST]"); probe("</s>");
-
             clock_gettime(CLOCK_MONOTONIC, &t0);  // restart timer for decode only
 
             for (int t = 0; t < max_tokens; t++) {
                 int next = sample_greedy(state->logits, n_vocab, state->stream);
-                if (next == eos_id || next == 2 || next == 1) break;
-
-                // Check stop tokens (model trying to start new turn)
-                bool is_stop = false;
-                for (int sid : stop_ids) {
-                    if (next == sid) { is_stop = true; break; }
-                }
-                if (is_stop && n_gen > 2) break;
+                if (next == eos_id || next == tok->bos_id) break;
 
                 printf("%s", detokenize_one(tok, next).c_str());
                 fflush(stdout);
 
                 forward(state, &next);
-                current_pos = state->positions[0];
                 n_gen++;
             }
 
-            clock_gettime(CLOCK_MONOTONIC, &t1);  // stop timer before EOS overhead
-
-            // Feed EOS/turn separator so model knows this turn ended
-            {
-                int eos_tok = tok->eos_id > 0 ? tok->eos_id : 2;
-                state->positions[0] = current_pos;
-                forward(state, &eos_tok);
-                current_pos = state->positions[0];
-            }
+            clock_gettime(CLOCK_MONOTONIC, &t1);
             double secs = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
 
             printf("\n\n--- Stats ---\n");
             printf("Prompt tokens: %zu\n", tokens.size());
             printf("Generated tokens: %d\n", n_gen);
-            printf("Context position: %d / %d\n", current_pos, model->max_seq_len);
             printf("Total time: %.2f s\n", secs);
             if (n_gen > 0) printf("Decode speed: %.1f tok/s\n", n_gen / secs);
-
-            // Check context limit
-            if (current_pos > model->max_seq_len - 100) {
-                printf("Context nearly full (%d/%d). Resetting.\n", current_pos, model->max_seq_len);
-                current_pos = 0;
-            }
 
             printf("\n--- READY ---\n");
             fflush(stdout);

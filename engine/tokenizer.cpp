@@ -77,6 +77,76 @@ static std::string unescape_token(const std::string& s) {
     return result;
 }
 
+// Load special tokens (e.g. [INST], [/INST]) from tokenizer.json added_tokens
+static void load_special_tokens(Tokenizer* tok, const std::string& model_dir) {
+    std::string path = model_dir + "/tokenizer.json";
+    std::ifstream f(path);
+    if (!f) return;
+    std::string json((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    f.close();
+
+    size_t added = json.find("\"added_tokens\"");
+    if (added == std::string::npos) return;
+    size_t arr_start = json.find("[", added);
+    if (arr_start == std::string::npos) return;
+
+    // Iterate through objects in the array (don't rely on finding matching ']')
+    size_t pos = arr_start + 1;
+    while (pos < json.size()) {
+        size_t obj_start = json.find("{", pos);
+        if (obj_start == std::string::npos) break;
+        // Find matching '}' — skip nested strings that may contain braces
+        size_t obj_end = obj_start + 1;
+        bool in_str = false;
+        while (obj_end < json.size()) {
+            if (json[obj_end] == '"' && json[obj_end-1] != '\\') in_str = !in_str;
+            else if (!in_str && json[obj_end] == '}') break;
+            obj_end++;
+        }
+        if (obj_end >= json.size()) break;
+        std::string obj = json.substr(obj_start, obj_end - obj_start + 1);
+
+        if (obj.find("\"special\"") != std::string::npos &&
+            obj.find("true") != std::string::npos) {
+            int id = extract_json_int(obj, "id");
+            size_t cs = obj.find("\"content\"");
+            if (cs != std::string::npos) {
+                cs = obj.find("\"", cs + 9);
+                if (cs != std::string::npos) {
+                    size_t ce = obj.find("\"", cs + 1);
+                    if (ce != std::string::npos) {
+                        std::string content = obj.substr(cs + 1, ce - cs - 1);
+                        if (id > 2 && content.size() > 1)
+                            tok->special_tokens.push_back({content, id});
+                        if (content == "</s>" && id != tok->eos_id)
+                            tok->eos_id = id;
+                    }
+                }
+            }
+        }
+        pos = obj_end + 1;
+        // Stop if we've passed the array (next non-whitespace after obj is ']')
+        size_t next = json.find_first_not_of(" \t\n\r,", pos);
+        if (next != std::string::npos && json[next] == ']') break;
+    }
+
+    // Sort longest-first for greedy matching
+    std::sort(tok->special_tokens.begin(), tok->special_tokens.end(),
+              [](const SpecialToken& a, const SpecialToken& b) {
+                  return a.text.size() > b.text.size();
+              });
+
+    if (!tok->special_tokens.empty()) {
+        printf("  Special tokens: ");
+        for (size_t i = 0; i < tok->special_tokens.size() && i < 5; i++) {
+            if (i) printf(", ");
+            printf("%s=%d", tok->special_tokens[i].text.c_str(), tok->special_tokens[i].id);
+        }
+        if (tok->special_tokens.size() > 5) printf(", ... (%zu total)", tok->special_tokens.size());
+        printf("\n");
+    }
+}
+
 static bool load_hf_tokenizer(Tokenizer* tok, const std::string& model_dir) {
     // Prefer pre-extracted binary format (vocab.bin + merges.bin) for speed and correctness
     std::string vocab_path = model_dir + "/vocab.bin";
@@ -266,8 +336,10 @@ Tokenizer* load_tokenizer(const std::string& model_path) {
 
     // Try sentencepiece first
     std::string sp_path = model_path + "/tokenizer.model";
-    if (load_sentencepiece(tok, sp_path))
+    if (load_sentencepiece(tok, sp_path)) {
+        load_special_tokens(tok, model_path);
         return tok;
+    }
 
     // Try HuggingFace tokenizer (vocab.bin or tokenizer.json)
     if (load_hf_tokenizer(tok, model_path))
@@ -287,19 +359,67 @@ void free_tokenizer(Tokenizer* tok) {
     delete tok;
 }
 
-std::vector<int> tokenize(Tokenizer* tok, const std::string& text) {
-    if (tok->type == 0) {
-        auto* sp = (sentencepiece::SentencePieceProcessor*)tok->sp_model;
-        std::vector<int> ids;
-        sp->Encode(text, &ids);
-        ids.insert(ids.begin(), tok->bos_id);
-        return ids;
-    } else {
-        auto* hf = (HFTokenizer*)tok->sp_model;
-        auto ids = bpe_encode(hf, text);
-        ids.insert(ids.begin(), tok->bos_id);
-        return ids;
+// Split text on special tokens, encode each segment, insert special token IDs
+static std::vector<int> tokenize_with_special(Tokenizer* tok, const std::string& text) {
+    if (tok->special_tokens.empty()) {
+        // No special tokens — encode normally
+        if (tok->type == 0) {
+            auto* sp = (sentencepiece::SentencePieceProcessor*)tok->sp_model;
+            std::vector<int> ids;
+            sp->Encode(text, &ids);
+            return ids;
+        } else {
+            return bpe_encode((HFTokenizer*)tok->sp_model, text);
+        }
     }
+
+    // Scan text for special tokens, split and encode segments
+    std::vector<int> ids;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        // Try to match a special token at current position (longest-first)
+        bool matched = false;
+        for (auto& st : tok->special_tokens) {
+            if (pos + st.text.size() <= text.size() &&
+                text.compare(pos, st.text.size(), st.text) == 0) {
+                ids.push_back(st.id);
+                pos += st.text.size();
+                matched = true;
+                break;
+            }
+        }
+        if (matched) continue;
+
+        // Find the next special token occurrence
+        size_t next_special = text.size();
+        for (auto& st : tok->special_tokens) {
+            size_t found = text.find(st.text, pos);
+            if (found != std::string::npos && found < next_special)
+                next_special = found;
+        }
+
+        // Encode the text segment before the next special token
+        std::string segment = text.substr(pos, next_special - pos);
+        if (!segment.empty()) {
+            if (tok->type == 0) {
+                auto* sp = (sentencepiece::SentencePieceProcessor*)tok->sp_model;
+                std::vector<int> seg_ids;
+                sp->Encode(segment, &seg_ids);
+                ids.insert(ids.end(), seg_ids.begin(), seg_ids.end());
+            } else {
+                auto seg_ids = bpe_encode((HFTokenizer*)tok->sp_model, segment);
+                ids.insert(ids.end(), seg_ids.begin(), seg_ids.end());
+            }
+        }
+        pos = next_special;
+    }
+    return ids;
+}
+
+std::vector<int> tokenize(Tokenizer* tok, const std::string& text) {
+    auto ids = tokenize_with_special(tok, text);
+    ids.insert(ids.begin(), tok->bos_id);
+    return ids;
 }
 
 std::string detokenize(Tokenizer* tok, const std::vector<int>& tokens) {
@@ -351,6 +471,10 @@ static std::string bpe_token_to_text(HFTokenizer* hf, const std::string& token) 
 }
 
 std::string detokenize_one(Tokenizer* tok, int token) {
+    // Check special tokens first (works for both sentencepiece and HF BPE)
+    for (auto& st : tok->special_tokens) {
+        if (st.id == token) return st.text;
+    }
     if (tok->type == 0) {
         auto* sp = (sentencepiece::SentencePieceProcessor*)tok->sp_model;
         std::string piece = sp->IdToPiece(token);
