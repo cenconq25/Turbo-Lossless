@@ -1,5 +1,7 @@
 # Turbo Lossless — 1.33x Smaller, 2.93x Faster, Decode with 1 ADD
 
+### **1.33x** compression for most models. Up to **2.93x** faster than vLLM for multi-user. **3-7x fewer ops** than other lossless methods — just an ADD.
+
 > **BF16 → 12-bit lossless. One integer ADD to decode. Zero precision loss.**
 
 ```
