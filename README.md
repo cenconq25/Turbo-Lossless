@@ -1,4 +1,4 @@
-# Turbo Lossless — 1.33x Smaller, 2.93x Faster, Decode with 1 ADD
+# Turbo Lossless — 1.33x Smaller, 2.93x Faster, Decode with 1 ADD operation
 
 > **Note:** This is a research proof of concept demonstrating that BF16 lossless compression works and the decode-fused kernels are viable. The KV cache and attention are not fully optimised — expect slowdown over long conversations. The focus is on the compression format and fused decode, not production chat.
 
