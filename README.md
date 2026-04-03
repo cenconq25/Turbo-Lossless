@@ -4,6 +4,8 @@
 
 ### **1.33x** compression for most models. Up to **2.93x** faster than vLLM for multi-user (B=256). **3-7x fewer ops** than other lossless methods — just an ADD.
 
+![Turbo Lossless CLI](docs/turbo-screenshot.png)
+
 > **BF16 → 12-bit lossless. One integer ADD to decode. Zero precision loss.**
 
 ```
