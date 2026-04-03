@@ -1,4 +1,4 @@
-# Turbo Lossless — Decode with 1 ADD
+# Turbo Lossless — 1.33x Smaller, 2.93x Faster, Decode with 1 ADD
 
 > **BF16 → 12-bit lossless. One integer ADD to decode. Zero precision loss.**
 
