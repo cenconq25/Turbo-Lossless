@@ -21,10 +21,6 @@ extern "C" {
 
     // Matvec launch wrappers (decompress_v2.hip)
     int launch_patches_v2_async(const void* row_offsets, const void* patch_cols, const void* correct_vals, const void* wrong_vals, const void* activations, void* output, int M, void* stream);
-    int launch_structured12_v2_async(const void* packed, int base_exp, const void* activations, void* output, int M, int K, void* stream, const void* patch_row_offsets, const void* patch_cols, const void* patch_correct_vals, const void* patch_wrong_vals);
-    int launch_structured12_v2_dual_async(const void* packed_a, int base_exp_a, const void* packed_b, int base_exp_b, const void* activations, void* output_a, void* output_b, int M, int K, void* stream);
-    int launch_structured12_batch4_async(const void* packed, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, int M, int K, void* stream);
-    int launch_structured12_batch8_async(const void* packed, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* a4, const void* a5, const void* a6, const void* a7, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, void* o4, void* o5, void* o6, void* o7, int M, int K, void* stream);
     int launch_split12_v2_async(const void* sign_mantissa, const void* groups, int base_exp, const void* activations, void* output, int M, int K, void* stream);
     int launch_split12_v2_dual_async(const void* sm_a, const void* gr_a, int base_exp_a, const void* sm_b, const void* gr_b, int base_exp_b, const void* activations, void* output_a, void* output_b, int M, int K, void* stream);
     int launch_split12_batch4_async(const void* sm, const void* gr, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, int M, int K, void* stream);
@@ -74,23 +70,14 @@ static inline bool fill_patch_desc(PatchBatchDesc& d, const CompressedWeight& w,
 
 // B=4 batch4 matvec: prefer split12 (zero amplification) when available
 #define BATCH4_MATVEC(w, bf16_in, out_buf, n_in, n_out, strm) do { \
-    if ((w).split_sm) { \
-        launch_split12_batch4_async((w).split_sm, (w).split_gr, (w).base_exp, \
-            SEQI(bf16_in,0,n_in), SEQI(bf16_in,1,n_in), \
-            SEQI(bf16_in,2,n_in), SEQI(bf16_in,3,n_in), \
-            (w).escape_row_base, (w).escape_counts, (w).escape_vals, \
-            SEQ(out_buf,0,n_out), SEQ(out_buf,1,n_out), \
-            SEQ(out_buf,2,n_out), SEQ(out_buf,3,n_out), \
-            (w).M, (w).K, strm); \
-    } else { \
-        launch_structured12_batch4_async((w).packed, (w).base_exp, \
-            SEQI(bf16_in,0,n_in), SEQI(bf16_in,1,n_in), \
-            SEQI(bf16_in,2,n_in), SEQI(bf16_in,3,n_in), \
-            (w).escape_row_base, (w).escape_counts, (w).escape_vals, \
-            SEQ(out_buf,0,n_out), SEQ(out_buf,1,n_out), \
-            SEQ(out_buf,2,n_out), SEQ(out_buf,3,n_out), \
-            (w).M, (w).K, strm); \
-    } \
+    if (!(w).split_sm) { fprintf(stderr, "ERROR: split12 data missing for weight %dx%d\n", (w).M, (w).K); exit(1); } \
+    launch_split12_batch4_async((w).split_sm, (w).split_gr, (w).base_exp, \
+        SEQI(bf16_in,0,n_in), SEQI(bf16_in,1,n_in), \
+        SEQI(bf16_in,2,n_in), SEQI(bf16_in,3,n_in), \
+        (w).escape_row_base, (w).escape_counts, (w).escape_vals, \
+        SEQ(out_buf,0,n_out), SEQ(out_buf,1,n_out), \
+        SEQ(out_buf,2,n_out), SEQ(out_buf,3,n_out), \
+        (w).M, (w).K, strm); \
 } while(0)
 
 // NVIDIA tensor core GEMM: decode → shared mem → WMMA (sm_80+ Ampere/Hopper/Ada/Blackwell)
@@ -268,23 +255,15 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
 
     // Split12 matvec WITHOUT patches (patches batched separately to reduce launches)
     #define MATVEC_B1_NOPATCH(w, bf16_in, fp32_out) do { \
-        if ((w).split_sm) { \
-            NV_OR_HIP_SPLIT12_V2(w, bf16_in, fp32_out); \
-        } else { \
-            launch_structured12_v2_async((w).packed, (w).base_exp, bf16_in, fp32_out, (w).M, (w).K, stream, \
-                (w).row_offsets, (w).patch_cols, (w).patch_correct, (w).patch_wrong); \
-        } \
+        if (!(w).split_sm) { fprintf(stderr, "ERROR: split12 data missing for weight %dx%d\n", (w).M, (w).K); exit(1); } \
+        NV_OR_HIP_SPLIT12_V2(w, bf16_in, fp32_out); \
     } while(0)
 
     // Legacy macro with inline patches (backward compat)
     #define MATVEC_B1(w, bf16_in, fp32_out) do { \
-        if ((w).split_sm) { \
-            NV_OR_HIP_SPLIT12_V2(w, bf16_in, fp32_out); \
-            NV_OR_HIP_PATCHES(w, bf16_in, fp32_out); \
-        } else { \
-            launch_structured12_v2_async((w).packed, (w).base_exp, bf16_in, fp32_out, (w).M, (w).K, stream, \
-                (w).row_offsets, (w).patch_cols, (w).patch_correct, (w).patch_wrong); \
-        } \
+        if (!(w).split_sm) { fprintf(stderr, "ERROR: split12 data missing for weight %dx%d\n", (w).M, (w).K); exit(1); } \
+        NV_OR_HIP_SPLIT12_V2(w, bf16_in, fp32_out); \
+        NV_OR_HIP_PATCHES(w, bf16_in, fp32_out); \
     } while(0)
 
 #ifdef TURBO_NVIDIA
@@ -362,7 +341,8 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
 
         // --- FFN: gate+up dual kernel + batched patches (1 launch instead of 2) ---
         PROF_START(stream);
-        if (L.w_gate.split_sm && L.w_up.split_sm) {
+        if (!L.w_gate.split_sm || !L.w_up.split_sm) { fprintf(stderr, "ERROR: split12 data missing for gate/up\n"); exit(1); }
+        {
 #ifdef TURBO_NVIDIA
             nv_launch_split12_v2_dual_async(
 #else
@@ -378,13 +358,6 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
             if (fill_patch_desc(patch_descs[nd], L.w_gate, bf16_a, state->ffn_gate)) { max_M = std::max(max_M, L.w_gate.M); nd++; }
             if (fill_patch_desc(patch_descs[nd], L.w_up, bf16_a, state->ffn_up))     { max_M = std::max(max_M, L.w_up.M); nd++; }
             if (nd > 0) launch_patches_b1_batched_async(state->patch_descs_gpu, patch_descs, nd, max_M, stream);
-        } else {
-            launch_structured12_v2_dual_async(
-                L.w_gate.packed, L.w_gate.base_exp,
-                L.w_up.packed, L.w_up.base_exp,
-                bf16_a,
-                state->ffn_gate, state->ffn_up,
-                L.w_gate.M, L.w_gate.K, stream);
         }
         PROF_END_MV(stream);
 
@@ -432,31 +405,18 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
 
 // B=8 batch8 matvec: prefer split12 when available
 #define BATCH8_MATVEC(w, bf16_in, out_buf, n_in, n_out, strm) do { \
-    if ((w).split_sm) { \
-        launch_split12_batch8_async((w).split_sm, (w).split_gr, (w).base_exp, \
-            SEQI(bf16_in,0,n_in), SEQI(bf16_in,1,n_in), \
-            SEQI(bf16_in,2,n_in), SEQI(bf16_in,3,n_in), \
-            SEQI(bf16_in,4,n_in), SEQI(bf16_in,5,n_in), \
-            SEQI(bf16_in,6,n_in), SEQI(bf16_in,7,n_in), \
-            (w).escape_row_base, (w).escape_counts, (w).escape_vals, \
-            SEQ(out_buf,0,n_out), SEQ(out_buf,1,n_out), \
-            SEQ(out_buf,2,n_out), SEQ(out_buf,3,n_out), \
-            SEQ(out_buf,4,n_out), SEQ(out_buf,5,n_out), \
-            SEQ(out_buf,6,n_out), SEQ(out_buf,7,n_out), \
-            (w).M, (w).K, strm); \
-    } else { \
-        launch_structured12_batch8_async((w).packed, (w).base_exp, \
-            SEQI(bf16_in,0,n_in), SEQI(bf16_in,1,n_in), \
-            SEQI(bf16_in,2,n_in), SEQI(bf16_in,3,n_in), \
-            SEQI(bf16_in,4,n_in), SEQI(bf16_in,5,n_in), \
-            SEQI(bf16_in,6,n_in), SEQI(bf16_in,7,n_in), \
-            (w).escape_row_base, (w).escape_counts, (w).escape_vals, \
-            SEQ(out_buf,0,n_out), SEQ(out_buf,1,n_out), \
-            SEQ(out_buf,2,n_out), SEQ(out_buf,3,n_out), \
-            SEQ(out_buf,4,n_out), SEQ(out_buf,5,n_out), \
-            SEQ(out_buf,6,n_out), SEQ(out_buf,7,n_out), \
-            (w).M, (w).K, strm); \
-    } \
+    if (!(w).split_sm) { fprintf(stderr, "ERROR: split12 data missing for weight %dx%d\n", (w).M, (w).K); exit(1); } \
+    launch_split12_batch8_async((w).split_sm, (w).split_gr, (w).base_exp, \
+        SEQI(bf16_in,0,n_in), SEQI(bf16_in,1,n_in), \
+        SEQI(bf16_in,2,n_in), SEQI(bf16_in,3,n_in), \
+        SEQI(bf16_in,4,n_in), SEQI(bf16_in,5,n_in), \
+        SEQI(bf16_in,6,n_in), SEQI(bf16_in,7,n_in), \
+        (w).escape_row_base, (w).escape_counts, (w).escape_vals, \
+        SEQ(out_buf,0,n_out), SEQ(out_buf,1,n_out), \
+        SEQ(out_buf,2,n_out), SEQ(out_buf,3,n_out), \
+        SEQ(out_buf,4,n_out), SEQ(out_buf,5,n_out), \
+        SEQ(out_buf,6,n_out), SEQ(out_buf,7,n_out), \
+        (w).M, (w).K, strm); \
 } while(0)
 
 // B=4 forward — fully batched, minimal kernel launches
@@ -486,29 +446,9 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
         if (layer == 0)
             launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
 
-#ifdef TURBO_NVIDIA
-        // NVIDIA: auto-select split12 when available (saves 10 GB VRAM)
         BATCH4_MATVEC(L.wq, bf16_a, state->q_buf, n, n, stream);
         BATCH4_MATVEC(L.wk, bf16_a, state->k_buf, n, kv_dim, stream);
         BATCH4_MATVEC(L.wv, bf16_a, state->v_buf, n, kv_dim, stream);
-#else
-        // AMD: original structured12 path (unchanged)
-        launch_structured12_batch4_async(L.wq.packed, L.wq.base_exp,
-            SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
-            L.wq.escape_row_base, L.wq.escape_counts, L.wq.escape_vals,
-            SEQ(state->q_buf,0,n), SEQ(state->q_buf,1,n), SEQ(state->q_buf,2,n), SEQ(state->q_buf,3,n),
-            L.wq.M, L.wq.K, stream);
-        launch_structured12_batch4_async(L.wk.packed, L.wk.base_exp,
-            SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
-            L.wk.escape_row_base, L.wk.escape_counts, L.wk.escape_vals,
-            SEQ(state->k_buf,0,kv_dim), SEQ(state->k_buf,1,kv_dim), SEQ(state->k_buf,2,kv_dim), SEQ(state->k_buf,3,kv_dim),
-            L.wk.M, L.wk.K, stream);
-        launch_structured12_batch4_async(L.wv.packed, L.wv.base_exp,
-            SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
-            L.wv.escape_row_base, L.wv.escape_counts, L.wv.escape_vals,
-            SEQ(state->v_buf,0,kv_dim), SEQ(state->v_buf,1,kv_dim), SEQ(state->v_buf,2,kv_dim), SEQ(state->v_buf,3,kv_dim),
-            L.wv.M, L.wv.K, stream);
-#endif
 
         size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
         launch_rope_batch(state->q_buf, state->k_buf, state->d_positions,
@@ -528,37 +468,12 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
                 bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
                 max_pos + 1, scale, BS, 0, stream);
 
-#ifdef TURBO_NVIDIA
         BATCH4_MATVEC(L.wo, bf16_a, res, n, n, stream);
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
         BATCH4_MATVEC(L.w_gate, bf16_a, state->ffn_gate, n, n_ff, stream);
         BATCH4_MATVEC(L.w_up, bf16_a, state->ffn_up, n, n_ff, stream);
         launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, BS, stream);
         BATCH4_MATVEC(L.w_down, bf16_b, cur, n_ff, n, stream);
-#else
-        launch_structured12_batch4_async(L.wo.packed, L.wo.base_exp,
-            SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
-            L.wo.escape_row_base, L.wo.escape_counts, L.wo.escape_vals,
-            SEQ(res,0,n), SEQ(res,1,n), SEQ(res,2,n), SEQ(res,3,n),
-            L.wo.M, L.wo.K, stream);
-        launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
-        launch_structured12_batch4_async(L.w_gate.packed, L.w_gate.base_exp,
-            SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
-            L.w_gate.escape_row_base, L.w_gate.escape_counts, L.w_gate.escape_vals,
-            SEQ(state->ffn_gate,0,n_ff), SEQ(state->ffn_gate,1,n_ff), SEQ(state->ffn_gate,2,n_ff), SEQ(state->ffn_gate,3,n_ff),
-            L.w_gate.M, L.w_gate.K, stream);
-        launch_structured12_batch4_async(L.w_up.packed, L.w_up.base_exp,
-            SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
-            L.w_up.escape_row_base, L.w_up.escape_counts, L.w_up.escape_vals,
-            SEQ(state->ffn_up,0,n_ff), SEQ(state->ffn_up,1,n_ff), SEQ(state->ffn_up,2,n_ff), SEQ(state->ffn_up,3,n_ff),
-            L.w_up.M, L.w_up.K, stream);
-        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, n_ff, BS, stream);
-        launch_structured12_batch4_async(L.w_down.packed, L.w_down.base_exp,
-            SEQI(bf16_b,0,n_ff), SEQI(bf16_b,1,n_ff), SEQI(bf16_b,2,n_ff), SEQI(bf16_b,3,n_ff),
-            L.w_down.escape_row_base, L.w_down.escape_counts, L.w_down.escape_vals,
-            SEQ(cur,0,n), SEQ(cur,1,n), SEQ(cur,2,n), SEQ(cur,3,n),
-            L.w_down.M, L.w_down.K, stream);
-#endif
 
         // Fuse add + next layer's RMSNorm (saves 1 kernel launch per layer)
         if (layer + 1 < cfg.n_layer) {
@@ -570,16 +485,7 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
     }
 
     // Output projection
-#ifdef TURBO_NVIDIA
     BATCH4_MATVEC(m->output_proj, bf16_a, state->logits, n, cfg.n_vocab, stream);
-#else
-    launch_structured12_batch4_async(m->output_proj.packed, m->output_proj.base_exp,
-        SEQI(bf16_a,0,n), SEQI(bf16_a,1,n), SEQI(bf16_a,2,n), SEQI(bf16_a,3,n),
-        m->output_proj.escape_row_base, m->output_proj.escape_counts, m->output_proj.escape_vals,
-        SEQ(state->logits,0,cfg.n_vocab), SEQ(state->logits,1,cfg.n_vocab),
-        SEQ(state->logits,2,cfg.n_vocab), SEQ(state->logits,3,cfg.n_vocab),
-        m->output_proj.M, m->output_proj.K, stream);
-#endif
     for (int s = 0; s < BS; s++) state->positions[s]++;
 }
 

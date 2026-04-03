@@ -15,8 +15,7 @@
 ## Build & Run
 
 ```bash
-# Build packers
-gcc -O3 -shared -fPIC -o structured12_pack.so structured12_pack.c
+# Build packer
 gcc -O3 -shared -fPIC -o split12_pack.so split12_pack.c
 
 # Build engine — NVIDIA (RTX 5070 Ti, sm_120)
@@ -100,12 +99,12 @@ CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./turbo-engine <model_dir> "<prompt>" <max_t
 
 Format per element: `[4-bit exp_group][1-bit sign][7-bit mantissa]` = 12 bits
 
-- BaseExp found per-tensor by `find_base_exp()` (typically 105-109)
+- BaseExp found per-tensor by `split12_find_base_exp()` (typically 105-109)
 - Groups 1-15 -> exponent = BaseExp + group
 - Group 0 -> escape sentinel (read exact BF16 from CSR patch table)
 - Sign and mantissa pass through unchanged from original BF16
 
-### Storage: Split12 Format (Primary)
+### Storage: Split12 Format
 
 Two byte-aligned arrays for zero HBM read amplification:
 ```
@@ -113,13 +112,6 @@ Array 1 (sign_mantissa): [sign 1][mantissa 7] = 1 byte per element
 Array 2 (groups):        [group 4]            = 0.5 bytes per element (2 nibbles/byte)
 ```
 Files: `*.sm.bin` (sign+mantissa), `*.gr.bin` (groups)
-
-### Storage: Packed12 Format (Fallback)
-
-12 bits packed contiguously in uint32 words. Used when split12 files not present.
-File: `*.packed.bin`
-
-The engine auto-detects: if `.sm.bin`/`.gr.bin` exist, uses split12; else uses packed12.
 
 ### Escape Handling
 
@@ -137,7 +129,7 @@ At load time, `model.cpp` builds:
 
 ## Kernel Architecture (decompress_v2.hip — 1312 lines)
 
-### Split12 Kernels (Primary — byte-aligned, zero amplification)
+### Split12 Kernels (byte-aligned, zero amplification)
 
 | Kernel | Purpose |
 |--------|---------|
@@ -146,15 +138,6 @@ At load time, `model.cpp` builds:
 | `split12_matvec_v2_dual` | B=1 gate+up fused (shared activation) |
 | `split12_matvec_batch4` | B=4 with escape handling |
 | `split12_matvec_batch8` | B=8 with escape handling |
-
-### Structured12 Kernels (Fallback — packed 12-bit)
-
-| Kernel | Purpose |
-|--------|---------|
-| `structured12_matvec_v2` | B=1 two-pass (no escape in main pass) |
-| `structured12_matvec_v2_dual` | B=1 gate+up fused |
-| `structured12_matvec_batch4` | B=4 fused (FAST=1 required) |
-| `structured12_matvec_batch8` | B=8 fused (FAST=1 required) |
 
 ### Support Kernels
 
@@ -290,9 +273,8 @@ Example: `4096 4096 5358 107`
 
 | File | Lines | Purpose |
 |------|------:|---------|
-| `decompress_v2.hip` | 1312 | All GPU matvec kernels (split12 + structured12) |
-| `structured12_pack.c` | 118 | Packer for structured12 format (used by convert_model.py) |
-| `split12_pack.c` | 128 | Packer for split12 byte-aligned format |
+| `decompress_v2.hip` | 1312 | All GPU matvec kernels (split12) |
+| `split12_pack.c` | 128 | Packer for split12 byte-aligned format (used by convert_model.py) |
 | `engine/main.cpp` | 80 | CLI: model_path, prompt, max_tokens, batch_size |
 | `engine/model.h` | 78 | CompressedWeight struct (packed + split_sm/split_gr + escape) |
 | `engine/model.cpp` | 268 | Loads config.bin, weights, builds escape tables, proper GPU cleanup |

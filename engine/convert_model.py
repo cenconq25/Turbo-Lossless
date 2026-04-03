@@ -6,7 +6,7 @@ Outputs a directory with:
   tok_embd.bin    — token embeddings (BF16 raw)
   output_norm.bin — output norm weights (FP32)
   layer.N.{attn_norm,ffn_norm}.bin — norm weights (FP32)
-  layer.N.{wq,wk,wv,wo,w_gate,w_up,w_down}.{packed,codebook,esc_off,esc_val}.bin
+  layer.N.{wq,wk,wv,wo,w_gate,w_up,w_down}.{sm,gr,row_off,patch_cols,patch_correct,patch_wrong,dims}.bin
 """
 
 import sys, os, json, struct, time
@@ -16,26 +16,26 @@ from safetensors import safe_open
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import ctypes, glob
 
-# Load C packer for structured 12-bit format
+# Load C packer for split 12-bit format
 _dir = os.path.join(os.path.dirname(__file__), "..")
-_pack_lib = ctypes.CDLL(os.path.join(_dir, "structured12_pack.so"))
-_pack_lib.find_base_exp.argtypes = [
-    ctypes.POINTER(ctypes.c_uint16), ctypes.c_int64,
-    ctypes.POINTER(ctypes.c_uint8),  # exp_rmap_out[256]
+_pack_lib = ctypes.CDLL(os.path.join(_dir, "split12_pack.so"))
+_pack_lib.split12_find_base_exp.argtypes = [
+    ctypes.POINTER(ctypes.c_uint16), ctypes.c_int,
 ]
-_pack_lib.find_base_exp.restype = ctypes.c_int
-_pack_lib.pack_structured12_csr.argtypes = [
-    ctypes.POINTER(ctypes.c_uint16), ctypes.c_int64,
-    ctypes.POINTER(ctypes.c_uint8),   # exp_rmap[256]
-    ctypes.POINTER(ctypes.c_uint32),  # packed_out
-    ctypes.POINTER(ctypes.c_int32),   # row_offsets_out
-    ctypes.POINTER(ctypes.c_int32),   # patch_cols_out
-    ctypes.POINTER(ctypes.c_int16),   # patch_correct_out
-    ctypes.POINTER(ctypes.c_int16),   # patch_wrong_out
-    ctypes.c_int32,                   # wrong_value
-    ctypes.c_int32, ctypes.c_int32,   # M, K
+_pack_lib.split12_find_base_exp.restype = ctypes.c_int
+_pack_lib.pack_split12.argtypes = [
+    ctypes.POINTER(ctypes.c_uint16),  # bf16_data
+    ctypes.c_int,                     # M
+    ctypes.c_int,                     # K
+    ctypes.c_int,                     # base_exp
+    ctypes.POINTER(ctypes.c_uint8),   # sign_mantissa
+    ctypes.POINTER(ctypes.c_uint8),   # groups
+    ctypes.POINTER(ctypes.c_int32),   # row_offsets
+    ctypes.POINTER(ctypes.c_int32),   # patch_cols
+    ctypes.POINTER(ctypes.c_int16),   # patch_correct
+    ctypes.POINTER(ctypes.c_int16),   # patch_wrong
 ]
-_pack_lib.pack_structured12_csr.restype = ctypes.c_int64
+_pack_lib.pack_split12.restype = ctypes.c_int
 
 def convert(model_dir, output_dir):
     os.makedirs(output_dir, exist_ok=True)
@@ -90,45 +90,42 @@ def convert(model_dir, output_dir):
         return os.path.getsize(path)
 
     def save_compressed(prefix, W):
-        """Compress BF16 weight using structured 12-bit and save packed + CSR escape data."""
+        """Compress BF16 weight using split 12-bit and save .sm.bin/.gr.bin + CSR escape data."""
         M, K = W.shape
         n = M * K
 
         raw = W.contiguous().view(torch.int16).numpy().flatten().astype(np.uint16)
 
         # Find optimal BaseExp for this tensor
-        exp_rmap = np.zeros(256, dtype=np.uint8)
-        base_exp = _pack_lib.find_base_exp(
+        base_exp = _pack_lib.split12_find_base_exp(
             raw.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
-            ctypes.c_int64(n),
-            exp_rmap.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            ctypes.c_int(n),
         )
 
-        # Pack structured 12-bit + CSR escape data
-        num_words = (n * 12 + 31) // 32 + 4
-        packed = np.zeros(num_words, dtype=np.uint32)
+        # Allocate output arrays
+        sign_mantissa = np.zeros(n, dtype=np.uint8)
+        groups = np.zeros((n + 1) // 2, dtype=np.uint8)
         max_patches = max(n // 10, 1024)
         row_offsets = np.zeros(M + 1, dtype=np.int32)
         patch_cols = np.zeros(max_patches, dtype=np.int32)
         patch_correct = np.zeros(max_patches, dtype=np.int16)
         patch_wrong = np.zeros(max_patches, dtype=np.int16)
 
-        num_patches = _pack_lib.pack_structured12_csr(
+        num_patches = _pack_lib.pack_split12(
             raw.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
-            ctypes.c_int64(n),
-            exp_rmap.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-            packed.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
+            ctypes.c_int(M), ctypes.c_int(K),
+            ctypes.c_int(base_exp),
+            sign_mantissa.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            groups.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
             row_offsets.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
             patch_cols.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
             patch_correct.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
             patch_wrong.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
-            ctypes.c_int32(0),  # wrong_value unused (group=0 encodes escapes)
-            ctypes.c_int32(M), ctypes.c_int32(K),
         )
 
         # Save files
-        save_raw(f"{prefix}.packed.bin", packed[:num_words])
-        # No codebook needed for structured 12-bit (decode is pure arithmetic)
+        save_raw(f"{prefix}.sm.bin", sign_mantissa)
+        save_raw(f"{prefix}.gr.bin", groups)
         save_raw(f"{prefix}.row_off.bin", row_offsets)
         save_raw(f"{prefix}.patch_cols.bin", patch_cols[:num_patches])
         save_raw(f"{prefix}.patch_correct.bin", patch_correct[:num_patches])

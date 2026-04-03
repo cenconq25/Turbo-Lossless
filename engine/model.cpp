@@ -41,35 +41,6 @@ static bool load_compressed(const std::string& dir, const std::string& prefix, C
     }
     df.close();
 
-    // Check if split12 format is available (skip packed12 upload to save VRAM)
-    bool has_split12 = false;
-    {
-        std::string sm_path = dir + "/" + prefix + ".sm.bin";
-        std::string gr_path = dir + "/" + prefix + ".gr.bin";
-        std::ifstream sf(sm_path, std::ios::binary), gf(gr_path, std::ios::binary);
-        has_split12 = sf.good() && gf.good();
-    }
-
-    // Read and upload packed data (skip if split12 available — saves ~10 GB VRAM)
-    auto packed = read_file(dir + "/" + prefix + ".packed.bin");
-    if (packed.empty() && !has_split12) return false;
-    if (!packed.empty() && !has_split12)
-        w.packed = upload_gpu<int32_t>(packed.data(), packed.size() / sizeof(int32_t));
-    else
-        w.packed = nullptr;
-
-    // Codebook (not needed for structured 12-bit, but load if present for backward compat)
-    {
-        std::string cb_path = dir + "/" + prefix + ".codebook.bin";
-        std::ifstream cbf(cb_path, std::ios::binary);
-        if (cbf) {
-            auto cb = read_file(cb_path);
-            w.codebook = upload_gpu<int16_t>(cb.data(), cb.size() / sizeof(int16_t));
-        } else {
-            w.codebook = nullptr;  // structured12 mode — no codebook needed
-        }
-    }
-
     // CSR escape data
     auto ro = read_file(dir + "/" + prefix + ".row_off.bin");
     if (!ro.empty())
@@ -95,15 +66,15 @@ static bool load_compressed(const std::string& dir, const std::string& prefix, C
     else
         w.patch_wrong = nullptr;
 
-    // Load split12 format if available (byte-aligned, zero read amplification)
-    w.split_sm = nullptr;
-    w.split_gr = nullptr;
+    // Load split12 format (byte-aligned, zero read amplification) — required
     auto sm_data = read_file(dir + "/" + prefix + ".sm.bin");
     auto gr_data = read_file(dir + "/" + prefix + ".gr.bin");
-    if (!sm_data.empty() && !gr_data.empty()) {
-        w.split_sm = upload_gpu<uint8_t>(sm_data.data(), sm_data.size());
-        w.split_gr = upload_gpu<uint8_t>(gr_data.data(), gr_data.size());
+    if (sm_data.empty() || gr_data.empty()) {
+        fprintf(stderr, "ERROR: split12 files missing for %s (need .sm.bin + .gr.bin)\n", prefix.c_str());
+        return false;
     }
+    w.split_sm = upload_gpu<uint8_t>(sm_data.data(), sm_data.size());
+    w.split_gr = upload_gpu<uint8_t>(gr_data.data(), gr_data.size());
 
     // Build fused escape table from CSR data
     // escape_offsets[row*256+tid] = exclusive prefix sum of escapes for thread tid in row
@@ -295,8 +266,6 @@ Model* load_model(const std::string& model_path, int device_id) {
 }
 
 static void free_compressed_weight(CompressedWeight& w) {
-    if (w.packed)           hipFree(w.packed);
-    if (w.codebook)         hipFree(w.codebook);
     if (w.row_offsets)      hipFree(w.row_offsets);
     if (w.patch_cols)       hipFree(w.patch_cols);
     if (w.patch_correct)    hipFree(w.patch_correct);

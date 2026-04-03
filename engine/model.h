@@ -20,8 +20,6 @@ struct ModelConfig {
 // Compressed weight tensor on GPU (CSR escape format + fused escape table)
 struct CompressedWeight {
     int M, K;                     // weight dimensions [M, K]
-    int32_t* packed;              // 12-bit packed indices on GPU
-    int16_t* codebook;            // 4096-entry codebook on GPU
     // CSR escape patches (tiny — ~few KB per tensor)
     int32_t* row_offsets;         // [M+1] CSR row pointers
     int32_t* patch_cols;          // [num_patches] column indices
