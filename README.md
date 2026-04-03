@@ -157,118 +157,19 @@ BF16 and FP16 safetensors supported. No GGUF, no FP32, no quantized formats.
 
 ## Kernel Architecture
 
-Two kernel families for different batch sizes. All decode Split12 weights on-the-fly with 1 ADD — no codebook, no shared memory lookup table.
+Auto-selected by batch size. All decode Split12 weights on-the-fly with 1 ADD.
 
-### Per-Row Kernels (`decompress_v2.hip`) — B=1 to B=8
+| Batch | Kernel | How It Works |
+|:-----:|--------|--------------|
+| B=1 | Per-row matvec | Each thread streams weights, decodes inline, accumulates. 2 rows/block share activation loads. Portable NVIDIA + AMD |
+| B=4 | Per-row batch4 | Decode weight once, multiply by 4 activations. Inline escape handling via warp-shuffle prefix sum |
+| B=8 | Per-row batch8 | Same as B=4 but 8 activations. Single accumulator to save registers |
+| B=16..63 | **V1/V2** fused decode+GEMM | Decode weights directly into tensor core registers. Software `cp.async` pipeline. V2 uses smaller tiles for higher occupancy (2-3 blocks/SM vs 1) |
+| B≥64 | **V3 Blackwell TMA** | Hardware TMA copies entire tiles — 1 thread issues load, GPU handles the rest. Mbarrier sync, hardware swizzle. All 128 threads free for decode + `mma.sync` |
 
-For small batches, matvec is bandwidth-bound: each output element is a single dot product. One block processes one (or two) rows. Each thread streams through the weight array, decodes inline, and accumulates. Portable across NVIDIA and AMD via `gpu_compat.h`.
+V1/V2 differ only in tile size (128×64 vs 64×64) and occupancy. V3 is a fundamentally different architecture using Blackwell's Tensor Memory Accelerator. All three use [ZipServ](https://github.com/HPMLL/ZipServ_ASPLOS26)-style K-slice interleaving: `decode(slice N+1)` overlaps `mma.sync(slice N)`.
 
-| Kernel | Batch | What It Does Differently |
-|--------|:-----:|--------------------------|
-| `split12_matvec_v2` | B=1 | Baseline: 4x unrolled loop, pointer-stride addressing |
-| `split12_matvec_v2_multirow` | B=1 | **2 rows per block** — both rows read the same activation vector, cutting activation memory traffic in half (+4%) |
-| `split12_matvec_v2_dual` | B=1 | **Gate+up fused** — two different weight matrices (FFN gate and up) share one activation load. One kernel instead of two, half the activation reads |
-| `split12_matvec_batch4` | B=4 | **4 activations × 1 weight decode** — decode each weight once, multiply by 4 activation vectors. Inline escape handling via warp-shuffle prefix sum (no separate patch kernel) |
-| `split12_matvec_batch8` | B=8 | Same as batch4 but 8 activations. Uses **single accumulator** per batch element (not dual) to save 8 registers — critical for fitting in the register file |
-
-Escape patches: B=1 uses a separate batched `apply_patches_v2` kernel (eliminates ~192 tiny launches per token). B=4/8 handle escapes inline during the main loop via `if (group == 0) val = escape_table[ptr++]`.
-
-### Fused Decode+GEMM (`nvidia_kernels.cu`) — B>8, NVIDIA Only
-
-For larger batches, we switch to tensor core GEMM. The challenge: weights are compressed, so we can't just call cuBLAS. Instead, we decode Split12 weights directly into tensor core registers and run PTX `mma.sync.aligned.m16n8k16` on the decoded BF16 values.
-
-All three versions share the same compute pattern — **K-slice interleaving** from [ZipServ](https://github.com/HPMLL/ZipServ_ASPLOS26): within each K-tile, `decode(slice N+1)` runs in parallel with `mma.sync(slice N)`, hiding the 3-ALU-op decode behind tensor core math. Register double-buffering (`a[2][4]`, `b[2][2]`) enables this ping-pong without stalls.
-
-The versions differ in **how data moves from HBM to shared memory** — which is the bottleneck.
-
-#### V1 and V2 — Software `cp.async` Pipeline
-
-V1 and V2 use the **same loading mechanism**: all threads cooperatively issue `cp.async.cg.shared.global` instructions (16-byte async copies from DRAM to shared memory, bypassing registers). Each thread loops over its portion of the tile: `for i = tid to tile_size/16 step blockDim`. Double-buffered K-tiles overlap loading with compute.
-
-The only difference is **tile size and occupancy**:
-
-| | V1 | V2 |
-|--|----|----|
-| **Threads** | 256 (8 warps) | 128 (4 warps) |
-| **Tile M×K** | 128×64 | 64×64 |
-| **Shared memory** | ~40 KB | ~20 KB |
-| **Blocks per SM** | 1 | 2-3 (`__launch_bounds__(128, 3)`) |
-| **Patch correction** | Fused in output write | Separate kernel |
-
-V1's large tile means only 1 block fits per SM — when it stalls waiting for data, the SM idles. V2 halves the tile so 2-3 blocks fit: when block A stalls, block B runs. This occupancy trick is the same approach ZipServ uses to reach 2.21x over cuBLAS.
-
-Both use `cp_async_commit()` / `cp_async_wait<N>()` for pipeline control and `__syncthreads()` for barrier synchronisation.
-
-#### V3 — Blackwell Hardware TMA
-
-V3 is a **fundamentally different architecture**, not just a tuning of V1/V2. It replaces the software `cp.async` pipeline with the Tensor Memory Accelerator (TMA) — dedicated hardware on SM90+/Blackwell GPUs that copies entire 2D tiles autonomously.
-
-**How TMA loading works:**
-
-1. **TMA descriptors** are created on the host via `cuTensorMapEncodeTiled()`, encoding the tensor's shape, strides, tile size, and swizzle pattern. Three descriptors: one each for sign-mantissa (64B swizzle), groups (32B swizzle), and activations (128B swizzle). Descriptors are copied to device memory once.
-
-2. **One elected thread** per warp (via `elect.sync` PTX) issues `cp.async.bulk.tensor.2d.shared::cluster.global.tile` — a single instruction that tells TMA hardware to copy an entire tile. The other 127 threads do nothing for loading; they're free for decode and compute.
-
-3. **Mbarrier synchronisation** replaces `__syncthreads()`. The elected thread calls `mbar_expect_tx(bytes)` to declare how many bytes are in flight. TMA hardware automatically signals the mbarrier (`mbarrier::complete_tx`) when the transfer finishes. Waiting threads spin on `mbar_wait(phase)` using hardware parity — lighter than software barriers.
-
-4. **Swizzle patterns** are applied automatically by TMA during the copy to eliminate shared memory bank conflicts. The trade-off: all subsequent shared memory reads must apply XOR-based address translation to compensate:
-   ```
-   // SM: 64B swizzle → per-row XOR offset
-   int swiz = ((row >> 1) & 3) << 4;
-   uint32_t val = *(sm + row * TILE_K + ((col & ~3) ^ swiz));
-
-   // B (activations): 128B swizzle
-   uint32_t val = *(B + row * TILE_K*2 + (byte_col ^ ((row & 7) << 4)));
-   ```
-
-5. **Two-stage pipeline** alternates between mbar0/mbar1 with phase toggling, overlapping TMA loads of the next tile with compute on the current tile.
-
-**Why V3 is fastest at B≥64:** TMA offloads all data movement to hardware. In V1/V2, threads spend cycles issuing `cp.async` loads and computing loop indices. In V3, threads spend 100% of their time on decode + `mma.sync`. At large B, the compute-to-load ratio is high enough for TMA's setup overhead (descriptors, elect_sync, mbarrier protocol) to pay off.
-
-#### Summary: V1 vs V2 vs V3
-
-| | **V1** | **V2** | **V3 (Blackwell TMA)** |
-|---|---|---|---|
-| **HBM → shared memory** | Software `cp.async` (16B chunks) | Software `cp.async` (16B chunks) | Hardware TMA (`cp.async.bulk.tensor.2d`) |
-| **Who loads data** | All 256 threads cooperate | All 128 threads cooperate | 1 elected thread issues TMA; hardware does the rest |
-| **Threads** | 256 (8 warps) | 128 (4 warps) | 128 (4 warps) |
-| **Tile M×K** | 128×64 | 64×64 | 64×64 |
-| **Shared memory** | ~40 KB | ~20 KB | ~22 KB |
-| **Blocks per SM** | 1 | 2-3 | 2 |
-| **Synchronisation** | `__syncthreads()` | `__syncthreads()` | Hardware mbarrier (parity-based, `mbar_wait`) |
-| **Bank conflict avoidance** | Manual padding (`OUT_PAD+1`) | Manual padding | TMA hardware swizzle (64B/32B/128B per tensor) |
-| **Shared mem reads** | Direct offset | Direct offset | XOR address translation (undo swizzle) |
-| **Patch correction** | Fused in output write | Separate kernel | Fused in output write |
-| **GPU requirement** | Any CUDA GPU | Any CUDA GPU | SM90+ (Hopper/Blackwell) |
-| **Best for** | Fallback / debug | B=16..63 | **B≥64 (default)** |
-
-### Auto-Selection
-
-| Batch Size | Kernel | Why |
-|:----------:|:-------|:----|
-| B=1 | Per-row multirow + batched patches | Bandwidth-bound; tensor cores can't help at B=1 |
-| B=4 | Per-row batch4 (inline escapes) | Still bandwidth-bound; per-row is simpler and fast |
-| B=8 | Per-row batch8 (inline escapes) | Transition zone; per-row wins by avoiding GEMM overhead |
-| B=16..63 | **V2** fused decode+GEMM | Enough columns to fill tensor cores; high occupancy wins |
-| B≥64 | **V3 TMA** fused decode+GEMM | TMA hardware loading frees all threads for compute |
-
-Override with `TURBO_KERNEL=1|2|3`.
-
-### Engine Kernels (`engine/kernels.hip`)
-
-Non-matvec kernels, portable across NVIDIA and AMD:
-
-| Kernel | What It Does |
-|--------|--------------|
-| `rms_norm_bf16_batch` | RMSNorm with warp-shuffle reduction, outputs BF16 directly (no separate conversion) |
-| `add_rms_norm_bf16_batch` | Residual add + RMSNorm → BF16 in one pass. Fused **across layers** — layer N's down-projection residual + layer N+1's attention norm in a single kernel (saves 31 launches per forward) |
-| `silu_mul_bf16_batch` | SiLU(gate) × up → BF16. Three ops fused into one kernel |
-| `rope_store_kv` | Applies RoPE rotation to Q and K, then stores K and V into the KV cache as BF16. One kernel instead of three |
-| `flash_attention` | Flash Attention v2 with online softmax. Constant 34 KB shared memory regardless of sequence length (tiles K/V in blocks of 128) |
-| `attention_all_heads` | Simpler attention for short sequences (< 1024 tokens). Loads full score vector into shared memory |
-| `argmax` | Batched greedy sampling — 1 block per sequence, shared memory tree reduction |
-
-All kernels compute in FP32 internally, convert to BF16 only at output boundaries.
+Override with `TURBO_KERNEL=1|2|3`. See [CLAUDE.md](CLAUDE.md) for full kernel internals.
 
 ---
 
