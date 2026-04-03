@@ -484,12 +484,13 @@ int nv_launch_split12_fused_gemm_async(
     return 0;
 }
 
-// Legacy cuBLAS path (kept for comparison, not production)
-static cublasHandle_t s_cublas_handle = nullptr;
-static cudaStream_t s_decode_stream = nullptr;
-static cudaEvent_t s_decode_done = nullptr;
-static cudaEvent_t s_gemm_done = nullptr;
-static int s_ping = 0;
+// Legacy cuBLAS path — per-device handles for TP support
+static constexpr int MAX_GPUS = 8;
+static cublasHandle_t s_cublas_handle[MAX_GPUS] = {};
+static cudaStream_t s_decode_stream[MAX_GPUS] = {};
+static cudaEvent_t s_decode_done[MAX_GPUS] = {};
+static cudaEvent_t s_gemm_done[MAX_GPUS] = {};
+static int s_ping[MAX_GPUS] = {};
 
 __launch_bounds__(256)
 __global__ void nv_decode_split12_to_bf16(
@@ -516,31 +517,32 @@ int nv_launch_split12_cublas_batch_async(
     int M, int K, int B, void* stream)
 {
     cudaStream_t s = (cudaStream_t)stream;
-    if (!s_decode_stream) {
-        cudaStreamCreateWithFlags(&s_decode_stream, cudaStreamNonBlocking);
-        cudaEventCreateWithFlags(&s_decode_done, cudaEventDisableTiming);
-        cudaEventCreateWithFlags(&s_gemm_done, cudaEventDisableTiming);
+    int dev = 0; cudaGetDevice(&dev);
+    if (!s_decode_stream[dev]) {
+        cudaStreamCreateWithFlags(&s_decode_stream[dev], cudaStreamNonBlocking);
+        cudaEventCreateWithFlags(&s_decode_done[dev], cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&s_gemm_done[dev], cudaEventDisableTiming);
     }
-    if (!s_cublas_handle) cublasCreate(&s_cublas_handle);
+    if (!s_cublas_handle[dev]) cublasCreate(&s_cublas_handle[dev]);
 
     __nv_bfloat16* buf0 = (__nv_bfloat16*)bf16_weight_buf;
-    __nv_bfloat16* cur_buf = s_ping ? (buf0 + buf_half_elems) : buf0;
+    __nv_bfloat16* cur_buf = s_ping[dev] ? (buf0 + buf_half_elems) : buf0;
 
-    cudaStreamWaitEvent(s_decode_stream, s_gemm_done, 0);
+    cudaStreamWaitEvent(s_decode_stream[dev], s_gemm_done[dev], 0);
     int total = M * K, threads = 256, blocks = (total + threads - 1) / threads;
-    nv_decode_split12_to_bf16<<<blocks, threads, 0, s_decode_stream>>>(
+    nv_decode_split12_to_bf16<<<blocks, threads, 0, s_decode_stream[dev]>>>(
         (const uint8_t*)sign_mantissa, (const uint8_t*)groups, base_exp,
         cur_buf, M, K);
-    cudaEventRecord(s_decode_done, s_decode_stream);
-    cudaStreamWaitEvent(s, s_decode_done, 0);
+    cudaEventRecord(s_decode_done[dev], s_decode_stream[dev]);
+    cudaStreamWaitEvent(s, s_decode_done[dev], 0);
 
-    cublasSetStream(s_cublas_handle, s);
+    cublasSetStream(s_cublas_handle[dev], s);
     float alpha = 1.0f, beta = 0.0f;
-    cublasGemmEx(s_cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, M, B, K, &alpha,
+    cublasGemmEx(s_cublas_handle[dev], CUBLAS_OP_T, CUBLAS_OP_N, M, B, K, &alpha,
         cur_buf, CUDA_R_16BF, K, activations, CUDA_R_16BF, act_stride, &beta,
         output, CUDA_R_32F, out_stride, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    cudaEventRecord(s_gemm_done, s);
-    s_ping ^= 1;
+    cudaEventRecord(s_gemm_done[dev], s);
+    s_ping[dev] ^= 1;
     return 0;
 }
 

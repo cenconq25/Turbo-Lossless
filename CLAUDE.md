@@ -89,28 +89,32 @@ CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./turbo-engine <model_dir> "<prompt>" <max_t
 | B=128 | 2110.8 | ~10.5 GB | vLLM OOM |
 | **B=256** | **2470.7** | **~10.5 GB** | **vLLM OOM** |
 
-### 2x RTX 5070 Ti (TP=2, NCCL over PCIe 5.0) — Measured 2026-04-03
+### 2x RTX 5070 Ti (TP=2, NCCL over PCIe 5.0) — Measured 2026-04-02
+
+Uses `forward_batch_tiled` with V3 TMA tensor cores at B>=16. Max batch: B=48 (Mistral) / B=32 (Llama) due to 16 GB VRAM.
 
 #### Mistral 7B (TP=2 vs 1-GPU)
 
-| Batch | 1-GPU | TP=2 | Speedup | Winner |
-|------:|------:|-----:|--------:|:------:|
-| B=1 | 60.0 | **93.1** | **1.55x** | TP=2 |
-| B=8 | 162.6 | **261.9** | **1.61x** | TP=2 |
-| B=16 | 673.1 | 263.8 | 0.39x | 1-GPU |
-| B=256 | 2553.5 | 264.3 | 0.10x | 1-GPU |
+| Batch | 1-GPU | TP=2 | Kernel | Speedup | Winner |
+|------:|------:|-----:|:------:|--------:|:------:|
+| B=1 | 60.0 | **90.8** | V2 | **1.51x** | TP=2 |
+| B=4 | — | **187.6** | V2 | — | TP=2 |
+| B=8 | 162.6 | **256.7** | V2 | **1.58x** | TP=2 |
+| B=16 | 673.1 | **746.4** | V3 TMA | **1.11x** | TP=2 |
+| B=32 | 1136.3 | **1082.7** | V3 TMA | 0.95x | 1-GPU |
+| B=48 | — | **1292.5** | V3 TMA | — | TP=2 (max) |
 
 #### Llama 3.1 8B (TP=2 vs 1-GPU)
 
-| Batch | 1-GPU | TP=2 | Speedup | Winner |
-|------:|------:|-----:|--------:|:------:|
-| B=1 | 57.0 | **86.3** | **1.51x** | TP=2 |
-| B=8 | 154.3 | **242.1** | **1.57x** | TP=2 |
-| B=16 | 627.5 | 243.8 | 0.39x | 1-GPU |
-| B=256 | 2470.7 | 248.5 | 0.10x | 1-GPU |
+| Batch | 1-GPU | TP=2 | Kernel | Speedup | Winner |
+|------:|------:|-----:|:------:|--------:|:------:|
+| B=1 | 57.0 | **86.8** | V2 | **1.52x** | TP=2 |
+| B=4 | 113.5 | **176.6** | V2 | **1.56x** | TP=2 |
+| B=8 | 154.3 | **243.1** | V2 | **1.58x** | TP=2 |
+| B=16 | 627.5 | **686.3** | V3 TMA | **1.09x** | TP=2 |
+| B=32 | 1068.6 | **1008.7** | V3 TMA | 0.94x | ~tied |
 
-**TP=2 wins at B<=8** (1.5-1.6x). **1-GPU wins at B>=16** (uses V3 TMA tensor cores).
-TP=2 currently uses B=8 slicing (no tensor cores). Future: TP-aware `forward_batch_tiled`.
+**TP=2 wins at B<=16** (1.1-1.6x) now that tensor cores are active. **~tied at B=32.**
 VRAM per GPU: ~6 GB (half model). Enables 13B+ models on 2x 16 GB.
 
 ### MI50 32GB (AMD GCN, 1.0 TB/s)
@@ -127,7 +131,7 @@ VRAM per GPU: ~6 GB (half model). Enables 13B+ models on 2x 16 GB.
 
 | Model | tok/s B=1 (RTX 5070 Ti) | tok/s B=1 (MI50) | Tokenizer | Status |
 |-------|------------------------:|-----------------:|-----------|--------|
-| Mistral 7B Instruct | 60.0 (93.1 TP=2) | 32.6 | sentencepiece | Production (V2+V3+TP) |
+| Mistral 7B Instruct | 60.0 (90.8 TP=2) | 32.6 | sentencepiece | Production (V2+V3+TP) |
 | Llama 3.1 8B Instruct | 57.0 | 31.8 | HF BPE | Production (V2+V3) |
 
 ### Compression

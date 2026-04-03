@@ -121,40 +121,37 @@ The VRAM jump at B>=64 is cuBLAS workspace (~1.5 GB), allocated lazily when `for
 
 ### Multi-GPU: 2x RTX 5070 Ti (TP=2, NCCL over PCIe 5.0)
 
+Now uses `forward_batch_tiled` with V3 TMA tensor cores at B>=16. Max batch limited by 16 GB per-GPU VRAM: B=48 (Mistral), B=32 (Llama).
+
 #### Mistral 7B Instruct — TP=2 vs Single-GPU
 
-| Batch | 1 GPU tok/s | TP=2 tok/s | TP Speedup | Best Choice |
-|------:|------------:|-----------:|-----------:|:-----------:|
-| B=1 | 60.0 | **93.1** | **1.55x** | TP=2 |
-| B=4 | — | **188.2** | — | TP=2 |
-| B=8 | 162.6 | **261.9** | **1.61x** | TP=2 |
-| B=16 | 673.1 | 263.8 | 0.39x | 1 GPU |
-| B=32 | 1136.3 | 264.9 | 0.23x | 1 GPU |
-| B=64 | 1514.2 | 262.9 | 0.17x | 1 GPU |
-| B=128 | 2196.6 | 264.5 | 0.12x | 1 GPU |
-| B=256 | 2553.5 | 264.3 | 0.10x | 1 GPU |
+| Batch | 1 GPU tok/s | TP=2 tok/s | TP=2 per user | Kernel | TP Speedup | Best Choice |
+|------:|------------:|-----------:|--------------:|:------:|-----------:|:-----------:|
+| B=1 | 60.0 | **90.8** | 90.8 | V2 | **1.51x** | TP=2 |
+| B=4 | — | **187.6** | 46.9 | V2 | — | TP=2 |
+| B=8 | 162.6 | **256.7** | 32.1 | V2 | **1.58x** | TP=2 |
+| B=16 | 673.1 | **746.4** | 46.6 | V3 TMA | **1.11x** | TP=2 |
+| B=32 | 1136.3 | **1082.7** | 33.8 | V3 TMA | 0.95x | 1 GPU |
+| B=48 | — | **1292.5** | 26.9 | V3 TMA | — | TP=2 (max) |
 
 #### Llama 3.1 8B Instruct — TP=2 vs Single-GPU
 
-| Batch | 1 GPU tok/s | TP=2 tok/s | TP Speedup | Best Choice |
-|------:|------------:|-----------:|-----------:|:-----------:|
-| B=1 | 57.0 | **86.3** | **1.51x** | TP=2 |
-| B=4 | 113.5 | **176.3** | **1.55x** | TP=2 |
-| B=8 | 154.3 | **242.1** | **1.57x** | TP=2 |
-| B=16 | 627.5 | 243.8 | 0.39x | 1 GPU |
-| B=32 | 1068.6 | 225.9 | 0.21x | 1 GPU |
-| B=64 | 1438.6 | 123.4 | 0.09x | 1 GPU |
-| B=128 | 2110.8 | 112.8 | 0.05x | 1 GPU |
-| B=256 | 2470.7 | 248.5 | 0.10x | 1 GPU |
+| Batch | 1 GPU tok/s | TP=2 tok/s | TP=2 per user | Kernel | TP Speedup | Best Choice |
+|------:|------------:|-----------:|--------------:|:------:|-----------:|:-----------:|
+| B=1 | 57.0 | **86.8** | 86.8 | V2 | **1.52x** | TP=2 |
+| B=4 | 113.5 | **176.6** | 44.2 | V2 | **1.56x** | TP=2 |
+| B=8 | 154.3 | **243.1** | 30.4 | V2 | **1.58x** | TP=2 |
+| B=16 | 627.5 | **686.3** | 42.9 | V3 TMA | **1.09x** | TP=2 |
+| B=32 | 1068.6 | **1008.7** | 31.5 | V3 TMA | 0.94x | ~tied |
 
 **When to use TP=2:**
 - **B=1 to B=8 (latency):** TP=2 is 1.5-1.6x faster. Best for interactive single-user or small-batch serving.
-- **B>=16 (throughput):** Single-GPU is massively faster because it uses V3 TMA tensor cores via `forward_batch_tiled`. TP=2 currently falls back to B=8 slicing (per-row kernels) which doesn't scale.
+- **B=16 (sweet spot):** TP=2 now uses V3 TMA tensor cores and slightly beats single-GPU (~1.1x). Good balance of throughput and per-user latency.
+- **B=32+ (throughput):** Single-GPU matches or slightly beats TP=2. Use single-GPU unless you need the extra VRAM headroom.
+- **B=48 (Mistral) / B=32 (Llama):** Maximum TP=2 batch before OOM on 16 GB cards. TP=2 is the only option at B=48.
 - **Large models:** TP=2 halves VRAM per GPU (~6 GB vs ~11 GB), enabling 13B+ models on 2x 16 GB cards.
 
 **Architecture:** Each GPU holds half the attention heads (16/32) and half the FFN (7168/14336). NCCL all-reduce after wo and w_down — 64 NCCL calls per token. PCIe 5.0 x8, SHM/direct transport, ~0.5 ms overhead at B=1.
-
-**Future optimization:** Implement TP-aware `forward_batch_tiled` with grouped NCCL all-reduce to unlock tensor core throughput at B>=16.
 
 ### MI50 32GB (AMD GCN, 1.0 TB/s)
 
