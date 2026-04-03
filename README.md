@@ -55,15 +55,14 @@ All methods exploit the same observation: BF16 exponents have ~2.6 bits of entro
 | **NeuZip** | arXiv'24 | ~10.6 | ANS | No | Also supports training |
 | **Huff-LLM** | arXiv'25 | ~11.6 | CAM | ASIC only | Custom silicon, not GPU |
 
-**Key differences from other approaches:**
-- We use 4-bit fixed group codes (15 exponents, 0.03% escapes); they use 3-bit bitmap codewords (7 exponents, ~3% escapes)
-- We store in two byte-aligned arrays (Split12); they use triple 64-bit bitmaps per 8×8 tile
-- We decode with 1 integer ADD; they decode with bitmap extract + popcount
-- We support AMD + NVIDIA; they are NVIDIA-only (Ampere+)
-- We compress to 12.0 bits (fixed); they compress to ~11.3 bits (variable)
-- They achieve ~1.41x compression; we achieve 1.33x — the tradeoff is simpler decode and lower escape rate
+**How Turbo differs:**
+- **vs ZipServ** — We use fixed 4-bit groups (15 exponents, 0.03% escapes) vs their 3-bit bitmap codewords (7 exponents, ~3% escapes). We store in byte-aligned arrays; they use tile-structured bitmaps. We decode with 1 ADD; they need bitmap+popcount. We support AMD + NVIDIA; they are NVIDIA-only. They compress ~8% more (11.3 vs 12.0 bits) at the cost of more complex decode.
+- **vs DFloat11** — They use variable-length Huffman codes which break GPU parallelism (40% slower than BF16 at B=1). We use fixed-length encoding that matches BF16 speed at B=1. They compress slightly more (~11 bits) but cannot fuse with GEMM.
+- **vs ZipNN** — CPU-only compression for storage/transfer. No GPU decode, no VRAM savings during inference. Complementary, not competitive.
+- **vs NeuZip** — ANS entropy coding with significant decode overhead. Also supports training (unique), but inference is slower than BF16.
+- **vs Huff-LLM** — Custom ASIC design, not deployable on commodity GPUs.
 
-Both are **independently conceived** approaches to the same well-known observation (BF16 exponent redundancy, documented since 2024 by ZipNN, DFloat11, NeuZip).
+All approaches exploit the same well-known observation: BF16 exponent redundancy (~2.6 bits entropy in 8-bit field), documented independently by multiple groups since 2024.
 
 ### The Storage (Split12)
 
