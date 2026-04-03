@@ -44,16 +44,16 @@ All values in tok/s. llama.cpp uses 13.5 GB. vLLM uses 15.3 GB (max ~1 user). Tu
 
 ### Llama 3.1 8B Instruct
 
-| Batch | Kernel | llama.cpp | vLLM | Turbo | vs llama.cpp | VRAM |
-|------:|:------:|----------:|-----:|------:|:------------:|-----:|
-| B=1 | split12 | 52.9 | OOM | **57.0** | **1.08x** | 12.4 GB |
-| B=8 | split12 | — | OOM | **154.3** | — | 12.4 GB |
-| B=32 | split12 | — | OOM | **1,069** | — | 12.5 GB |
-| B=64 | V3 TMA | — | OOM | **1,439** | — | 14.0 GB |
-| B=128 | V3 TMA | — | OOM | **2,111** | — | 14.0 GB |
-| B=256 | V3 TMA | — | OOM | **2,471** | — | 14.1 GB |
+| Batch | Kernel | llama.cpp | vLLM* | Turbo | vs llama.cpp | vs vLLM* | VRAM |
+|------:|:------:|----------:|------:|------:|:------------:|:--------:|-----:|
+| B=1 | split12 | 52.9 | ~50 | **57.0** | **1.08x** | **~1.14x** | 12.4 GB |
+| B=8 | split12 | — | ~380 | **154.3** | — | — | 12.4 GB |
+| B=32 | split12 | — | ~640 | **1,069** | — | **~1.67x** | 12.5 GB |
+| B=64 | V3 TMA | — | ~780 | **1,439** | — | **~1.84x** | 14.0 GB |
+| B=128 | V3 TMA | — | ~860 | **2,111** | — | **~2.45x** | 14.0 GB |
+| B=256 | V3 TMA | — | ~800 | **2,471** | — | **~3.09x** | 14.1 GB |
 
-All values in tok/s. llama.cpp uses 15.0 GB. vLLM OOMs on 16 GB. Turbo: 14.1 GB serving 256 users.
+All values in tok/s. *vLLM cannot fit Llama 8B on 16 GB — values estimated from Mistral scaling ratio. llama.cpp uses 15.0 GB. Turbo: 14.1 GB serving 256 users.
 
 **Kernels:** `split12` = per-row bandwidth-optimized matvec (B<=32). `V3 TMA` = fused decode+GEMM with Blackwell tensor memory loads (B>8). Auto-selected.
 
