@@ -353,7 +353,26 @@ static std::string bpe_token_to_text(HFTokenizer* hf, const std::string& token) 
 std::string detokenize_one(Tokenizer* tok, int token) {
     if (tok->type == 0) {
         auto* sp = (sentencepiece::SentencePieceProcessor*)tok->sp_model;
-        return sp->IdToPiece(token);
+        std::string piece = sp->IdToPiece(token);
+        // Convert sentencepiece representation to readable text
+        std::string result;
+        size_t i = 0;
+        while (i < piece.size()) {
+            if (piece[i] == '\xe2' && i + 2 < piece.size() &&
+                piece[i+1] == '\x96' && piece[i+2] == '\x81') {
+                result += ' ';  // U+2581 (▁) → space
+                i += 3;
+            } else if (piece[i] == '<' && i + 5 < piece.size() &&
+                       piece[i+1] == '0' && piece[i+2] == 'x') {
+                size_t end = piece.find('>', i);
+                if (end != std::string::npos) {
+                    std::string hex = piece.substr(i + 3, end - i - 3);
+                    result += (char)strtol(hex.c_str(), nullptr, 16);
+                    i = end + 1;
+                } else { result += piece[i++]; }
+            } else { result += piece[i++]; }
+        }
+        return result;
     } else {
         auto* hf = (HFTokenizer*)tok->sp_model;
         auto it = hf->id_to_token.find(token);

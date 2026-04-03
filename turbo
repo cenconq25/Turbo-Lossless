@@ -1,0 +1,291 @@
+#!/bin/bash
+set -e
+
+BOLD='\033[1m'
+DIM='\033[2m'
+CYAN='\033[36m'
+GREEN='\033[32m'
+YELLOW='\033[33m'
+RED='\033[31m'
+WHITE='\033[97m'
+RESET='\033[0m'
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ENGINE="$SCRIPT_DIR/engine/turbo-engine"
+
+show_banner() {
+    clear
+    echo ""
+    echo -e "${CYAN}${BOLD}"
+    cat << 'BANNER'
+  ████████╗██╗   ██╗██████╗ ██████╗  ██████╗
+  ╚══██╔══╝██║   ██║██╔══██╗██╔══██╗██╔═══██╗
+     ██║   ██║   ██║██████╔╝██████╔╝██║   ██║
+     ██║   ██║   ██║██╔══██╗██╔══██╗██║   ██║
+     ██║   ╚██████╔╝██║  ██║██████╔╝╚██████╔╝
+     ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═════╝  ╚═════╝
+BANNER
+    echo -e "${RESET}"
+    echo -e "  ${WHITE}BF16 → 12-bit lossless  •  Decode with 1 ADD${RESET}"
+    echo -e "  ${DIM}1.33x smaller  •  2.93x faster  •  Zero precision loss${RESET}"
+    echo ""
+}
+
+ok()   { echo -e "  ${GREEN}✓${RESET} $1"; }
+warn() { echo -e "  ${YELLOW}!${RESET} $1"; }
+fail() { echo -e "  ${RED}✗${RESET} $1"; exit 1; }
+
+detect_gpu() {
+    if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
+        GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader -i 0 2>/dev/null | head -1)
+        GPU_VRAM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i 0 2>/dev/null | head -1)
+        GPU_TYPE="nvidia"
+        ok "GPU: ${BOLD}$GPU_NAME${RESET} ($GPU_VRAM MiB)"
+    elif command -v rocm-smi &>/dev/null; then
+        GPU_TYPE="amd"
+        ok "GPU: ${BOLD}AMD (ROCm)${RESET}"
+    else
+        fail "No GPU detected."
+    fi
+}
+
+check_deps() {
+    [ -f "$ENGINE" ] && return
+    local missing=()
+    command -v gcc &>/dev/null || missing+=("gcc → sudo apt install build-essential")
+    command -v python3 &>/dev/null || missing+=("python3 → sudo apt install python3")
+    if [ "$GPU_TYPE" = "nvidia" ]; then
+        local nv=$(command -v nvcc 2>/dev/null || find /usr/local/cuda*/bin -name nvcc 2>/dev/null | head -1)
+        [ -z "$nv" ] && missing+=("nvcc → sudo apt install nvidia-cuda-toolkit")
+    fi
+    if ! ldconfig -p 2>/dev/null | grep -q libsentencepiece; then
+        missing+=("libsentencepiece-dev → sudo apt install libsentencepiece-dev")
+    fi
+    if [ ${#missing[@]} -gt 0 ]; then
+        warn "Missing:"
+        for d in "${missing[@]}"; do echo -e "    ${RED}•${RESET} $d"; done
+        fail "Install the above and try again."
+    fi
+}
+
+build_engine() {
+    [ -f "$ENGINE" ] && { ok "Engine: ready"; return; }
+    echo -ne "  ${DIM}Building engine...${RESET}"
+    cd "$SCRIPT_DIR"
+    [ ! -f split12_pack.so ] && gcc -O3 -shared -fPIC -o split12_pack.so split12_pack.c 2>/dev/null
+    cd engine
+    ln -sf kernels.hip kernels.cu 2>/dev/null
+    ln -sf ../decompress_v2.hip decompress_v2.cu 2>/dev/null
+    if [ "$GPU_TYPE" = "nvidia" ]; then
+        local NVCC=$(command -v nvcc 2>/dev/null || find /usr/local/cuda*/bin -name nvcc 2>/dev/null | sort -V | tail -1)
+        local ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i 0 2>/dev/null | head -1 | tr -d '.')
+        $NVCC -O3 -arch=sm_${ARCH:-80} -I.. -o turbo-engine \
+            main.cpp model.cpp inference.cpp tokenizer.cpp sampler.cpp \
+            kernels.cu decompress_v2.cu ../nvidia_kernels.cu ../nvidia_kernels_v3.cu \
+            -lcublas -lsentencepiece -lcuda -std=c++17 2>/dev/null || fail "Build failed."
+    else
+        /opt/rocm/bin/hipcc -O3 --offload-arch=gfx906 -o turbo-engine \
+            main.cpp model.cpp inference.cpp tokenizer.cpp sampler.cpp \
+            kernels.hip ../decompress_v2.hip -lhipblas -lsentencepiece -std=c++17 2>/dev/null || fail "Build failed."
+    fi
+    cd "$SCRIPT_DIR"
+    echo -ne "\r\033[K"
+    ok "Engine: built"
+}
+
+find_model() {
+    MODEL_DIR="$1"
+    if [ -f "$MODEL_DIR/config.bin" ] && ls "$MODEL_DIR"/*.sm.bin &>/dev/null 2>&1; then
+        local sm_bytes=$(du -sbc "$MODEL_DIR"/*.sm.bin 2>/dev/null | tail -1 | awk '{print $1}')
+        local gr_bytes=$(du -sbc "$MODEL_DIR"/*.gr.bin 2>/dev/null | tail -1 | awk '{print $1}')
+        local comp_gb=$(echo "scale=1; ($sm_bytes + $gr_bytes) / 1073741824" | bc 2>/dev/null || echo "?")
+        local bf16_gb=$(echo "scale=1; $comp_gb * 1.33" | bc 2>/dev/null || echo "?")
+        local saved_gb=$(echo "scale=1; $bf16_gb - $comp_gb" | bc 2>/dev/null || echo "?")
+        ok "Model: ${BOLD}$(basename $MODEL_DIR)${RESET}"
+        ok "VRAM: ${comp_gb} GB compressed (${GREEN}saving ~${saved_gb} GB${RESET} vs ${bf16_gb} GB BF16)"
+        return
+    fi
+    local HF_DIR="${MODEL_DIR%-turbo}"
+    if [ -f "$HF_DIR/config.json" ]; then
+        echo -ne "  ${DIM}Converting $(basename $HF_DIR)...${RESET}"
+        python3 "$SCRIPT_DIR/engine/convert_model.py" "$HF_DIR" "$MODEL_DIR" 2>/dev/null || fail "Conversion failed"
+        for f in tokenizer.model tokenizer.json tokenizer_config.json vocab.bin merges.bin byte_encoder.bin; do
+            cp "$HF_DIR/$f" "$MODEL_DIR/" 2>/dev/null; done
+        echo -ne "\r\033[K"
+        ok "Model: converted"
+        return
+    fi
+    fail "Model not found: $MODEL_DIR"
+}
+
+wrap_prompt() {
+    local name=$(basename "$1" | tr '[:upper:]' '[:lower:]')
+    local p="$2"
+    [[ "$p" == *"[INST]"* ]] || [[ "$p" == *"<|"* ]] && { echo "$p"; return; }
+    [[ "$name" == *"mistral"* ]] || [[ "$name" == *"llama-2"* ]] || [[ "$name" == *"llama2"* ]] && { echo "[INST] $p [/INST]"; return; }
+    echo "$p"
+}
+
+show_response() {
+    local prompt="$1" out="$2" show_prompt="${3:-yes}"
+    local text=$(echo "$out" | sed -n '/^Generating\.\.\.$/,/^--- Stats ---$/p' | sed '1d;$d')
+    local speed=$(echo "$out" | grep "Decode speed" | grep -oP '[\d.]+' | head -1)
+    local tokens=$(echo "$out" | grep "Generated tokens" | grep -oP '\d+')
+    local time=$(echo "$out" | grep "Total time" | grep -oP '[\d.]+')
+
+    if [ "$show_prompt" = "yes" ]; then
+        echo -e "  ${GREEN}${BOLD}▶${RESET} ${BOLD}$prompt${RESET}"
+        echo ""
+    fi
+    text=$(echo "$text" | sed 's/\[\/\?INST[]\?]//g; s/\[INST//g; s/\[\/INST//g')
+    text=$(echo "$text" | sed '/./,$!d')
+    text=$(echo "$text" | sed 's/^[[:space:]]*//')
+    if [ -n "$text" ]; then
+        echo -e "  ${CYAN}turbo${RESET}"
+        echo ""
+        echo "$text" | while IFS= read -r line; do echo "  $line"; done
+    else
+        echo -e "  ${DIM}(no output)${RESET}"
+    fi
+    echo ""
+    echo -e "  ${DIM}─────────────────────────────────────${RESET}"
+    echo -e "  ${DIM}${tokens:-?} tokens  •  ${speed:-?} tok/s  •  ${time:-?}s${RESET}"
+}
+
+run_single() {
+    local model="$1" prompt="$2" max="${3:-200}" batch="${4:-1}"
+    local wrapped=$(wrap_prompt "$model" "$prompt")
+    echo ""
+    local t0=$(date +%s)
+    local tmp=$(mktemp)
+    TURBO_FAST=1 "$ENGINE" "$model" "$wrapped" "$max" "$batch" >"$tmp" 2>/dev/null &
+    local pid=$!
+    while kill -0 $pid 2>/dev/null; do
+        echo -ne "\r  ${DIM}Loading model... $(( $(date +%s) - t0 ))s${RESET}\033[K"
+        sleep 1
+    done
+    wait $pid 2>/dev/null
+    echo -ne "\r\033[K"
+    show_response "$prompt" "$(cat "$tmp")"
+    rm -f "$tmp"
+}
+
+interactive() {
+    # Persistent mode: model loads ONCE, stays in VRAM
+    local model="$1" max="${MAX_TOKENS:-200}"
+    echo ""
+    local t0=$(date +%s)
+
+    # Start engine in --interactive mode (reads prompts from stdin, model stays loaded)
+    local fifo_in=$(mktemp -u) fifo_out=$(mktemp -u)
+    mkfifo "$fifo_in" "$fifo_out"
+
+    # stdbuf forces line-buffered stdout so progress lines arrive immediately through the fifo
+    TURBO_FAST=1 stdbuf -oL "$ENGINE" "$model" --interactive "$max" < "$fifo_in" > "$fifo_out" 2>/dev/null &
+    local epid=$!
+    exec 3>"$fifo_in"
+    exec 4<"$fifo_out"
+
+    # Wait for "Model loaded." — show progress bar from layer loading lines
+    local n_layers=0 loaded=0
+    while IFS= read -r line <&4; do
+        # Parse "  Config: ... layers=N ..."
+        if [[ "$line" =~ layers=([0-9]+) ]]; then
+            n_layers="${BASH_REMATCH[1]}"
+        fi
+        # Parse "  Loaded layer N/M"
+        if [[ "$line" =~ "Loaded layer "([0-9]+)/([0-9]+) ]]; then
+            loaded="${BASH_REMATCH[1]}"
+            n_layers="${BASH_REMATCH[2]}"
+            if [ "$n_layers" -gt 0 ]; then
+                local pct=$(( loaded * 100 / n_layers ))
+                local bar_len=30
+                local filled=$(( pct * bar_len / 100 ))
+                local empty=$(( bar_len - filled ))
+                local bar=$(printf "%${filled}s" | tr ' ' '#')$(printf "%${empty}s" | tr ' ' '-')
+                echo -ne "\r  ${CYAN}${bar}${RESET} ${DIM}${pct}% (${loaded}/${n_layers} layers)${RESET}\033[K"
+            fi
+        fi
+        [[ "$line" == "Model loaded." ]] && break
+    done
+    echo -ne "\r\033[K"
+    ok "Model loaded in $(( $(date +%s) - t0 ))s — ${n_layers} layers in VRAM"
+
+    echo ""
+    echo -e "  ${DIM}Type your prompt. ${YELLOW}quit${RESET}${DIM} to exit.${RESET}"
+
+    cleanup_engine() {
+        echo "quit" >&3 2>/dev/null
+        exec 3>&- 2>/dev/null
+        exec 4<&- 2>/dev/null
+        wait $epid 2>/dev/null
+        rm -f "$fifo_in" "$fifo_out"
+    }
+    trap cleanup_engine EXIT
+    trap 'cleanup_engine; exit 0' INT TERM
+
+    while true; do
+        echo ""
+        echo -ne "  ${GREEN}${BOLD}▶${RESET} "
+        read -r input
+        [ "$input" = "quit" ] || [ "$input" = "exit" ] || [ "$input" = "q" ] && break
+        [ -z "$input" ] && continue
+
+        local wrapped=$(wrap_prompt "$model" "$input")
+        echo "$wrapped" >&3
+
+        # Collect response until "--- READY ---"
+        local resp=""
+        while IFS= read -r line <&4; do
+            [[ "$line" == "--- READY ---" ]] && break
+            resp+="$line"$'\n'
+        done
+
+        echo ""
+        show_response "$input" "$resp" "no"
+    done
+
+    echo -e "\n  ${DIM}Goodbye.${RESET}\n"
+}
+
+usage() {
+    echo -e "  ${BOLD}Usage:${RESET}"
+    echo -e "    ./turbo <model> \"<prompt>\" [tokens] [batch]"
+    echo -e "    ./turbo <model> -i"
+    echo ""
+    echo -e "  ${BOLD}Examples:${RESET}"
+    echo -e "    ./turbo models/mistral-7b-instruct-turbo \"What is AI?\" 100"
+    echo -e "    ./turbo models/mistral-7b-instruct-turbo -i"
+    echo ""
+    exit 0
+}
+
+# ─── Main ───
+show_banner
+[ $# -lt 1 ] && usage
+
+MODEL_DIR="$1"; shift
+INTERACTIVE=false; PROMPT=""; MAX_TOKENS=200; BATCH=1
+
+if [ "${1:-}" = "-i" ] || [ "${1:-}" = "--interactive" ]; then
+    INTERACTIVE=true; shift
+elif [ -n "${1:-}" ]; then
+    PROMPT="$1"; shift
+    [ -n "${1:-}" ] && MAX_TOKENS="$1" && shift
+    [ -n "${1:-}" ] && BATCH="$1" && shift
+else
+    INTERACTIVE=true
+fi
+
+detect_gpu
+check_deps
+build_engine
+find_model "$MODEL_DIR"
+
+if $INTERACTIVE; then
+    interactive "$MODEL_DIR"
+else
+    [ -z "$PROMPT" ] && fail "No prompt. Use -i for interactive."
+    run_single "$MODEL_DIR" "$PROMPT" "$MAX_TOKENS" "$BATCH"
+    echo ""
+fi
