@@ -9,3 +9,6 @@ test_model.*
 llama.cpp/
 engine/turbo-engine
 .cu symlinks
+__pycache__/
+*.pyc
+build/

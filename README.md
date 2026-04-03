@@ -1,11 +1,10 @@
 # Turbo Lossless: BF16 Compression Engine
 
-100% bit-perfect lossless compression for BF16 LLM weights. BF16 in, BF16 out — no precision loss, 1.33x smaller VRAM. Tested on a single NVIDIA RTX 5070 Ti 16 GB.
+100% bit-perfect lossless compression for BF16 LLM weights. BF16 in, BF16 out — no precision loss, 1.33x smaller VRAM. Proof-of-concept tested on a single NVIDIA RTX 5070 Ti 16 GB.
 
-**Highlights:**
 - Runs **Llama 3.1 8B on 16 GB** where vLLM OOMs
 - **2.93x faster** than vLLM at B=256 (Mistral 7B)
-- **~4,500 lines** of C++/CUDA, no Python runtime
+- **~4,750 lines** of C++/CUDA, no Python runtime
 
 **BF16 safetensors only.** No GGUF, no FP16, no FP32, no quantized formats.
 
@@ -13,41 +12,35 @@
 
 ## How It Works
 
-LLM inference is memory-bandwidth bound. A 7B model reads ~14 GB of BF16 weights per token. Quantization (INT4/INT8) reduces this but destroys precision.
-
-**Our insight:** BF16 has 8-bit exponent but only uses ~40 of 256 values. 15 consecutive exponents cover **99.97%** of all weights. We replace the 8-bit exponent with a 4-bit group code:
+BF16 weights have sparse exponents — only ~40 of 256 possible values are used, and 15 consecutive exponents cover 99.97%. We replace the 8-bit exponent with a 4-bit group code:
 
 ```
-Original BF16:  [sign 1][exponent 8][mantissa 7]  = 16 bits
-Turbo 12-bit:   [group 4][sign 1][mantissa 7]     = 12 bits
+BF16:        [sign 1][exponent 8][mantissa 7]  = 16 bits
+Turbo 12-bit: [group 4][sign 1][mantissa 7]    = 12 bits
 
 Decode: exponent = BaseExp + group  (one integer ADD)
 ```
 
-**1.33x compression, zero information loss.** The 0.03% of values outside the 15-exponent window are stored exactly in a tiny CSR escape table.
-
-Stored as two byte-aligned arrays (Split12 format) for zero HBM read amplification:
-- Array 1: `[sign][mantissa]` = 1 byte/element
-- Array 2: `[group]` = 0.5 byte/element (nibble-packed)
+**1.33x compression, zero information loss.** The 0.03% of outlier values are stored exactly in a small CSR escape table (~3 MB for 7B model). Stored as two byte-aligned arrays for zero HBM read amplification.
 
 ---
 
-## Benchmarks (Single GPU: RTX 5070 Ti 16 GB)
+## Benchmarks
 
-All benchmarks measured with 200-token generation, output verified coherent.
+**Hardware:** Single GPU — NVIDIA RTX 5070 Ti 16 GB (Blackwell, 896 GB/s). All results with 200-token generation, output verified coherent.
 
 ### Mistral 7B Instruct
 
-| Batch | Kernel | vLLM BF16 | Turbo 12-bit | vs vLLM | VRAM |
-|------:|:------:|----------:|-------------:|:-------:|-----:|
-| B=1 | split12 | 54.7 tok/s | **60.0 tok/s** | **1.10x** | 11.1 GB |
+| Batch | Kernel | vLLM BF16 | Turbo 12-bit | Speedup | VRAM |
+|------:|:------:|----------:|-------------:|--------:|-----:|
+| B=1 | split12 | 54.7 tok/s | **60.0** | 1.10x | 11.1 GB |
 | B=8 | split12 | 414.6 | **162.6** | — | 11.1 GB |
-| B=32 | split12 | 694.2 | **1,136** | **1.64x** | 11.2 GB |
-| B=64 | V3 TMA | 853 | **1,514** | **1.77x** | 12.7 GB |
-| B=128 | V3 TMA | 942 | **2,197** | **2.33x** | 12.7 GB |
+| B=32 | split12 | 694.2 | **1,136** | 1.64x | 11.2 GB |
+| B=64 | V3 TMA | 853 | **1,514** | 1.77x | 12.7 GB |
+| B=128 | V3 TMA | 942 | **2,197** | 2.33x | 12.7 GB |
 | B=256 | V3 TMA | 872 | **2,554** | **2.93x** | 12.7 GB |
 
-vLLM fills the entire 16 GB card (15.3 GB) and can serve only ~1 user. Turbo serves **256 users at 12.7 GB**.
+vLLM uses 15.3 GB (max ~1 user). Turbo serves 256 users at 12.7 GB.
 
 ### Llama 3.1 8B Instruct
 
@@ -60,27 +53,25 @@ vLLM fills the entire 16 GB card (15.3 GB) and can serve only ~1 user. Turbo ser
 | B=128 | V3 TMA | OOM | **2,111** | 14.0 GB |
 | B=256 | V3 TMA | OOM | **2,471** | 14.1 GB |
 
-vLLM **cannot load** Llama 8B BF16 on a 16 GB card (needs ~17 GB). Turbo runs it at 14.1 GB serving 256 users.
+vLLM cannot load Llama 8B BF16 on 16 GB (needs ~17 GB). Turbo runs it at 14.1 GB.
 
-Kernels: **split12** = per-row bandwidth-optimized matvec (B<=32), **V3 TMA** = fused decode+GEMM with Blackwell tensor memory loads (B>=64). Auto-selected based on batch size.
+**Kernels:** `split12` = per-row bandwidth-optimized matvec (B<=32). `V3 TMA` = fused decode+GEMM with Blackwell tensor memory loads (B>8). Auto-selected.
 
-### VRAM: Turbo vs vLLM
+### VRAM Comparison
 
-|  | vLLM (Mistral) | Turbo (Mistral) | vLLM (Llama) | Turbo (Llama) |
+| | Mistral (vLLM) | Mistral (Turbo) | Llama (vLLM) | Llama (Turbo) |
 |--|---------------:|----------------:|-------------:|--------------:|
-| Model weights | 13.2 GB | **10.2 GB** | ~14.7 GB | **11.5 GB** |
-| Runtime overhead | ~2.1 GB | **~0.9 GB** | OOM | **~0.9 GB** |
-| **Total (B=1)** | **15.3 GB** | **11.1 GB** | **OOM** | **12.4 GB** |
-| Max batch users | ~1 | **>256** | 0 | **>256** |
-
-Turbo uses 57% less runtime overhead than vLLM (lean C++ vs Python/PyTorch).
+| Weights | 13.2 GB | **10.2 GB** | ~14.7 GB | **11.5 GB** |
+| Overhead | ~2.1 GB | ~0.9 GB | OOM | ~0.9 GB |
+| **Total** | 15.3 GB | **11.1 GB** | OOM | **12.4 GB** |
+| Max users | ~1 | **>256** | 0 | **>256** |
 
 ### Tested Models
 
-| Model | B=1 tok/s | Escape Rate | Compression | Status |
-|-------|----------:|------------:|:-----------:|--------|
-| Mistral 7B Instruct | 60.0 | 0.031% | 1.33x | Production |
-| Llama 3.1 8B Instruct | 57.0 | 0.021% | 1.33x | Production |
+| Model | B=1 tok/s | Escape Rate | Compression |
+|-------|----------:|------------:|:-----------:|
+| Mistral 7B Instruct | 60.0 | 0.031% | 1.33x |
+| Llama 3.1 8B Instruct | 57.0 | 0.021% | 1.33x |
 
 ---
 
@@ -91,8 +82,10 @@ Turbo uses 57% less runtime overhead than vLLM (lean C++ vs Python/PyTorch).
 gcc -O3 -shared -fPIC -o structured12_pack.so structured12_pack.c
 gcc -O3 -shared -fPIC -o split12_pack.so split12_pack.c
 
-# Build engine (NVIDIA)
-cd engine && ln -sf kernels.hip kernels.cu && ln -sf ../decompress_v2.hip decompress_v2.cu
+# Build engine (NVIDIA — HIP kernels are cross-compatible via gpu_compat.h)
+cd engine
+ln -sf kernels.hip kernels.cu
+ln -sf ../decompress_v2.hip decompress_v2.cu
 nvcc -O3 -arch=sm_120 -I.. -o turbo-engine \
   main.cpp model.cpp inference.cpp tokenizer.cpp sampler.cpp \
   kernels.cu decompress_v2.cu ../nvidia_kernels.cu ../nvidia_kernels_v3.cu \
@@ -108,29 +101,33 @@ CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./turbo-engine models/mistral-7b-instruct-tu
 
 ### Environment Variables
 
+| Variable | Default | Effect |
+|----------|:-------:|--------|
+| `CUDA_VISIBLE_DEVICES=N` | all | Select GPU |
+| `TURBO_FAST=1` | off | Pre-compute escape tables. **Recommended.** +10% speed, +361 MB VRAM |
+| `TURBO_CTX=N` | 2048 | Max context length (tokens) |
+| `TURBO_PROFILE=1` | off | Print per-token timing breakdown |
+
+**Debug only** (no need to set these):
+
 | Variable | Effect |
 |----------|--------|
-| `CUDA_VISIBLE_DEVICES=N` | Select GPU |
-| `TURBO_FAST=1` | Pre-computed escape counts (+10% speed, +361 MB VRAM) |
-| `TURBO_CTX=N` | Max context length (default 2048) |
-| `TURBO_PROFILE=1` | Per-token timing breakdown |
-| `TURBO_KERNEL=1\|2\|3` | Fused GEMM kernel for B>=64: V1 baseline, V2 cp.async, **V3 TMA** (default). No effect at B<=32 |
-
-B<=32 always uses split12 per-row matvec. B>=64 uses fused decode+GEMM (V3 TMA by default, override with `TURBO_KERNEL`).
+| `TURBO_KERNEL=N` | Override fused GEMM kernel at B>8: 1=V1, 2=V2 cp.async, 3=V3 TMA. Default auto-selects V3 |
+| `TURBO_CUBLAS=1` | Force cuBLAS path for all matmuls (slow, for correctness testing) |
 
 ---
 
 ## File Map
 
-~4,450 lines of production code.
-
 | File | Purpose |
 |------|---------|
-| `gpu_compat.h` | AMD/NVIDIA compatibility layer |
-| `decompress_v2.hip` | GPU matvec kernels (split12 + structured12, B=1/4/8) |
+| `gpu_compat.h` | AMD/NVIDIA kernel compatibility layer |
+| `decompress_v2.hip` | Split12 per-row matvec kernels (B=1/4/8) |
 | `nvidia_kernels.cu` | NVIDIA fused decode+GEMM (V1/V2/V3 TMA) |
-| `engine/inference.cpp` | Forward pass + generate loop |
+| `engine/inference.cpp` | Forward pass + generation loop |
 | `engine/kernels.hip` | RMSNorm, RoPE, Flash Attention, SiLU, argmax |
 | `engine/model.cpp` | Model loader + escape table builder |
 | `engine/tokenizer.cpp` | Sentencepiece + HF BPE auto-detect |
-| `engine/convert_model.py` | BF16 safetensors to turbo format converter |
+| `engine/convert_model.py` | BF16 safetensors to Turbo format converter |
+
+~4,750 lines of C++/CUDA.
