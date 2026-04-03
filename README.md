@@ -84,12 +84,22 @@ All values in tok/s. vLLM cannot fit Llama 8B on 16 GB (needs ~17 GB). llama.cpp
 | **Total** | 15.3 GB | **11.1 GB** | OOM | **12.4 GB** |
 | Max users | ~1 | **>256** | 0 | **>256** |
 
+### Yi 1.5 9B Chat (01.AI — different model family)
+
+| | llama.cpp | vLLM | Turbo |
+|--|----------:|-----:|------:|
+| B=1 | OOM | OOM | **48.1** |
+| BF16 VRAM | 17.7 GB | ~19 GB | **~14.5 GB** |
+
+Both llama.cpp and vLLM cannot load Yi 9B BF16 on a 16 GB card. Turbo fits it with 1.5 GB to spare.
+
 ### Tested Models
 
-| Model | B=1 tok/s | Escape Rate | Compression |
-|-------|----------:|------------:|:-----------:|
-| Mistral 7B Instruct | 60.0 | 0.031% | 1.33x |
-| Llama 3.1 8B Instruct | 57.0 | 0.021% | 1.33x |
+| Model | Family | Params | B=1 tok/s | Escape Rate | Compression | llama.cpp/vLLM |
+|-------|--------|-------:|----------:|------------:|:-----------:|:--------------:|
+| Mistral 7B Instruct | Mistral | 7.25B | 60.0 | 0.031% | 1.33x | Both fit |
+| Llama 3.1 8B Instruct | Meta | 8.03B | 57.0 | 0.021% | 1.33x | vLLM OOM |
+| Yi 1.5 9B Chat | 01.AI | 8.83B | 48.1 | — | 1.33x | Both OOM |
 
 ---
 
