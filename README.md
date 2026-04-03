@@ -155,6 +155,67 @@ BF16 and FP16 safetensors supported. No GGUF, no FP32, no quantized formats.
 
 ---
 
+## Benchmarking
+
+### Single-User (B=1)
+```bash
+# Basic — output verified, 200 tokens
+CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./engine/turbo-engine \
+  models/mistral-7b-instruct-turbo "[INST] Write an essay about AI. [/INST]" 200
+
+# With profiling — shows per-token matvec/attn/norm/silu breakdown
+CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 TURBO_PROFILE=1 ./engine/turbo-engine \
+  models/mistral-7b-instruct-turbo "[INST] Write an essay about AI. [/INST]" 200
+```
+
+### Multi-User (B=4, 8, 16, 32, 64, 128, 256)
+```bash
+# B=32 — 32 concurrent sequences, same prompt
+CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./engine/turbo-engine \
+  models/mistral-7b-instruct-turbo "[INST] Write an essay about AI. [/INST]" 200 32
+
+# B=256 — maximum throughput test
+CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./engine/turbo-engine \
+  models/mistral-7b-instruct-turbo "[INST] Write an essay about AI. [/INST]" 200 256
+```
+
+### Comparing with vLLM
+```bash
+# vLLM BF16 baseline (same model, same prompt, same token count)
+python3 -m vllm.entrypoints.openai.api_server --model mistralai/Mistral-7B-Instruct-v0.3 \
+  --dtype bfloat16 --max-model-len 2048 --gpu-memory-utilization 0.95
+
+# Then benchmark with:
+python3 -m vllm.entrypoints.openai.api_server  # ... or use benchmark_serving.py
+```
+
+### What to Check
+
+1. **Verify output is coherent** — not garbage. If output is nonsensical, the benchmark is invalid.
+2. **Use a non-display GPU** — the GPU connected to the monitor has lower available bandwidth.
+3. **Run 3 times** — take the median. First run may be slower (cold caches).
+4. **Match token count** — compare same number of generated tokens across engines.
+
+### Reading Profile Output
+
+```
+[PROFILE] 100 tok: mv 154.2 (92%) | attn 7.7 norm 4.2 silu 0.8 misc 0.0 | total 166.9 (59.9 t/s)
+```
+
+| Field | Meaning |
+|-------|---------|
+| `100 tok` | Profile window (last 10 tokens, at position 100) |
+| `mv 154.2 (92%)` | Matvec time in ms (% of total). Constant regardless of context length |
+| `attn 7.7` | Attention time in ms. Grows linearly with context (~0.065ms per token) |
+| `norm 4.2` | RMSNorm + residual add time |
+| `silu 0.8` | SiLU activation time |
+| `total 166.9` | Total ms per 10 tokens |
+| `(59.9 t/s)` | Tokens per second |
+
+At B=1, matvec dominates (~85-95%). Attention grows with context but stays <15% under 1K tokens.
+
+---
+
 ## Kernel Architecture
 
 Auto-selected by batch size. All decode Split12 weights on-the-fly with 1 ADD.
