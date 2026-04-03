@@ -21,7 +21,26 @@ Turbo 12-bit: [group 4][sign 1][mantissa 7]    = 12 bits
 Decode: exponent = BaseExp + group  (one integer ADD)
 ```
 
-**1.33x compression, zero information loss.** The 0.03% of outlier values are stored exactly in a small CSR escape table (~3 MB for 7B model). Stored as two byte-aligned arrays for zero HBM read amplification.
+**1.33x compression, zero information loss.** The 0.03% of outlier values are stored exactly in a small CSR escape table (~3 MB for 7B model).
+
+### Storage: Split12 vs Structured12
+
+The 12-bit values need to be stored on disk and GPU. We support two layouts:
+
+**Structured12** (fallback) — 12 bits packed contiguously into uint32 words:
+```
+[elem0 12b][elem1 12b][elem2 12b]...  packed across byte boundaries
+```
+Problem: reading one element loads a uint64 and bit-shifts across 4-byte boundaries → **5.3x read amplification** on GPU.
+
+**Split12** (primary) — same 12 bits split into two byte-aligned arrays:
+```
+Array 1: [sign 1][mantissa 7] = 1 byte per element     ← perfectly aligned
+Array 2: [group 4][group 4]   = 0.5 byte per element   ← nibble-packed, byte-aligned
+```
+Every byte loaded is useful data → **zero read amplification**. Same 1.5 bytes/element = same 1.33x compression.
+
+Split12 is **~5% faster** at B=1 because the GPU memory controller reads exactly what's needed. The engine auto-detects: if `.sm.bin`/`.gr.bin` files exist, uses Split12; otherwise falls back to Structured12.
 
 ---
 
