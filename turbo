@@ -29,7 +29,8 @@ BANNER
     echo -e "  ${WHITE}BF16 → 12-bit lossless  •  Decode with 1 ADD${RESET}"
     echo -e "  ${DIM}1.33x smaller  •  up to 2.93x faster (B=256)  •  Zero precision loss${RESET}"
     echo ""
-    echo -e "  ${YELLOW}Note: This is a proof of concept. The UI is not optimised and may have errors.${RESET}"
+    echo -e "  ${YELLOW}Proof of concept — showcasing compression + fused decode.${RESET}"
+    echo -e "  ${YELLOW}KV cache not fully optimised; expect slowdown over long conversations.${RESET}"
     echo ""
 }
 
