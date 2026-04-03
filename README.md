@@ -37,7 +37,7 @@ Stored as two byte-aligned arrays (**Split12**) — zero GPU read amplification:
 | **GPU decode** | Yes | Yes | Yes | No (CPU) | Yes | No (ASIC) |
 | **Hardware** | **NVIDIA + AMD** | NVIDIA | NVIDIA | CPU | NVIDIA | Custom |
 
-**Our trade-off:** We use 0.7 more bits/weight than ZipServ, but decode with 1 instruction instead of 5-8, have 100x fewer escapes, and run on AMD.
+**Our trade-off:** We use 0.7 more bits/weight than ZipServ, but decode with 1 instruction instead of 5-8, have 100x fewer escapes, and run on NVIDIA, AMD, Intel — you name it.
 
 ---
 
