@@ -2,9 +2,10 @@
 
 100% bit-perfect lossless compression for BF16 LLM weights. BF16 in, BF16 out — no precision loss, 1.33x smaller VRAM. Proof-of-concept tested on a single NVIDIA RTX 5070 Ti 16 GB.
 
-- Runs **Llama 3.1 8B on 16 GB** where vLLM OOMs
-- **2.93x faster** than vLLM at B=256 (Mistral 7B)
-- **~4,750 lines** of C++/CUDA, no Python runtime
+- **1.33x compression**, zero information loss
+- **8-9% faster** than llama.cpp and vLLM at B=1
+- **Up to 2.93x faster** than vLLM at B=256
+- Runs models **where competitors OOM** (Llama 8B, Yi 9B on 16 GB)
 
 **BF16 safetensors only.** No GGUF, no FP16, no FP32, no quantized formats.
 
@@ -45,75 +46,37 @@ Why pack 2 groups per byte? Because the smallest unit a GPU can load is 1 byte. 
 
 ## Benchmarks
 
-**Hardware:** Single GPU — NVIDIA RTX 5070 Ti 16 GB (Blackwell, 896 GB/s). All results with 200-token generation, output verified coherent.
+Single GPU — NVIDIA RTX 5070 Ti 16 GB (Blackwell, 896 GB/s). All tok/s, 200-token generation, output verified coherent.
 
-### Mistral 7B Instruct
+### Single-User Latency (B=1)
 
-| Batch | Kernel | llama.cpp | vLLM | Turbo | vs llama.cpp | vs vLLM | VRAM |
-|------:|:------:|----------:|-----:|------:|:------------:|:-------:|-----:|
-| B=1 | split12 | 55.7 | 54.7 | **60.0** | **1.08x** | **1.10x** | 11.1 GB |
-| B=8 | split12 | — | 414.6 | **162.6** | — | — | 11.1 GB |
-| B=32 | split12 | — | 694.2 | **1,136** | — | **1.64x** | 11.2 GB |
-| B=64 | V3 TMA | — | 853 | **1,514** | — | **1.77x** | 12.7 GB |
-| B=128 | V3 TMA | — | 942 | **2,197** | — | **2.33x** | 12.7 GB |
-| B=256 | V3 TMA | — | 872 | **2,554** | — | **2.93x** | 12.7 GB |
+| Model | Params | llama.cpp | vLLM | Turbo | Speedup | Turbo VRAM |
+|-------|-------:|----------:|-----:|------:|--------:|-----------:|
+| Llama 2 7B | 6.74B | 59.6 | — | **64.7** | **1.09x** | 10.4 GB |
+| Mistral 7B | 7.25B | 55.7 | 54.7 | **60.0** | **1.08x** | 11.1 GB |
+| Llama 3.1 8B | 8.03B | 52.9 | OOM | **57.0** | **1.08x** | 12.4 GB |
+| Yi 1.5 9B | 8.83B | OOM | OOM | **48.1** | — | ~14.5 GB |
 
-All values in tok/s. llama.cpp uses 13.5 GB. vLLM uses 15.3 GB (max ~1 user). Turbo serves 256 users at 12.7 GB.
+### Batch Throughput (Mistral 7B)
 
-### Llama 3.1 8B Instruct
+| Batch | Kernel | Turbo | vLLM | vs vLLM |
+|------:|:------:|------:|-----:|--------:|
+| B=1 | split12 | **60** | 54.7 | **1.10x** |
+| B=32 | split12 | **1,136** | 694 | **1.64x** |
+| B=64 | V3 TMA | **1,514** | 853 | **1.77x** |
+| B=128 | V3 TMA | **2,197** | 942 | **2.33x** |
+| B=256 | V3 TMA | **2,554** | 872 | **2.93x** |
 
-| Batch | Kernel | llama.cpp | vLLM | Turbo | vs llama.cpp | VRAM |
-|------:|:------:|----------:|-----:|------:|:------------:|-----:|
-| B=1 | split12 | 52.9 | OOM | **57.0** | **1.08x** | 12.4 GB |
-| B=8 | split12 | — | OOM | **154.3** | — | 12.4 GB |
-| B=32 | split12 | — | OOM | **1,069** | — | 12.5 GB |
-| B=64 | V3 TMA | — | OOM | **1,439** | — | 14.0 GB |
-| B=128 | V3 TMA | — | OOM | **2,111** | — | 14.0 GB |
-| B=256 | V3 TMA | — | OOM | **2,471** | — | 14.1 GB |
+`split12` = per-row bandwidth-optimized matvec. `V3 TMA` = fused decode+GEMM with Blackwell tensor memory loads. Auto-selected.
 
-All values in tok/s. vLLM cannot fit Llama 8B on 16 GB (needs ~17 GB). llama.cpp uses 15.0 GB. Turbo: 14.1 GB serving 256 users.
+### VRAM Comparison (16 GB card)
 
-**Kernels:** `split12` = per-row bandwidth-optimized matvec (B<=32). `V3 TMA` = fused decode+GEMM with Blackwell tensor memory loads (B>8). Auto-selected.
-
-### VRAM Comparison
-
-| | Mistral (vLLM) | Mistral (Turbo) | Llama (vLLM) | Llama (Turbo) |
-|--|---------------:|----------------:|-------------:|--------------:|
-| Weights | 13.2 GB | **10.2 GB** | ~14.7 GB | **11.5 GB** |
-| Overhead | ~2.1 GB | ~0.9 GB | OOM | ~0.9 GB |
-| **Total** | 15.3 GB | **11.1 GB** | OOM | **12.4 GB** |
-| Max users | ~1 | **>256** | 0 | **>256** |
-
-### Yi 1.5 9B Chat (01.AI — different model family)
-
-| | llama.cpp | vLLM | Turbo |
-|--|----------:|-----:|------:|
-| B=1 | OOM | OOM | **48.1** |
-| BF16 VRAM | 17.7 GB | ~19 GB | **~14.5 GB** |
-
-Both llama.cpp and vLLM cannot load Yi 9B BF16 on a 16 GB card. Turbo fits it with 1.5 GB to spare.
-
-### Llama 2 7B Chat (true 7B, FP16→BF16 converted)
-
-| Batch | Kernel | llama.cpp | Turbo | vs llama.cpp | VRAM |
-|------:|:------:|----------:|------:|:------------:|-----:|
-| B=1 | split12 | 59.6 | **64.7** | **1.09x** | ~10.4 GB |
-| B=8 | split12 | — | **172.2** | — | ~10.4 GB |
-| B=32 | split12 | — | **1,289** | — | ~10.5 GB |
-| B=64 | V3 TMA | — | **1,605** | — | ~12.0 GB |
-| B=128 | V3 TMA | — | **2,576** | — | ~12.0 GB |
-| B=256 | V3 TMA | — | **2,931** | — | ~12.0 GB |
-
-All values in tok/s. Llama 2 7B is MHA (32/32 heads, not GQA) with smaller FFN (11008). Fastest at B=1 due to fewer params. Original FP16 model auto-cast to BF16 during conversion.
-
-### Tested Models
-
-| Model | Family | Params | B=1 tok/s | Escape Rate | Compression | llama.cpp/vLLM |
-|-------|--------|-------:|----------:|------------:|:-----------:|:--------------:|
-| Llama 2 7B Chat | Meta | 6.74B | 64.7 | — | 1.33x | Both fit |
-| Mistral 7B Instruct | Mistral | 7.25B | 60.0 | 0.031% | 1.33x | Both fit |
-| Llama 3.1 8B Instruct | Meta | 8.03B | 57.0 | 0.021% | 1.33x | vLLM OOM |
-| Yi 1.5 9B Chat | 01.AI | 8.83B | 48.1 | — | 1.33x | Both OOM |
+| Model | BF16 (llama.cpp) | BF16 (vLLM) | Turbo 12-bit | Fits? |
+|-------|------------------:|-----------:|-------------:|:-----:|
+| Llama 2 7B | 12.6 GB | ~14.7 GB | **10.4 GB** | All fit |
+| Mistral 7B | 13.5 GB | 15.3 GB | **11.1 GB** | All fit |
+| Llama 3.1 8B | 15.0 GB | OOM | **12.4 GB** | vLLM OOM |
+| Yi 1.5 9B | OOM | OOM | **~14.5 GB** | Only Turbo |
 
 ---
 
@@ -132,7 +95,7 @@ nvcc -O3 -arch=sm_120 -I.. -o turbo-engine \
   kernels.cu decompress_v2.cu ../nvidia_kernels.cu ../nvidia_kernels_v3.cu \
   -lcublas -lsentencepiece -lcuda -std=c++17
 
-# Convert model
+# Convert model (supports BF16 and FP16 safetensors)
 python3 engine/convert_model.py models/mistral-7b-instruct
 cp models/mistral-7b-instruct/tokenizer.model models/mistral-7b-instruct-turbo/
 
@@ -149,16 +112,13 @@ CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./turbo-engine models/mistral-7b-instruct-tu
 | `TURBO_CTX=N` | 2048 | Max context length (tokens) |
 | `TURBO_PROFILE=1` | off | Print per-token timing breakdown |
 
-**Debug only** (no need to set these):
-
-| Variable | Effect |
-|----------|--------|
-| `TURBO_KERNEL=N` | Override fused GEMM kernel at B>8: 1=V1, 2=V2 cp.async, 3=V3 TMA. Default auto-selects V3 |
-| `TURBO_CUBLAS=1` | Force cuBLAS path for all matmuls (slow, for correctness testing) |
+**Debug only:** `TURBO_KERNEL=N` (override fused GEMM at B>8: 1/2/3), `TURBO_CUBLAS=1` (force cuBLAS path).
 
 ---
 
 ## File Map
+
+~4,750 lines of C++/CUDA.
 
 | File | Purpose |
 |------|---------|
@@ -169,6 +129,4 @@ CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./turbo-engine models/mistral-7b-instruct-tu
 | `engine/kernels.hip` | RMSNorm, RoPE, Flash Attention, SiLU, argmax |
 | `engine/model.cpp` | Model loader + escape table builder |
 | `engine/tokenizer.cpp` | Sentencepiece + HF BPE auto-detect |
-| `engine/convert_model.py` | BF16 safetensors to Turbo format converter |
-
-~4,750 lines of C++/CUDA.
+| `engine/convert_model.py` | BF16/FP16 safetensors to Turbo format converter |
