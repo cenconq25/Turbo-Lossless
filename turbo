@@ -134,6 +134,7 @@ show_response() {
     local speed=$(echo "$out" | grep "Decode speed" | grep -oP '[\d.]+' | head -1)
     local tokens=$(echo "$out" | grep "Generated tokens" | grep -oP '\d+')
     local time=$(echo "$out" | grep "Total time" | grep -oP '[\d.]+')
+    local context=$(echo "$out" | grep "Context:" | grep -oP '[\d]+ / [\d]+')
 
     if [ "$show_prompt" = "yes" ]; then
         echo -e "  ${GREEN}${BOLD}▶${RESET} ${BOLD}$prompt${RESET}"
@@ -151,7 +152,9 @@ show_response() {
     fi
     echo ""
     echo -e "  ${DIM}─────────────────────────────────────${RESET}"
-    echo -e "  ${DIM}${tokens:-?} tokens  •  ${speed:-?} tok/s  •  ${time:-?}s${RESET}"
+    local ctx_info=""
+    [ -n "$context" ] && ctx_info="  •  ctx ${context}"
+    echo -e "  ${DIM}${tokens:-?} tokens  •  ${speed:-?} tok/s  •  ${time:-?}s${ctx_info}${RESET}"
 }
 
 run_single() {
