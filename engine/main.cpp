@@ -92,6 +92,9 @@ int main(int argc, char** argv) {
         printf("Max tokens: %d\n\n", max_tokens);
     }
 
+    // Force unbuffered stdout so progress lines reach FIFOs/pipes immediately
+    if (interactive) setvbuf(stdout, NULL, _IONBF, 0);
+
     printf("Loading model...\n");
     Model* model = load_model(model_path);
     if (!model) { fprintf(stderr, "Failed to load model\n"); return 1; }
@@ -112,10 +115,6 @@ int main(int argc, char** argv) {
     fflush(stdout);
 
     if (interactive) {
-        // Force unbuffered stdout so token output reaches the FIFO immediately
-        // (stdbuf -oL only flushes on \n, but tokens are printed without \n)
-        setvbuf(stdout, NULL, _IONBF, 0);
-
         // Interactive: KV cache persists across turns (like llama.cpp)
         // Each turn only prefills NEW tokens; previous context stays in cache.
         // Format: <s>[INST] user1 [/INST] assistant1 </s>[INST] user2 [/INST] ...

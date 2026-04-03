@@ -207,7 +207,7 @@ interactive() {
                 local bar_len=30
                 local filled=$(( pct * bar_len / 100 ))
                 local empty=$(( bar_len - filled ))
-                local bar=$(printf "%${filled}s" | tr ' ' '#')$(printf "%${empty}s" | tr ' ' '-')
+                local bar=$(printf "%${filled}s" | tr ' ' '|')$(printf "%${empty}s" | tr ' ' '-')
                 echo -ne "\r  ${CYAN}${bar}${RESET} ${DIM}${pct}% (${loaded}/${n_layers} layers)${RESET}\033[K"
             fi
         fi
