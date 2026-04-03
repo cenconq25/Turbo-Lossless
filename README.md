@@ -93,17 +93,15 @@ Single GPU — NVIDIA RTX 5070 Ti 16 GB (Blackwell, 896 GB/s). All tok/s, 200-to
 | Llama 3.1 8B | 8.03B | 52.9 | OOM | **57.0** | **1.08x** | 12.4 GB |
 | Yi 1.5 9B | 8.83B | OOM | OOM | **48.1** | — | ~14.5 GB |
 
-### Batch Throughput (Mistral 7B)
+### Multi-User Throughput (total tok/s across all users)
 
-| Batch | Kernel | Turbo | vLLM | vs vLLM |
-|------:|:------:|------:|-----:|--------:|
-| B=1 | split12 | **60** | 54.7 | **1.10x** |
-| B=32 | split12 | **1,136** | 694 | **1.64x** |
-| B=64 | V3 TMA | **1,514** | 853 | **1.77x** |
-| B=128 | V3 TMA | **2,197** | 942 | **2.33x** |
-| B=256 | V3 TMA | **2,554** | 872 | **2.93x** |
+| Model | Params | B=32 | B=64 | B=128 | B=256 | vLLM B=256 | Speedup |
+|-------|-------:|-----:|-----:|------:|------:|-----------:|--------:|
+| Llama 2 7B | 6.74B | 1,289 | 1,605 | 2,576 | **2,931** | — | — |
+| Mistral 7B | 7.25B | 1,136 | 1,514 | 2,197 | **2,554** | 872 | **2.93x** |
+| Llama 3.1 8B | 8.03B | 1,069 | 1,439 | 2,111 | **2,471** | OOM | — |
 
-`split12` = per-row bandwidth-optimized matvec. `V3 TMA` = fused decode+GEMM with Blackwell tensor memory loads. Auto-selected.
+Kernel auto-selects: `split12` per-row matvec at B≤32, `V3 TMA` fused decode+GEMM at B>8.
 
 ### VRAM Comparison (16 GB card)
 
