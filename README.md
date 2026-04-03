@@ -103,6 +103,7 @@ Single GPU — NVIDIA RTX 5070 Ti 16 GB (Blackwell, 896 GB/s). All tok/s, 200-to
 | Qwen 2.5 72B | 72B | Dense LLM | 1.060% | 1.31x |
 | Gemma 4 31B | 31.3B | Dense LLM | 0.071% | 1.33x |
 | **SDXL UNet** | 2.6B | **Image (FP16)** | **0.233%** | **1.33x** |
+| **CogVideoX 2B** | 1.7B | **Video (FP16)** | **0.128%** | **1.33x** |
 | Gemma 4 E4B | 8.0B | Multimodal | 1.512% | 1.31x |
 | Gemma 4 E2B | 5.1B | Multimodal | 2.344% | 1.30x |
 
@@ -110,6 +111,7 @@ Single GPU — NVIDIA RTX 5070 Ti 16 GB (Blackwell, 896 GB/s). All tok/s, 200-to
 - **Scales to 405B** — Llama 405B has 0.034% escapes, same as 8B. Compression is size-independent.
 - **MoE works** — Mixtral expert weights compress identically to dense (0.05%)
 - **Image models work** — SDXL UNet (FP16) compresses at 1.33x with 0.23% escapes
+- **Video models work** — CogVideoX (FP16) compresses at 1.33x with 0.13% escapes
 - **Multimodal outliers** — Gemma E2B/E4B have 1.5-2.3% escapes (wider weight distributions from vision/audio training)
 - Dense text LLMs consistently achieve <0.1% escape rates regardless of model size
 
