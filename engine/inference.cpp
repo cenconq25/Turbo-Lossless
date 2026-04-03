@@ -20,6 +20,16 @@ extern "C" {
     void launch_flash_attention_batch(const float* q, const int16_t* kv_k, const int16_t* kv_v, int16_t* output, const int* positions, int n_head, int n_head_kv, int head_dim, int max_seq, float scale, int batch_size, int kv_stride, hipStream_t stream);
     void launch_rope_store_kv(float* q, float* k, const float* v, int16_t* kv_k, int16_t* kv_v, int head_dim, int n_head, int n_head_kv, int position, int max_seq, float theta, hipStream_t stream);
 
+    // Gemma4 kernel wrappers (Dev 2 implements these in kernels.hip/kernels.cu)
+    void launch_gelu_mul_bf16_batch(const float* gate, const float* up, int16_t* out, int n, int bs, hipStream_t stream);
+    void launch_softcap(float* logits, int n, float cap, hipStream_t stream);
+    void launch_rms_norm_per_head(float* x, const float* weight, int n_heads, int head_dim, float eps, hipStream_t stream);
+    void launch_scale(float* x, float scale, int n, hipStream_t stream);
+    void launch_rope_init_partial(int rotary_dim, float theta_base);
+    void launch_attention_all_heads_windowed(const float* q, const int16_t* k_cache, const int16_t* v_cache,
+        int16_t* output, int n_head, int n_head_kv, int head_dim, int seq_len, int max_seq, float scale,
+        int window_size, hipStream_t stream);
+
     // Matvec launch wrappers (decompress_v2.hip)
     int launch_patches_v2_async(const void* row_offsets, const void* patch_cols, const void* correct_vals, const void* wrong_vals, const void* activations, void* output, int M, void* stream);
     int launch_structured12_v2_async(const void* packed, int base_exp, const void* activations, void* output, int M, int K, void* stream, const void* patch_row_offsets, const void* patch_cols, const void* patch_correct_vals, const void* patch_wrong_vals);
@@ -126,13 +136,25 @@ InferenceState* create_inference_state(Model* model, int batch_size, int max_seq
     int local_nff = n_ff / tp_size;      // local FFN dim (row-split w_gate/w_up)
     int local_vocab = n_vocab / tp_size;  // local vocab (row-split output_proj)
 
+    // Gemma4: q_buf/k_buf/v_buf must be sized for the MAX across layer types
+    int max_q_dim = local_n;
+    int max_kv_dim = local_kv;
+    if (model->config.head_dim_sliding > 0) {
+        // Full attention layers may have larger head_dim (e.g., 512 vs 256)
+        int max_head_dim = std::max(model->config.head_dim_sliding, model->config.head_dim_full);
+        int n_head_local = model->config.n_head / tp_size;
+        int n_kv_local = model->config.n_head_kv / tp_size;
+        max_q_dim = std::max(max_q_dim, n_head_local * max_head_dim);
+        max_kv_dim = std::max(max_kv_dim, n_kv_local * max_head_dim);
+    }
+
     // hidden/hidden2/res stay full size (hold all-reduced results)
     GPU_CHECK(hipMalloc(&s->hidden,   bs * n * sizeof(float)));
     GPU_CHECK(hipMalloc(&s->hidden2,  bs * n * sizeof(float)));
     GPU_CHECK(hipMalloc(&s->attn_out, bs * n * sizeof(float)));
-    GPU_CHECK(hipMalloc(&s->q_buf,    bs * local_n * sizeof(float)));
-    GPU_CHECK(hipMalloc(&s->k_buf,    bs * local_kv * sizeof(float)));
-    GPU_CHECK(hipMalloc(&s->v_buf,    bs * local_kv * sizeof(float)));
+    GPU_CHECK(hipMalloc(&s->q_buf,    bs * max_q_dim * sizeof(float)));
+    GPU_CHECK(hipMalloc(&s->k_buf,    bs * max_kv_dim * sizeof(float)));
+    GPU_CHECK(hipMalloc(&s->v_buf,    bs * max_kv_dim * sizeof(float)));
     GPU_CHECK(hipMalloc(&s->ffn_gate, bs * local_nff * sizeof(float)));
     GPU_CHECK(hipMalloc(&s->ffn_up,   bs * local_nff * sizeof(float)));
     s->ffn_down = nullptr;  // unused — w_down writes directly to cur
@@ -141,6 +163,9 @@ InferenceState* create_inference_state(Model* model, int batch_size, int max_seq
     GPU_CHECK(hipMalloc(&s->d_positions, bs * sizeof(int)));
     GPU_CHECK(hipMalloc(&s->d_tokens, bs * sizeof(int)));
     int max_act = std::max(n, local_nff);
+    // Gemma4: activation buffer must also cover max Q dim for BF16 attention output
+    if (model->config.head_dim_sliding > 0)
+        max_act = std::max(max_act, max_q_dim);
     // Pad batch dimension to 64 for GEMM tile alignment: the fused decode+GEMM
     // kernel loads full TILE_N-wide activation tiles via cp.async without bounds
     // checking. When bs is not a multiple of TILE_N (e.g., B=48 with TILE_N=32),
@@ -238,10 +263,17 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
     int n_head_kv_local = cfg.n_head_kv / tp;
     int kv_dim = n_head_kv_local * head_dim;
     int pos = state->positions[0];
+    bool is_gemma4 = (cfg.head_dim_sliding > 0);
 
     hipMemcpyAsync(state->d_tokens, token_ids, sizeof(int), hipMemcpyHostToDevice, stream);
+    // Gemma4 B=1 uses launch_rope_batch which needs d_positions on GPU
+    if (is_gemma4)
+        hipMemcpyAsync(state->d_positions, &pos, sizeof(int), hipMemcpyHostToDevice, stream);
     launch_embed_lookup(m->token_embd, state->d_tokens, state->hidden, n, 1, cfg.n_vocab, stream);
 
+    // Gemma4: scale embeddings by sqrt(n_embd)
+    if (is_gemma4)
+        launch_scale(state->hidden, sqrtf((float)n), n, stream);
 
     // Ping-pong between hidden and hidden2 to avoid unnecessary copies
     float* cur = state->hidden;
@@ -271,6 +303,13 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
     for (int layer = 0; layer < cfg.n_layer; layer++) {
         auto& L = m->layers[layer];
 
+        // Per-layer dimensions (Gemma4: varies per layer; legacy: constant)
+        int l_head_dim = L.head_dim;
+        int l_kv_dim = L.kv_dim;
+        int l_n_head_local = n_head_local;
+        int l_n_head_kv_local = n_head_kv_local;
+        float l_scale = 1.0f / sqrtf((float)l_head_dim);
+
         // Fused RMSNorm → BF16 for Q/K/V input
         PROF_START(stream);
         if (layer == 0)
@@ -287,20 +326,64 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
 
         PROF_END_MV(stream);
 
+        // Gemma4: per-head Q/K norms
+        if (L.q_norm) {
+            launch_rms_norm_per_head(state->q_buf, L.q_norm, l_n_head_local, l_head_dim, cfg.rms_norm_eps, stream);
+        }
+        if (L.k_norm) {
+            launch_rms_norm_per_head(state->k_buf, L.k_norm, l_n_head_kv_local, l_head_dim, cfg.rms_norm_eps, stream);
+        }
+
         PROF_START(stream);
-        size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
-        launch_rope_store_kv(state->q_buf, state->k_buf, state->v_buf,
-                             m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
-                             head_dim, n_head_local, n_head_kv_local, pos,
-                             m->max_seq_len, cfg.rope_theta, stream);
+        // Get per-layer KV cache pointers
+        int16_t* kv_k = m->kv_k_ptrs[layer];
+        int16_t* kv_v = m->kv_v_ptrs[layer];
 
-        if (pos < 1024)
-            launch_attention_all_heads(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
-                bf16_a, n_head_local, n_head_kv_local, head_dim, pos+1, m->max_seq_len, scale, stream);
-        else
-            launch_flash_attention(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
-                bf16_a, n_head_local, n_head_kv_local, head_dim, pos+1, m->max_seq_len, scale, stream);
+        if (is_gemma4) {
+            // Gemma4: per-layer RoPE with variable theta and partial rotary
+            float l_theta;
+            int rotary_dim;
+            if (L.is_full_attn) {
+                l_theta = cfg.rope_theta_full;
+                rotary_dim = (int)(l_head_dim * cfg.partial_rotary);
+            } else {
+                l_theta = cfg.rope_theta;
+                rotary_dim = l_head_dim;  // full rotation for sliding layers
+            }
 
+            // Partial RoPE: only rotate first rotary_dim dimensions
+            if (rotary_dim < l_head_dim) {
+                launch_rope_init_partial(rotary_dim, l_theta);
+            }
+
+            // RoPE (in-place on q and k)
+            launch_rope_batch(state->q_buf, state->k_buf, state->d_positions,
+                              l_head_dim, l_n_head_local, l_n_head_kv_local,
+                              l_n_head_local * l_head_dim, l_kv_dim, l_theta, 1, stream);
+
+            // Store K/V to cache
+            launch_store_kv_batch(state->k_buf, state->v_buf, kv_k, kv_v,
+                                  state->d_positions, l_kv_dim, m->max_seq_len, 1, stream);
+
+            // Windowed or full attention
+            int window = L.is_full_attn ? 0 : cfg.sliding_window;
+            launch_attention_all_heads_windowed(state->q_buf, kv_k, kv_v,
+                bf16_a, l_n_head_local, l_n_head_kv_local, l_head_dim, pos+1, m->max_seq_len, l_scale,
+                window, stream);
+        } else {
+            // Legacy Llama/Mistral path (unchanged)
+            launch_rope_store_kv(state->q_buf, state->k_buf, state->v_buf,
+                                 kv_k, kv_v,
+                                 head_dim, n_head_local, n_head_kv_local, pos,
+                                 m->max_seq_len, cfg.rope_theta, stream);
+
+            if (pos < 1024)
+                launch_attention_all_heads(state->q_buf, kv_k, kv_v,
+                    bf16_a, n_head_local, n_head_kv_local, head_dim, pos+1, m->max_seq_len, scale, stream);
+            else
+                launch_flash_attention(state->q_buf, kv_k, kv_v,
+                    bf16_a, n_head_local, n_head_kv_local, head_dim, pos+1, m->max_seq_len, scale, stream);
+        }
 
         PROF_END_ATTN(stream);
 
@@ -315,8 +398,16 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
             PROF_END_NCCL(stream);
         }
 
+        // Gemma4: pre-FFN norm (separate from add+norm)
         PROF_START(stream);
-        launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
+        if (is_gemma4 && L.pre_ffn_norm) {
+            // Add residual first, then separate FFN norm
+            launch_add_batch(res, cur, n, 1, stream);
+            // res now holds the residual sum; norm into bf16_a for FFN input
+            launch_rms_norm_bf16_batch(res, L.pre_ffn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
+        } else {
+            launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
+        }
         PROF_END_NORM(stream);
 
         PROF_START(stream);
@@ -346,12 +437,25 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
         PROF_END_MV(stream);
 
         PROF_START(stream);
-        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, 1, stream);
+        // Gemma4: GELU activation; legacy: SiLU
+        if (cfg.activation_type == 1) {
+            launch_gelu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, 1, stream);
+        } else {
+            launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, 1, stream);
+        }
         PROF_END_SILU(stream);
 
         PROF_START(stream);
         MATVEC_B1(L.w_down, bf16_b, cur);
         PROF_END_MV(stream);
+
+        // Gemma4: post-FFN norm
+        if (is_gemma4 && L.post_ffn_norm) {
+            launch_rms_norm_bf16_batch(cur, L.post_ffn_norm, bf16_b, n, cfg.rms_norm_eps, 1, stream);
+            // cur is post-FFN output; need to continue with it as FP32 for add
+            // post_ffn_norm was applied in-place concept; we keep cur as the result
+        }
+
         // TP: w_down is column-split, output is partial sum — all-reduce to get full result
         if (state->tp) {
             PROF_START(stream);
@@ -360,11 +464,22 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
         }
 
         PROF_START(stream);
-        if (layer + 1 < cfg.n_layer) {
-            auto& nextL = m->layers[layer + 1];
-            launch_add_rms_norm_bf16_batch(cur, res, nextL.attn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
+        if (is_gemma4 && L.pre_ffn_norm) {
+            // Gemma4: residual is in res (from attn add), cur is FFN output
+            // Next layer needs: add(cur, res) -> new residual, then attn_norm -> bf16_a
+            if (layer + 1 < cfg.n_layer) {
+                auto& nextL = m->layers[layer + 1];
+                launch_add_rms_norm_bf16_batch(cur, res, nextL.attn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
+            } else {
+                launch_add_rms_norm_bf16_batch(cur, res, m->output_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
+            }
         } else {
-            launch_add_rms_norm_bf16_batch(cur, res, m->output_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
+            if (layer + 1 < cfg.n_layer) {
+                auto& nextL = m->layers[layer + 1];
+                launch_add_rms_norm_bf16_batch(cur, res, nextL.attn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
+            } else {
+                launch_add_rms_norm_bf16_batch(cur, res, m->output_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
+            }
         }
         PROF_END_NORM(stream);
     }
@@ -373,6 +488,11 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
     PROF_START(stream);
     MATVEC_B1(m->output_proj, bf16_a, state->logits);
     PROF_END_MV(stream);
+
+    // Gemma4: logit softcap
+    if (cfg.logit_softcap > 0)
+        launch_softcap(state->logits, cfg.n_vocab, cfg.logit_softcap, stream);
+
     PROF_EVENT_DESTROY();
     PROF_TOKEN();
     state->positions[0] = pos + 1;
@@ -424,6 +544,10 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
     hipMemcpyAsync(state->d_tokens, token_ids, BS * sizeof(int), hipMemcpyHostToDevice, stream);
     launch_embed_lookup(m->token_embd, state->d_tokens, state->hidden, n, BS, cfg.n_vocab, stream);
 
+    // Gemma4: scale embeddings by sqrt(n_embd)
+    if (cfg.head_dim_sliding > 0)
+        launch_scale(state->hidden, sqrtf((float)n), n * BS, stream);
+
     float* cur = state->hidden;
     float* res = state->hidden2;
     float scale = 1.0f / sqrtf((float)head_dim);
@@ -462,21 +586,22 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
             L.wv.M, L.wv.K, stream);
 #endif
 
-        size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
+        int16_t* kv_k = m->kv_k_ptrs[layer];
+        int16_t* kv_v = m->kv_v_ptrs[layer];
         launch_rope_batch(state->q_buf, state->k_buf, state->d_positions,
                           head_dim, n_head_local, n_head_kv_local, n_head_local * head_dim, kv_dim, cfg.rope_theta, BS, stream);
         launch_store_kv_batch(state->k_buf, state->v_buf,
-                              m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+                              kv_k, kv_v,
                               state->d_positions, kv_dim, m->max_seq_len, BS, stream);
 
         int max_pos = 0;
         for (int s = 0; s < BS; s++) max_pos = std::max(max_pos, state->positions[s]);
         if (max_pos < 1024)
-            launch_attention_all_heads_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+            launch_attention_all_heads_batch(state->q_buf, kv_k, kv_v,
                 bf16_a, state->d_positions, n_head_local, n_head_kv_local, head_dim,
                 max_pos + 1, scale, BS, 0, stream);
         else
-            launch_flash_attention_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+            launch_flash_attention_batch(state->q_buf, kv_k, kv_v,
                 bf16_a, state->d_positions, n_head_local, n_head_kv_local, head_dim,
                 max_pos + 1, scale, BS, 0, stream);
 
@@ -488,7 +613,10 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, BS, stream);
         BATCH4_MATVEC(L.w_gate, bf16_a, state->ffn_gate, n, L.w_gate.M, stream);
         BATCH4_MATVEC(L.w_up, bf16_a, state->ffn_up, n, L.w_gate.M, stream);
-        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, BS, stream);
+        if (cfg.activation_type == 1)
+            launch_gelu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, BS, stream);
+        else
+            launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, BS, stream);
         BATCH4_MATVEC(L.w_down, bf16_b, cur, L.w_gate.M, n, stream);
         // TP: w_down is column-split — all-reduce partial sums
         if (state->tp)
@@ -513,7 +641,10 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
             L.w_up.escape_row_base, L.w_up.escape_counts, L.w_up.escape_vals,
             SEQ(state->ffn_up,0,L.w_gate.M), SEQ(state->ffn_up,1,L.w_gate.M), SEQ(state->ffn_up,2,L.w_gate.M), SEQ(state->ffn_up,3,L.w_gate.M),
             L.w_up.M, L.w_up.K, stream);
-        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, BS, stream);
+        if (cfg.activation_type == 1)
+            launch_gelu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, BS, stream);
+        else
+            launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, BS, stream);
         launch_structured12_batch4_async(L.w_down.packed, L.w_down.base_exp,
             SEQI(bf16_b,0,L.w_gate.M), SEQI(bf16_b,1,L.w_gate.M), SEQI(bf16_b,2,L.w_gate.M), SEQI(bf16_b,3,L.w_gate.M),
             L.w_down.escape_row_base, L.w_down.escape_counts, L.w_down.escape_vals,
@@ -544,6 +675,9 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
         SEQ(state->logits,2,m->output_proj.M), SEQ(state->logits,3,m->output_proj.M),
         m->output_proj.M, m->output_proj.K, stream);
 #endif
+    // Gemma4: logit softcap
+    if (cfg.logit_softcap > 0)
+        launch_softcap(state->logits, cfg.n_vocab * BS, cfg.logit_softcap, stream);
     for (int s = 0; s < BS; s++) state->positions[s]++;
 }
 
@@ -567,6 +701,10 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
     hipMemcpyAsync(state->d_tokens, token_ids, BS * sizeof(int), hipMemcpyHostToDevice, stream);
     launch_embed_lookup(m->token_embd, state->d_tokens, state->hidden, n, BS, cfg.n_vocab, stream);
 
+    // Gemma4: scale embeddings by sqrt(n_embd)
+    if (cfg.head_dim_sliding > 0)
+        launch_scale(state->hidden, sqrtf((float)n), n * BS, stream);
+
     float* cur = state->hidden;
     float* res = state->hidden2;
     float scale = 1.0f / sqrtf((float)head_dim);
@@ -589,22 +727,23 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
         BATCH8_MATVEC(L.wv, bf16_a, state->v_buf, n, kv_dim, stream);
         PROF_END_MV(stream);
 
-        size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
+        int16_t* kv_k = m->kv_k_ptrs[layer];
+        int16_t* kv_v = m->kv_v_ptrs[layer];
         launch_rope_batch(state->q_buf, state->k_buf, state->d_positions,
                           head_dim, n_head_local, n_head_kv_local, n_head_local * head_dim, kv_dim, cfg.rope_theta, BS, stream);
         launch_store_kv_batch(state->k_buf, state->v_buf,
-                              m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+                              kv_k, kv_v,
                               state->d_positions, kv_dim, m->max_seq_len, BS, stream);
 
         PROF_START(stream);
         int max_pos = 0;
         for (int s = 0; s < BS; s++) max_pos = std::max(max_pos, state->positions[s]);
         if (max_pos < 1024)
-            launch_attention_all_heads_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+            launch_attention_all_heads_batch(state->q_buf, kv_k, kv_v,
                 bf16_a, state->d_positions, n_head_local, n_head_kv_local, head_dim,
                 max_pos + 1, scale, BS, 0, stream);
         else
-            launch_flash_attention_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+            launch_flash_attention_batch(state->q_buf, kv_k, kv_v,
                 bf16_a, state->d_positions, n_head_local, n_head_kv_local, head_dim,
                 max_pos + 1, scale, BS, 0, stream);
         PROF_END_ATTN(stream);
@@ -631,8 +770,11 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
         PROF_END_MV(stream);
 
         PROF_START(stream);
-        // Fused SiLU*mul -> BF16 for w_down
-        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, BS, stream);
+        // Activation: GELU for Gemma4, SiLU for legacy
+        if (cfg.activation_type == 1)
+            launch_gelu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, BS, stream);
+        else
+            launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, BS, stream);
         PROF_END_SILU(stream);
 
         PROF_START(stream);
@@ -661,6 +803,9 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
     PROF_START(stream);
     BATCH8_MATVEC(m->output_proj, bf16_a, state->logits, n, m->output_proj.M, stream);
     PROF_END_MV(stream);
+    // Gemma4: logit softcap
+    if (cfg.logit_softcap > 0)
+        launch_softcap(state->logits, cfg.n_vocab * BS, cfg.logit_softcap, stream);
     PROF_EVENT_DESTROY();
     PROF_TOKEN();
     for (int s = 0; s < BS; s++) state->positions[s]++;
@@ -721,6 +866,10 @@ static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
     hipMemcpyAsync(state->d_tokens, token_ids, BS * sizeof(int), hipMemcpyHostToDevice, s1);
     launch_embed_lookup(m->token_embd, state->d_tokens, state->hidden, n, BS, cfg.n_vocab, s1);
 
+    // Gemma4: scale embeddings by sqrt(n_embd)
+    if (cfg.head_dim_sliding > 0)
+        launch_scale(state->hidden, sqrtf((float)n), n * BS, s1);
+
     float* cur = state->hidden;
     float* res = state->hidden2;
     float scale = 1.0f / sqrtf((float)head_dim);
@@ -744,21 +893,22 @@ static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
         // Sync patches before consuming q/k/v
         SYNC_PATCHES(s1, s2, ev);
 
-        size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
+        int16_t* kv_k = m->kv_k_ptrs[layer];
+        int16_t* kv_v = m->kv_v_ptrs[layer];
         launch_rope_batch(state->q_buf, state->k_buf, state->d_positions,
                           head_dim, n_head_local, n_head_kv_local, n_head_local * head_dim, kv_dim, cfg.rope_theta, BS, s1);
         launch_store_kv_batch(state->k_buf, state->v_buf,
-                              m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+                              kv_k, kv_v,
                               state->d_positions, kv_dim, m->max_seq_len, BS, s1);
 
         int max_pos = 0;
         for (int s = 0; s < BS; s++) max_pos = std::max(max_pos, state->positions[s]);
         if (max_pos < 1024)
-            launch_attention_all_heads_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+            launch_attention_all_heads_batch(state->q_buf, kv_k, kv_v,
                 bf16_a, state->d_positions, n_head_local, n_head_kv_local, head_dim,
                 max_pos + 1, scale, BS, 0, s1);
         else
-            launch_flash_attention_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+            launch_flash_attention_batch(state->q_buf, kv_k, kv_v,
                 bf16_a, state->d_positions, n_head_local, n_head_kv_local, head_dim,
                 max_pos + 1, scale, BS, 0, s1);
 
@@ -778,9 +928,12 @@ static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
         GEMM_ONLY(L.w_up, bf16_a, state->ffn_up, n, L.w_gate.M, BS, s1);
         PATCHES_ASYNC(L.w_up, bf16_a, state->ffn_up, n, L.w_gate.M, BS, s1, s2, ev);
 
-        // Sync patches before silu_mul consumes gate+up
+        // Sync patches before activation consumes gate+up
         SYNC_PATCHES(s1, s2, ev);
-        launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, BS, s1);
+        if (cfg.activation_type == 1)
+            launch_gelu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, BS, s1);
+        else
+            launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, L.w_gate.M, BS, s1);
 
         // w_down: patches must finish before add_rms_norm
         GEMM_ONLY(L.w_down, bf16_b, cur, L.w_gate.M, n, BS, s1);
@@ -800,6 +953,10 @@ static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
     GEMM_ONLY(m->output_proj, bf16_a, state->logits, n, m->output_proj.M, BS, s1);
     PATCHES_ASYNC(m->output_proj, bf16_a, state->logits, n, m->output_proj.M, BS, s1, s2, ev);
     SYNC_PATCHES(s1, s2, ev);
+
+    // Gemma4: logit softcap
+    if (cfg.logit_softcap > 0)
+        launch_softcap(state->logits, cfg.n_vocab * BS, cfg.logit_softcap, s1);
 
     for (int s = 0; s < BS; s++) state->positions[s]++;
 }

@@ -64,23 +64,78 @@ def convert(model_dir, output_dir, tp=1):
     with open(os.path.join(model_dir, "config.json")) as f:
         cfg = json.load(f)
 
-    n_embd = cfg.get("hidden_size", cfg.get("dim", 4096))
-    n_head = cfg.get("num_attention_heads", cfg.get("n_heads", 32))
-    n_head_kv = cfg.get("num_key_value_heads", cfg.get("n_kv_heads", n_head))
-    n_layer = cfg.get("num_hidden_layers", cfg.get("n_layers", 32))
-    n_ff = cfg.get("intermediate_size", cfg.get("hidden_dim", n_embd * 4))
-    n_vocab = cfg.get("vocab_size", 32000)
-    n_ctx = cfg.get("max_position_embeddings", cfg.get("max_seq_len", 32768))
-    rope_theta = cfg.get("rope_theta", 10000.0)
-    rms_eps = cfg.get("rms_norm_eps", 1e-5)
+    # Detect Gemma 4: text model config is nested under text_config
+    is_gemma4 = cfg.get("model_type") == "gemma4"
+    tcfg = cfg.get("text_config", cfg) if is_gemma4 else cfg
+
+    n_embd = tcfg.get("hidden_size", tcfg.get("dim", 4096))
+    n_head = tcfg.get("num_attention_heads", tcfg.get("n_heads", 32))
+    n_head_kv = tcfg.get("num_key_value_heads", tcfg.get("n_kv_heads", n_head))
+    n_layer = tcfg.get("num_hidden_layers", tcfg.get("n_layers", 32))
+    n_ff = tcfg.get("intermediate_size", tcfg.get("hidden_dim", n_embd * 4))
+    n_vocab = tcfg.get("vocab_size", 32000)
+    n_ctx = tcfg.get("max_position_embeddings", tcfg.get("max_seq_len", 32768))
+    rope_theta = tcfg.get("rope_theta", 10000.0)
+    rms_eps = tcfg.get("rms_norm_eps", 1e-5)
+
+    # For Gemma 4, rope_theta comes from sliding_attention sub-dict
+    if is_gemma4:
+        rope_params = tcfg.get("rope_parameters", {})
+        rope_theta = rope_params.get("sliding_attention", {}).get("rope_theta", rope_theta)
 
     # Write config
-    config_data = struct.pack("iiiiiiiff",
-        n_vocab, n_embd, n_head, n_head_kv, n_layer, n_ff, n_ctx,
-        rope_theta, rms_eps)
-    with open(os.path.join(output_dir, "config.bin"), "wb") as f:
-        f.write(config_data)
-    print(f"Config: vocab={n_vocab} embd={n_embd} heads={n_head}/{n_head_kv} layers={n_layer} ff={n_ff}")
+    if is_gemma4:
+        # v2 format with Gemma4-specific fields
+        head_dim_sliding = tcfg.get("head_dim", 256)
+        head_dim_full = tcfg.get("global_head_dim", 512)
+        sliding_window = tcfg.get("sliding_window", 512)
+        logit_softcap = tcfg.get("final_logit_softcapping", 0.0)
+        num_kv_shared = tcfg.get("num_kv_shared_layers", 0)
+        rope_params = tcfg.get("rope_parameters", {})
+        rope_theta_full = rope_params.get("full_attention", {}).get("rope_theta", 1000000.0)
+        partial_rotary_factor = rope_params.get("full_attention", {}).get("partial_rotary_factor", 1.0)
+        hidden_act = tcfg.get("hidden_activation", "silu")
+        activation_type = 1 if "gelu" in hidden_act else 0
+        tie_embeddings = 1 if tcfg.get("tie_word_embeddings", False) else 0
+
+        # Layer types: 0=sliding, 1=full_attention
+        layer_types_str = tcfg.get("layer_types", [])
+        layer_types = []
+        for lt in layer_types_str:
+            layer_types.append(1 if lt == "full_attention" else 0)
+        # Pad to n_layer if needed
+        while len(layer_types) < n_layer:
+            layer_types.append(0)
+
+        config_data = b"TLv2"
+        config_data += struct.pack("iiiiiiiff",
+            n_vocab, n_embd, n_head, n_head_kv, n_layer, n_ff, n_ctx,
+            rope_theta, rms_eps)
+        config_data += struct.pack("iiififf",
+            head_dim_sliding, head_dim_full, sliding_window, logit_softcap,
+            num_kv_shared, rope_theta_full, partial_rotary_factor)
+        config_data += struct.pack("ii", activation_type, tie_embeddings)
+        config_data += bytes(layer_types[:n_layer])
+
+        with open(os.path.join(output_dir, "config.bin"), "wb") as f:
+            f.write(config_data)
+        print(f"Config (TLv2/Gemma4): vocab={n_vocab} embd={n_embd} heads={n_head}/{n_head_kv} "
+              f"layers={n_layer} ff={n_ff}")
+        print(f"  head_dim: sliding={head_dim_sliding} full={head_dim_full} "
+              f"sliding_window={sliding_window} softcap={logit_softcap}")
+        print(f"  rope: sliding={rope_theta} full={rope_theta_full} "
+              f"partial_rotary={partial_rotary_factor}")
+        print(f"  activation={hidden_act}({activation_type}) tie_embd={tie_embeddings} "
+              f"kv_shared={num_kv_shared}")
+        n_full = sum(layer_types[:n_layer])
+        print(f"  layer_types: {n_full} full_attention, {n_layer - n_full} sliding")
+    else:
+        config_data = struct.pack("iiiiiiiff",
+            n_vocab, n_embd, n_head, n_head_kv, n_layer, n_ff, n_ctx,
+            rope_theta, rms_eps)
+        with open(os.path.join(output_dir, "config.bin"), "wb") as f:
+            f.write(config_data)
+        print(f"Config: vocab={n_vocab} embd={n_embd} heads={n_head}/{n_head_kv} layers={n_layer} ff={n_ff}")
     if tp > 1:
         print(f"Tensor Parallelism: tp={tp}, row-split={ROW_SPLIT_NAMES}, col-split={COL_SPLIT_NAMES}")
 
@@ -90,6 +145,9 @@ def convert(model_dir, output_dir, tp=1):
     for shard in shards:
         f = safe_open(shard, framework="pt")
         for name in f.keys():
+            # For Gemma 4: filter out audio_tower/vision_tower tensors
+            if is_gemma4 and ("audio_tower" in name or "vision_tower" in name):
+                continue
             tensors[name] = (shard, name)
 
     # Name mapping: HF → our format
@@ -211,42 +269,111 @@ def convert(model_dir, output_dir, tp=1):
     total_size = 0
     t0 = time.time()
 
+    # Tensor name prefix differs for Gemma 4
+    lang_prefix = "model.language_model." if is_gemma4 else ""
+
     # Token embeddings (keep as BF16 — used for lookup not matvec)
-    embd_name = find_tensor("embed_tokens")
+    embd_key = f"{lang_prefix}embed_tokens.weight" if is_gemma4 else None
+    embd_name = embd_key if (embd_key and embd_key in tensors) else find_tensor("embed_tokens")
+    embd_tensor = None
     if embd_name:
         W = load_tensor(embd_name)
         sz = save_raw("tok_embd.bin", W.contiguous().view(torch.int16))
         total_size += sz
-        print(f"  tok_embd: {W.shape} → {sz/1e6:.1f} MB")
+        print(f"  tok_embd: {W.shape} -> {sz/1e6:.1f} MB")
+        if is_gemma4:
+            embd_tensor = W  # Keep for tied output_proj
 
-    # Output norm — must match exactly "model.norm.weight" not layer norms
-    norm_name = find_tensor("model.norm.weight")
+    # Output norm — must match exactly "model.norm.weight" (or language_model.norm.weight for Gemma4)
+    norm_key = f"{lang_prefix}norm.weight" if is_gemma4 else "model.norm.weight"
+    norm_name = norm_key if norm_key in tensors else find_tensor("model.norm.weight")
     if norm_name:
         W = load_tensor(norm_name).float()
         save_raw("output_norm.bin", W)
 
-    # Output projection (lm_head)
-    out_name = find_tensor("lm_head")
-    if out_name:
-        W = load_tensor(out_name)
+    # Output projection (lm_head) — or tied embeddings for Gemma 4
+    if is_gemma4 and tcfg.get("tie_word_embeddings", False) and embd_tensor is not None:
+        # Tied embeddings: embed_tokens IS the output projection
+        W = embd_tensor
         if W.dtype == torch.bfloat16 and W.ndim == 2:
             if tp > 1:
                 shard_and_save("output_proj", "output_proj", W)
-                print(f"  output_proj: {W.shape} -> {tp} TP shards (row-split)")
+                print(f"  output_proj (tied): {W.shape} -> {tp} TP shards (row-split)")
             else:
                 esc = save_compressed("output_proj", W)
-                print(f"  output_proj: {W.shape} escapes={esc}")
+                print(f"  output_proj (tied from embed_tokens): {W.shape} escapes={esc}")
+    else:
+        out_name = find_tensor("lm_head")
+        if out_name:
+            W = load_tensor(out_name)
+            if W.dtype == torch.bfloat16 and W.ndim == 2:
+                if tp > 1:
+                    shard_and_save("output_proj", "output_proj", W)
+                    print(f"  output_proj: {W.shape} -> {tp} TP shards (row-split)")
+                else:
+                    esc = save_compressed("output_proj", W)
+                    print(f"  output_proj: {W.shape} escapes={esc}")
+
+    # Gemma 4: save per-layer input embedding and projection tensors
+    if is_gemma4:
+        for extra_name, out_file in [
+            (f"{lang_prefix}embed_tokens_per_layer.weight", "embed_tokens_per_layer.bin"),
+            (f"{lang_prefix}per_layer_model_projection.weight", "per_layer_model_projection.bin"),
+            (f"{lang_prefix}per_layer_projection_norm.weight", "per_layer_projection_norm.bin"),
+        ]:
+            if extra_name in tensors:
+                W = load_tensor(extra_name)
+                sz = save_raw(out_file, W.contiguous().view(torch.int16) if W.dtype == torch.bfloat16 and W.ndim >= 2 else W.float())
+                print(f"  {out_file}: {W.shape} -> {sz/1e6:.1f} MB")
 
     # Layers
     for layer in range(n_layer):
         print(f"  Layer {layer}/{n_layer}...", end="", flush=True)
 
         # Attention norms
-        for norm_type, suffix in [("input_layernorm", "attn_norm"), ("post_attention_layernorm", "ffn_norm")]:
+        norm_map = [("input_layernorm", "attn_norm"), ("post_attention_layernorm", "ffn_norm")]
+        if is_gemma4:
+            norm_map += [
+                ("pre_feedforward_layernorm", "pre_ffn_norm"),
+                ("post_feedforward_layernorm", "post_ffn_norm"),
+                ("post_per_layer_input_norm", "post_pli_norm"),
+            ]
+        for norm_type, suffix in norm_map:
             name = find_tensor(f"layers.{layer}.{norm_type}")
             if name:
                 W = load_tensor(name).float()
                 save_raw(f"layer.{layer}.{suffix}.bin", W)
+
+        # Gemma 4: q_norm, k_norm (save as FP32)
+        if is_gemma4:
+            for qk_name, qk_suffix in [("q_norm", "q_norm"), ("k_norm", "k_norm")]:
+                name = find_tensor(f"layers.{layer}.self_attn.{qk_name}")
+                if name:
+                    W = load_tensor(name).float()
+                    save_raw(f"layer.{layer}.{qk_suffix}.bin", W)
+
+        # Gemma 4: layer_scalar (save as FP32)
+        if is_gemma4:
+            scalar_name = find_tensor(f"layers.{layer}.layer_scalar")
+            if scalar_name:
+                W = load_tensor(scalar_name).float()
+                save_raw(f"layer.{layer}.layer_scalar.bin", W)
+
+        # Gemma 4: per_layer_input_gate and per_layer_projection (compress as BF16 2D)
+        if is_gemma4:
+            for pli_name, pli_suffix in [
+                ("per_layer_input_gate", "pli_gate"),
+                ("per_layer_projection", "pli_proj"),
+            ]:
+                name = find_tensor(f"layers.{layer}.{pli_name}")
+                if name:
+                    W = load_tensor(name)
+                    if W.dtype == torch.bfloat16 and W.ndim == 2:
+                        prefix = f"layer.{layer}.{pli_suffix}"
+                        if tp > 1:
+                            shard_and_save(pli_suffix, prefix, W)
+                        else:
+                            save_compressed(prefix, W)
 
         # Weight tensors
         weight_map = {
@@ -271,6 +398,16 @@ def convert(model_dir, output_dir, tp=1):
                         save_compressed(prefix, W)
 
         print(f" done")
+
+    # Copy tokenizer files
+    import shutil
+    tokenizer_files = ["tokenizer.model", "tokenizer.json", "tokenizer_config.json"]
+    for tf in tokenizer_files:
+        src = os.path.join(model_dir, tf)
+        if os.path.exists(src):
+            dst = os.path.join(output_dir, tf)
+            shutil.copy2(src, dst)
+            print(f"  Copied {tf}")
 
     elapsed = time.time() - t0
     print(f"\nConversion complete in {elapsed:.1f}s")
