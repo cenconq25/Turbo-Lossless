@@ -55,7 +55,7 @@ All methods exploit the same observation: BF16 exponents have ~2.6 bits of entro
 | **NeuZip** | arXiv'24 | ~10.6 | ANS | No | Also supports training |
 | **Huff-LLM** | arXiv'25 | ~11.6 | CAM | ASIC only | Custom silicon, not GPU |
 
-**Key differences from ZipServ** (our closest competitor):
+**Key differences from other approaches:**
 - We use 4-bit fixed group codes (15 exponents, 0.03% escapes); they use 3-bit bitmap codewords (7 exponents, ~3% escapes)
 - We store in two byte-aligned arrays (Split12); they use triple 64-bit bitmaps per 8×8 tile
 - We decode with 1 integer ADD; they decode with bitmap extract + popcount
