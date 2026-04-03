@@ -31,29 +31,29 @@ Decode: exponent = BaseExp + group  (one integer ADD)
 
 ### Mistral 7B Instruct
 
-| Batch | Kernel | llama.cpp BF16 | vLLM BF16 | Turbo 12-bit | vs llama.cpp | vs vLLM | VRAM |
-|------:|:------:|---------------:|----------:|-------------:|:------------:|:-------:|-----:|
-| B=1 | split12 | 55.7 tok/s | 54.7 | **60.0** | **1.08x** | **1.10x** | 11.1 GB |
+| Batch | Kernel | llama.cpp | vLLM | Turbo | vs llama.cpp | vs vLLM | VRAM |
+|------:|:------:|----------:|-----:|------:|:------------:|:-------:|-----:|
+| B=1 | split12 | 55.7 | 54.7 | **60.0** | **1.08x** | **1.10x** | 11.1 GB |
 | B=8 | split12 | — | 414.6 | **162.6** | — | — | 11.1 GB |
 | B=32 | split12 | — | 694.2 | **1,136** | — | **1.64x** | 11.2 GB |
 | B=64 | V3 TMA | — | 853 | **1,514** | — | **1.77x** | 12.7 GB |
 | B=128 | V3 TMA | — | 942 | **2,197** | — | **2.33x** | 12.7 GB |
 | B=256 | V3 TMA | — | 872 | **2,554** | — | **2.93x** | 12.7 GB |
 
-llama.cpp uses 13.5 GB (BF16 GGUF). vLLM uses 15.3 GB (max ~1 user). Turbo serves 256 users at 12.7 GB.
+All values in tok/s. llama.cpp uses 13.5 GB. vLLM uses 15.3 GB (max ~1 user). Turbo serves 256 users at 12.7 GB.
 
 ### Llama 3.1 8B Instruct
 
-| Batch | Kernel | llama.cpp BF16 | vLLM BF16 | Turbo 12-bit | vs llama.cpp | VRAM |
-|------:|:------:|---------------:|----------:|-------------:|:------------:|-----:|
-| B=1 | split12 | 52.9 tok/s | OOM | **57.0** | **1.08x** | 12.4 GB |
+| Batch | Kernel | llama.cpp | vLLM | Turbo | vs llama.cpp | VRAM |
+|------:|:------:|----------:|-----:|------:|:------------:|-----:|
+| B=1 | split12 | 52.9 | OOM | **57.0** | **1.08x** | 12.4 GB |
 | B=8 | split12 | — | OOM | **154.3** | — | 12.4 GB |
 | B=32 | split12 | — | OOM | **1,069** | — | 12.5 GB |
 | B=64 | V3 TMA | — | OOM | **1,439** | — | 14.0 GB |
 | B=128 | V3 TMA | — | OOM | **2,111** | — | 14.0 GB |
 | B=256 | V3 TMA | — | OOM | **2,471** | — | 14.1 GB |
 
-llama.cpp uses 15.0 GB (BF16 GGUF). vLLM OOMs on 16 GB. Turbo: 14.1 GB serving 256 users.
+All values in tok/s. llama.cpp uses 15.0 GB. vLLM OOMs on 16 GB. Turbo: 14.1 GB serving 256 users.
 
 **Kernels:** `split12` = per-row bandwidth-optimized matvec (B<=32). `V3 TMA` = fused decode+GEMM with Blackwell tensor memory loads (B>8). Auto-selected.
 
