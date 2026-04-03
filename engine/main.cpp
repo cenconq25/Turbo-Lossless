@@ -137,9 +137,12 @@ int main(int argc, char** argv) {
                 tokens.erase(tokens.begin());
             }
 
-            // Context shift: if nearly full, discard older half (keep recent context)
+            // Context shift: attention is O(n) per token (~8% at 500, ~15% at 1K).
+            // Shift when context exceeds 1024 to keep speed above ~55 tok/s.
+            // After shift, recent ~512 tokens of conversation memory are kept.
+            int shift_limit = 1024;
             int headroom = (int)tokens.size() + max_tokens + 64;
-            if (current_pos + headroom > model->max_seq_len) {
+            if (current_pos + headroom > model->max_seq_len || current_pos > shift_limit) {
                 int discard = current_pos / 2;
                 printf("Context shifting: discarding %d oldest tokens\n", discard);
                 // Shift KV cache: move [discard..current_pos) → [0..current_pos-discard)
@@ -166,6 +169,8 @@ int main(int argc, char** argv) {
             }
             current_pos = state->positions[0];
 
+            // Sync GPU before timing — otherwise first sample_greedy includes prefill latency
+            hipDeviceSynchronize();
             clock_gettime(CLOCK_MONOTONIC, &t0);  // restart timer for decode only
 
             // Decode: generate new tokens
