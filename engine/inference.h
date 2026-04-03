@@ -30,6 +30,9 @@ struct InferenceState {
     int16_t* bf16_act;      // [batch_size * max(n_embd, n_ff)] BF16 temp
     int16_t* bf16_act2;     // second buffer for ffn (gate input differs from attn input)
 
+    // Batched patch descriptor buffer (B=1: 7 tensors/layer, 56 bytes each = 392 bytes)
+    void* patch_descs_gpu;  // GPU buffer for PatchBatchDesc array (max 8 entries)
+
 #ifdef TURBO_NVIDIA
     void* weight_buf;       // [2 × max_M * max_K] BF16 ping-pong for cuBLAS decode+GEMM
     int weight_buf_half;    // elements per half-buffer (max_M × max_K)

@@ -64,8 +64,8 @@ __global__ void nv_split12_matvec(
 
     int col = tid;
     for (; col + BLOCK_DIM * 3 < K; col += BLOCK_DIM * 4) {
-        uint8_t sm0 = sm_ptr[0], sm1 = sm_ptr[256], sm2 = sm_ptr[512], sm3 = sm_ptr[768];
-        uint8_t gb0 = gr_ptr[0], gb1 = gr_ptr[128], gb2 = gr_ptr[256], gb3 = gr_ptr[384];
+        uint8_t sm0 = __ldg(&sm_ptr[0]), sm1 = __ldg(&sm_ptr[256]), sm2 = __ldg(&sm_ptr[512]), sm3 = __ldg(&sm_ptr[768]);
+        uint8_t gb0 = __ldg(&gr_ptr[0]), gb1 = __ldg(&gr_ptr[128]), gb2 = __ldg(&gr_ptr[256]), gb3 = __ldg(&gr_ptr[384]);
         uint32_t g0 = is_odd ? (gb0>>4) : (gb0&0xF), g1 = is_odd ? (gb1>>4) : (gb1&0xF);
         uint32_t g2 = is_odd ? (gb2>>4) : (gb2&0xF), g3 = is_odd ? (gb3>>4) : (gb3&0xF);
         union { uint32_t u; float f; } c0, c1, c2, c3;
@@ -73,18 +73,18 @@ __global__ void nv_split12_matvec(
         c1.u = (((uint32_t)(sm1>>7))<<15 | ((uint32_t)(base_exp+g1))<<7 | (sm1&0x7F)) << 16;
         c2.u = (((uint32_t)(sm2>>7))<<15 | ((uint32_t)(base_exp+g2))<<7 | (sm2&0x7F)) << 16;
         c3.u = (((uint32_t)(sm3>>7))<<15 | ((uint32_t)(base_exp+g3))<<7 | (sm3&0x7F)) << 16;
-        sum0 += c0.f * bf16_to_float(*(const int16_t*)(act_ptr));
-        sum1 += c1.f * bf16_to_float(*(const int16_t*)(act_ptr + 512));
-        sum2 += c2.f * bf16_to_float(*(const int16_t*)(act_ptr + 1024));
-        sum3 += c3.f * bf16_to_float(*(const int16_t*)(act_ptr + 1536));
+        sum0 += c0.f * bf16_to_float(__ldg((const int16_t*)(act_ptr)));
+        sum1 += c1.f * bf16_to_float(__ldg((const int16_t*)(act_ptr + 512)));
+        sum2 += c2.f * bf16_to_float(__ldg((const int16_t*)(act_ptr + 1024)));
+        sum3 += c3.f * bf16_to_float(__ldg((const int16_t*)(act_ptr + 1536)));
         sm_ptr += 1024; gr_ptr += 512; act_ptr += 2048;
     }
     for (; col < K; col += BLOCK_DIM) {
-        uint8_t sm = sm_ptr[0], gb = gr_ptr[0];
+        uint8_t sm = __ldg(&sm_ptr[0]), gb = __ldg(&gr_ptr[0]);
         uint32_t g = is_odd ? (gb>>4) : (gb&0xF);
         union { uint32_t u; float f; } c;
         c.u = (((uint32_t)(sm>>7))<<15 | ((uint32_t)(base_exp+g))<<7 | (sm&0x7F)) << 16;
-        sum0 += c.f * bf16_to_float(*(const int16_t*)(act_ptr));
+        sum0 += c.f * bf16_to_float(__ldg((const int16_t*)(act_ptr)));
         sm_ptr += 256; gr_ptr += 128; act_ptr += 512;
     }
     float sum = sum0 + sum1 + sum2 + sum3;
@@ -122,13 +122,13 @@ __global__ void nv_split12_matvec_multirow(
 
     int col = tid;
     for (; col + BLOCK_DIM * 3 < K; col += BLOCK_DIM * 4) {
-        float a0 = bf16_to_float(*(const int16_t*)(act_ptr));
-        float a1 = bf16_to_float(*(const int16_t*)(act_ptr + 512));
-        float a2 = bf16_to_float(*(const int16_t*)(act_ptr + 1024));
-        float a3 = bf16_to_float(*(const int16_t*)(act_ptr + 1536));
+        float a0 = bf16_to_float(__ldg((const int16_t*)(act_ptr)));
+        float a1 = bf16_to_float(__ldg((const int16_t*)(act_ptr + 512)));
+        float a2 = bf16_to_float(__ldg((const int16_t*)(act_ptr + 1024)));
+        float a3 = bf16_to_float(__ldg((const int16_t*)(act_ptr + 1536)));
         #define DECODE4(ptr, grp, s0, s1, s2, s3) { \
-            uint8_t _s0=ptr[0],_s1=ptr[256],_s2=ptr[512],_s3=ptr[768]; \
-            uint8_t _g0=grp[0],_g1=grp[128],_g2=grp[256],_g3=grp[384]; \
+            uint8_t _s0=__ldg(&ptr[0]),_s1=__ldg(&ptr[256]),_s2=__ldg(&ptr[512]),_s3=__ldg(&ptr[768]); \
+            uint8_t _g0=__ldg(&grp[0]),_g1=__ldg(&grp[128]),_g2=__ldg(&grp[256]),_g3=__ldg(&grp[384]); \
             uint32_t _e0=is_odd?(_g0>>4):(_g0&0xF), _e1=is_odd?(_g1>>4):(_g1&0xF); \
             uint32_t _e2=is_odd?(_g2>>4):(_g2&0xF), _e3=is_odd?(_g3>>4):(_g3&0xF); \
             union{uint32_t u;float f;} _c0,_c1,_c2,_c3; \
@@ -143,13 +143,13 @@ __global__ void nv_split12_matvec_multirow(
         sm0p+=1024; gr0p+=512; sm1p+=1024; gr1p+=512; act_ptr+=2048;
     }
     for (; col < K; col += BLOCK_DIM) {
-        float a = bf16_to_float(*(const int16_t*)(act_ptr));
-        uint8_t s0=sm0p[0], g0=gr0p[0]; uint32_t e0=is_odd?(g0>>4):(g0&0xF);
+        float a = bf16_to_float(__ldg((const int16_t*)(act_ptr)));
+        uint8_t s0=__ldg(&sm0p[0]), g0=__ldg(&gr0p[0]); uint32_t e0=is_odd?(g0>>4):(g0&0xF);
         union{uint32_t u;float f;} c0;
         c0.u=((uint32_t)(s0>>7)<<15|(uint32_t)(base_exp+e0)<<7|(s0&0x7F))<<16;
         sa0 += c0.f * a;
         if (has_row1) {
-            uint8_t s1=sm1p[0], g1=gr1p[0]; uint32_t e1=is_odd?(g1>>4):(g1&0xF);
+            uint8_t s1=__ldg(&sm1p[0]), g1=__ldg(&gr1p[0]); uint32_t e1=is_odd?(g1>>4):(g1&0xF);
             union{uint32_t u;float f;} c1;
             c1.u=((uint32_t)(s1>>7)<<15|(uint32_t)(base_exp+e1)<<7|(s1&0x7F))<<16;
             sb0 += c1.f * a;
@@ -171,6 +171,97 @@ __global__ void nv_split12_matvec_multirow(
         for (int w=0; w<NUM_WARPS; w++) { s0+=warp_sums[w]; s1+=warp_sums[NUM_WARPS+w]; }
         output[row0] = s0;
         if (has_row1) output[row1] = s1;
+    }
+}
+
+// ============================================================
+// B=1 Dual Matvec (gate+up fused, shared activation reads)
+// ============================================================
+__launch_bounds__(BLOCK_DIM)
+__global__ void nv_split12_matvec_dual(
+    const uint8_t* __restrict__ sm_a, const uint8_t* __restrict__ gr_a, int base_exp_a,
+    const uint8_t* __restrict__ sm_b, const uint8_t* __restrict__ gr_b, int base_exp_b,
+    const int16_t* __restrict__ activations,
+    float* __restrict__ output_a, float* __restrict__ output_b,
+    int M, int K)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    __shared__ float warp_sums[NUM_WARPS * 2];  // [0..NW-1] for A, [NW..2*NW-1] for B
+    float sa0=0,sa1=0,sa2=0,sa3=0, sb0=0,sb1=0,sb2=0,sb3=0;
+
+    const uint8_t* sma_p = sm_a + (int64_t)row * K + tid;
+    const uint8_t* gra_p = gr_a + (int64_t)row * K / 2 + tid / 2;
+    const uint8_t* smb_p = sm_b + (int64_t)row * K + tid;
+    const uint8_t* grb_p = gr_b + (int64_t)row * K / 2 + tid / 2;
+    const char* act_ptr = (const char*)(activations + tid);
+    const int is_odd = tid & 1;
+
+    int col = tid;
+    for (; col + BLOCK_DIM * 3 < K; col += BLOCK_DIM * 4) {
+        float a0 = bf16_to_float(__ldg((const int16_t*)(act_ptr)));
+        float a1 = bf16_to_float(__ldg((const int16_t*)(act_ptr + 512)));
+        float a2 = bf16_to_float(__ldg((const int16_t*)(act_ptr + 1024)));
+        float a3 = bf16_to_float(__ldg((const int16_t*)(act_ptr + 1536)));
+        // Decode weight A
+        {
+            uint8_t _s0=__ldg(&sma_p[0]),_s1=__ldg(&sma_p[256]),_s2=__ldg(&sma_p[512]),_s3=__ldg(&sma_p[768]);
+            uint8_t _g0=__ldg(&gra_p[0]),_g1=__ldg(&gra_p[128]),_g2=__ldg(&gra_p[256]),_g3=__ldg(&gra_p[384]);
+            uint32_t _e0=is_odd?(_g0>>4):(_g0&0xF), _e1=is_odd?(_g1>>4):(_g1&0xF);
+            uint32_t _e2=is_odd?(_g2>>4):(_g2&0xF), _e3=is_odd?(_g3>>4):(_g3&0xF);
+            union{uint32_t u;float f;} _c0,_c1,_c2,_c3;
+            _c0.u=((uint32_t)(_s0>>7)<<15|(uint32_t)(base_exp_a+_e0)<<7|(_s0&0x7F))<<16;
+            _c1.u=((uint32_t)(_s1>>7)<<15|(uint32_t)(base_exp_a+_e1)<<7|(_s1&0x7F))<<16;
+            _c2.u=((uint32_t)(_s2>>7)<<15|(uint32_t)(base_exp_a+_e2)<<7|(_s2&0x7F))<<16;
+            _c3.u=((uint32_t)(_s3>>7)<<15|(uint32_t)(base_exp_a+_e3)<<7|(_s3&0x7F))<<16;
+            sa0+=_c0.f*a0; sa1+=_c1.f*a1; sa2+=_c2.f*a2; sa3+=_c3.f*a3;
+        }
+        // Decode weight B
+        {
+            uint8_t _s0=__ldg(&smb_p[0]),_s1=__ldg(&smb_p[256]),_s2=__ldg(&smb_p[512]),_s3=__ldg(&smb_p[768]);
+            uint8_t _g0=__ldg(&grb_p[0]),_g1=__ldg(&grb_p[128]),_g2=__ldg(&grb_p[256]),_g3=__ldg(&grb_p[384]);
+            uint32_t _e0=is_odd?(_g0>>4):(_g0&0xF), _e1=is_odd?(_g1>>4):(_g1&0xF);
+            uint32_t _e2=is_odd?(_g2>>4):(_g2&0xF), _e3=is_odd?(_g3>>4):(_g3&0xF);
+            union{uint32_t u;float f;} _c0,_c1,_c2,_c3;
+            _c0.u=((uint32_t)(_s0>>7)<<15|(uint32_t)(base_exp_b+_e0)<<7|(_s0&0x7F))<<16;
+            _c1.u=((uint32_t)(_s1>>7)<<15|(uint32_t)(base_exp_b+_e1)<<7|(_s1&0x7F))<<16;
+            _c2.u=((uint32_t)(_s2>>7)<<15|(uint32_t)(base_exp_b+_e2)<<7|(_s2&0x7F))<<16;
+            _c3.u=((uint32_t)(_s3>>7)<<15|(uint32_t)(base_exp_b+_e3)<<7|(_s3&0x7F))<<16;
+            sb0+=_c0.f*a0; sb1+=_c1.f*a1; sb2+=_c2.f*a2; sb3+=_c3.f*a3;
+        }
+        sma_p+=1024; gra_p+=512; smb_p+=1024; grb_p+=512; act_ptr+=2048;
+    }
+    for (; col < K; col += BLOCK_DIM) {
+        float a = bf16_to_float(__ldg((const int16_t*)(act_ptr)));
+        {
+            uint8_t s=__ldg(&sma_p[0]), g=__ldg(&gra_p[0]); uint32_t e=is_odd?(g>>4):(g&0xF);
+            union{uint32_t u;float f;} c;
+            c.u=((uint32_t)(s>>7)<<15|(uint32_t)(base_exp_a+e)<<7|(s&0x7F))<<16;
+            sa0 += c.f * a;
+        }
+        {
+            uint8_t s=__ldg(&smb_p[0]), g=__ldg(&grb_p[0]); uint32_t e=is_odd?(g>>4):(g&0xF);
+            union{uint32_t u;float f;} c;
+            c.u=((uint32_t)(s>>7)<<15|(uint32_t)(base_exp_b+e)<<7|(s&0x7F))<<16;
+            sb0 += c.f * a;
+        }
+        sma_p+=256; gra_p+=128; smb_p+=256; grb_p+=128; act_ptr+=512;
+    }
+    float sumA = sa0+sa1+sa2+sa3, sumB = sb0+sb1+sb2+sb3;
+    for (int off=WARP_SIZE/2; off>0; off>>=1) {
+        sumA += __shfl_down_sync(0xFFFFFFFF, sumA, off, WARP_SIZE);
+        sumB += __shfl_down_sync(0xFFFFFFFF, sumB, off, WARP_SIZE);
+    }
+    if ((tid&(WARP_SIZE-1))==0) {
+        warp_sums[tid/WARP_SIZE] = sumA;
+        warp_sums[NUM_WARPS + tid/WARP_SIZE] = sumB;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float sA=0, sB=0;
+        for (int w=0; w<NUM_WARPS; w++) { sA+=warp_sums[w]; sB+=warp_sums[NUM_WARPS+w]; }
+        output_a[row] = sA;
+        output_b[row] = sB;
     }
 }
 
@@ -305,6 +396,18 @@ int nv_launch_split12_v2_async(
             (const uint8_t*)sm, (const uint8_t*)gr, base_exp,
             (const int16_t*)act, (float*)out, M, K);
     }
+    return 0;
+}
+
+int nv_launch_split12_v2_dual_async(
+    const void* sm_a, const void* gr_a, int base_exp_a,
+    const void* sm_b, const void* gr_b, int base_exp_b,
+    const void* act, void* out_a, void* out_b, int M, int K, void* stream)
+{
+    nv_split12_matvec_dual<<<M, BLOCK_DIM, 0, (cudaStream_t)stream>>>(
+        (const uint8_t*)sm_a, (const uint8_t*)gr_a, base_exp_a,
+        (const uint8_t*)sm_b, (const uint8_t*)gr_b, base_exp_b,
+        (const int16_t*)act, (float*)out_a, (float*)out_b, M, K);
     return 0;
 }
 

@@ -65,6 +65,48 @@ float structured12_decode(uint32_t raw12, int base_exp) {
 }
 
 // ---------------------------------------------------------------------------
+// Batched patch descriptor for B=1 multi-tensor patch correction
+// Eliminates ~192 tiny kernel launches per token (7 per layer × 32 layers)
+// ---------------------------------------------------------------------------
+struct PatchBatchDesc {
+    const int32_t* row_offsets;
+    const int32_t* patch_cols;
+    const int16_t* patch_correct;
+    const int16_t* patch_wrong;
+    const int16_t* activations;
+    float*         output;
+    int            M;
+};
+
+// ---------------------------------------------------------------------------
+// Batched patch correction: one launch corrects up to N weight tensors
+// Grid: (max_M, num_descs), Block: WARP_SIZE
+// blockIdx.y selects tensor, blockIdx.x selects row within that tensor
+// ---------------------------------------------------------------------------
+__global__ void apply_patches_b1_batched(
+    const PatchBatchDesc* __restrict__ descs,
+    int num_descs)
+{
+    int desc_idx = blockIdx.y;
+    if (desc_idx >= num_descs) return;
+
+    PatchBatchDesc d = descs[desc_idx];
+    int row = blockIdx.x;
+    if (row >= d.M) return;
+
+    int tid = threadIdx.x;
+    int start = d.row_offsets[row];
+    int end   = d.row_offsets[row + 1];
+    float correction = 0.0f;
+    for (int p = start + tid; p < end; p += WARP_SIZE)
+        correction += (bf16_to_float(d.patch_correct[p]) - bf16_to_float(d.patch_wrong[p]))
+                      * bf16_to_float(d.activations[d.patch_cols[p]]);
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+        correction += __shfl_down(correction, off, WARP_SIZE);
+    if (tid == 0 && correction != 0.0f) d.output[row] += correction;
+}
+
+// ---------------------------------------------------------------------------
 // Patch correction kernel: wavefront-parallel two-pass escape correction
 // Applied after structured12_matvec_v2 to fix escape values (group=0)
 // ---------------------------------------------------------------------------
@@ -111,6 +153,23 @@ int launch_patches_v2_async(const void* row_offsets, const void* patch_cols,
         (const int32_t*)row_offsets, (const int32_t*)patch_cols,
         (const int16_t*)correct_vals, (const int16_t*)wrong_vals,
         (const int16_t*)activations, (float*)output, M);
+    return 0;
+}
+
+// Batched B=1 patch correction: corrects multiple weight tensors in one launch
+// descs_gpu: pre-allocated GPU buffer for PatchBatchDesc array
+// descs_cpu: host-side descriptor array (up to 7 entries per layer)
+// num_descs: number of valid descriptors (0 = skip)
+// max_M: largest M across all descriptors (grid X dimension)
+int launch_patches_b1_batched_async(void* descs_gpu, const void* descs_cpu,
+    int num_descs, int max_M, void* stream) {
+    if (num_descs == 0 || max_M == 0) return 0;
+    // Async copy descriptors to GPU (small: num_descs * 56 bytes)
+    hipMemcpyAsync(descs_gpu, descs_cpu, num_descs * sizeof(PatchBatchDesc),
+                   hipMemcpyHostToDevice, (hipStream_t)stream);
+    dim3 grid(max_M, num_descs);
+    hipLaunchKernelGGL(apply_patches_b1_batched, grid, dim3(WARP_SIZE), 0, (hipStream_t)stream,
+        (const PatchBatchDesc*)descs_gpu, num_descs);
     return 0;
 }
 }
@@ -956,7 +1015,945 @@ __global__ void split12_matvec_v2_dual(
     }
 }
 
+// ===========================================================================
+// VARIANT A: __ldg() read-only cache path (NVIDIA texture cache bypass L1)
+// On AMD: __ldg is a no-op, falls back to normal load
+// ===========================================================================
+#ifdef TURBO_NVIDIA
+#define TURBO_LDG(ptr) __ldg(ptr)
+#else
+#define TURBO_LDG(ptr) (*(ptr))
+#endif
+
+// ---------------------------------------------------------------------------
+// Split12 multirow v3_ldg: __ldg() on all weight and activation reads
+// ---------------------------------------------------------------------------
+__launch_bounds__(WORKGROUP_SIZE)
+__global__ void split12_matvec_v3_ldg_multirow(
+    const uint8_t* __restrict__ sign_mantissa,
+    const uint8_t* __restrict__ groups,
+    int base_exp,
+    const int16_t* __restrict__ activations,
+    float* __restrict__ output,
+    int M, int K)
+{
+    const int row0 = blockIdx.x * 2;
+    const int row1 = row0 + 1;
+    const int tid = threadIdx.x;
+    __shared__ float warp_sums[NUM_WARPS * 2];
+
+    float sum_a0 = 0.0f, sum_a1 = 0.0f, sum_a2 = 0.0f, sum_a3 = 0.0f;
+    float sum_b0 = 0.0f, sum_b1 = 0.0f, sum_b2 = 0.0f, sum_b3 = 0.0f;
+
+    const int has_row1 = (row1 < M);
+
+    const uint8_t* sm_ptr0 = sign_mantissa + (int64_t)row0 * K + tid;
+    const uint8_t* gr_ptr0 = groups + (int64_t)row0 * K / 2 + tid / 2;
+    const uint8_t* sm_ptr1 = sign_mantissa + (int64_t)row1 * K + tid;
+    const uint8_t* gr_ptr1 = groups + (int64_t)row1 * K / 2 + tid / 2;
+    const int16_t* act_base = activations + tid;
+
+    const int is_odd = tid & 1;
+
+    int col = tid;
+    for (; col + WORKGROUP_SIZE * 3 < K; col += WORKGROUP_SIZE * 4) {
+        float a0 = bf16_to_float(TURBO_LDG(act_base));
+        float a1 = bf16_to_float(TURBO_LDG(act_base + WORKGROUP_SIZE));
+        float a2 = bf16_to_float(TURBO_LDG(act_base + WORKGROUP_SIZE * 2));
+        float a3 = bf16_to_float(TURBO_LDG(act_base + WORKGROUP_SIZE * 3));
+
+        uint8_t sm0_0 = TURBO_LDG(sm_ptr0);
+        uint8_t sm0_1 = TURBO_LDG(sm_ptr0 + WORKGROUP_SIZE);
+        uint8_t sm0_2 = TURBO_LDG(sm_ptr0 + WORKGROUP_SIZE * 2);
+        uint8_t sm0_3 = TURBO_LDG(sm_ptr0 + WORKGROUP_SIZE * 3);
+        uint8_t gb0_0 = TURBO_LDG(gr_ptr0);
+        uint8_t gb0_1 = TURBO_LDG(gr_ptr0 + WORKGROUP_SIZE / 2);
+        uint8_t gb0_2 = TURBO_LDG(gr_ptr0 + WORKGROUP_SIZE);
+        uint8_t gb0_3 = TURBO_LDG(gr_ptr0 + WORKGROUP_SIZE * 3 / 2);
+
+        uint32_t g0_0 = is_odd ? (gb0_0 >> 4) : (gb0_0 & 0xF);
+        uint32_t g0_1 = is_odd ? (gb0_1 >> 4) : (gb0_1 & 0xF);
+        uint32_t g0_2 = is_odd ? (gb0_2 >> 4) : (gb0_2 & 0xF);
+        uint32_t g0_3 = is_odd ? (gb0_3 >> 4) : (gb0_3 & 0xF);
+
+        union { uint32_t u; float f; } c0_0, c0_1, c0_2, c0_3;
+        c0_0.u = (((uint32_t)(sm0_0 >> 7)) << 15 | ((uint32_t)(base_exp + g0_0)) << 7 | (sm0_0 & 0x7F)) << 16;
+        c0_1.u = (((uint32_t)(sm0_1 >> 7)) << 15 | ((uint32_t)(base_exp + g0_1)) << 7 | (sm0_1 & 0x7F)) << 16;
+        c0_2.u = (((uint32_t)(sm0_2 >> 7)) << 15 | ((uint32_t)(base_exp + g0_2)) << 7 | (sm0_2 & 0x7F)) << 16;
+        c0_3.u = (((uint32_t)(sm0_3 >> 7)) << 15 | ((uint32_t)(base_exp + g0_3)) << 7 | (sm0_3 & 0x7F)) << 16;
+
+        sum_a0 += c0_0.f * a0;
+        sum_a1 += c0_1.f * a1;
+        sum_a2 += c0_2.f * a2;
+        sum_a3 += c0_3.f * a3;
+
+        if (has_row1) {
+            uint8_t sm1_0 = TURBO_LDG(sm_ptr1);
+            uint8_t sm1_1 = TURBO_LDG(sm_ptr1 + WORKGROUP_SIZE);
+            uint8_t sm1_2 = TURBO_LDG(sm_ptr1 + WORKGROUP_SIZE * 2);
+            uint8_t sm1_3 = TURBO_LDG(sm_ptr1 + WORKGROUP_SIZE * 3);
+            uint8_t gb1_0 = TURBO_LDG(gr_ptr1);
+            uint8_t gb1_1 = TURBO_LDG(gr_ptr1 + WORKGROUP_SIZE / 2);
+            uint8_t gb1_2 = TURBO_LDG(gr_ptr1 + WORKGROUP_SIZE);
+            uint8_t gb1_3 = TURBO_LDG(gr_ptr1 + WORKGROUP_SIZE * 3 / 2);
+
+            uint32_t g1_0 = is_odd ? (gb1_0 >> 4) : (gb1_0 & 0xF);
+            uint32_t g1_1 = is_odd ? (gb1_1 >> 4) : (gb1_1 & 0xF);
+            uint32_t g1_2 = is_odd ? (gb1_2 >> 4) : (gb1_2 & 0xF);
+            uint32_t g1_3 = is_odd ? (gb1_3 >> 4) : (gb1_3 & 0xF);
+
+            union { uint32_t u; float f; } c1_0, c1_1, c1_2, c1_3;
+            c1_0.u = (((uint32_t)(sm1_0 >> 7)) << 15 | ((uint32_t)(base_exp + g1_0)) << 7 | (sm1_0 & 0x7F)) << 16;
+            c1_1.u = (((uint32_t)(sm1_1 >> 7)) << 15 | ((uint32_t)(base_exp + g1_1)) << 7 | (sm1_1 & 0x7F)) << 16;
+            c1_2.u = (((uint32_t)(sm1_2 >> 7)) << 15 | ((uint32_t)(base_exp + g1_2)) << 7 | (sm1_2 & 0x7F)) << 16;
+            c1_3.u = (((uint32_t)(sm1_3 >> 7)) << 15 | ((uint32_t)(base_exp + g1_3)) << 7 | (sm1_3 & 0x7F)) << 16;
+
+            sum_b0 += c1_0.f * a0;
+            sum_b1 += c1_1.f * a1;
+            sum_b2 += c1_2.f * a2;
+            sum_b3 += c1_3.f * a3;
+        }
+
+        sm_ptr0 += WORKGROUP_SIZE * 4;
+        gr_ptr0 += WORKGROUP_SIZE * 4 / 2;
+        sm_ptr1 += WORKGROUP_SIZE * 4;
+        gr_ptr1 += WORKGROUP_SIZE * 4 / 2;
+        act_base += WORKGROUP_SIZE * 4;
+    }
+    for (; col < K; col += WORKGROUP_SIZE) {
+        float a = bf16_to_float(TURBO_LDG(act_base));
+        uint8_t sm0 = TURBO_LDG(sm_ptr0);
+        uint8_t gb0 = TURBO_LDG(gr_ptr0);
+        uint32_t g0 = is_odd ? (gb0 >> 4) : (gb0 & 0xF);
+        union { uint32_t u; float f; } c0;
+        c0.u = (((uint32_t)(sm0 >> 7)) << 15 | ((uint32_t)(base_exp + g0)) << 7 | (sm0 & 0x7F)) << 16;
+        sum_a0 += c0.f * a;
+        if (has_row1) {
+            uint8_t sm1 = TURBO_LDG(sm_ptr1);
+            uint8_t gb1 = TURBO_LDG(gr_ptr1);
+            uint32_t g1 = is_odd ? (gb1 >> 4) : (gb1 & 0xF);
+            union { uint32_t u; float f; } c1;
+            c1.u = (((uint32_t)(sm1 >> 7)) << 15 | ((uint32_t)(base_exp + g1)) << 7 | (sm1 & 0x7F)) << 16;
+            sum_b0 += c1.f * a;
+        }
+        sm_ptr0 += WORKGROUP_SIZE;
+        gr_ptr0 += WORKGROUP_SIZE / 2;
+        sm_ptr1 += WORKGROUP_SIZE;
+        gr_ptr1 += WORKGROUP_SIZE / 2;
+        act_base += WORKGROUP_SIZE;
+    }
+
+    float sum0 = sum_a0 + sum_a1 + sum_a2 + sum_a3;
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+        sum0 += __shfl_down(sum0, off, WARP_SIZE);
+    if ((tid & (WARP_SIZE - 1)) == 0) warp_sums[tid / WARP_SIZE] = sum0;
+
+    float sum1 = sum_b0 + sum_b1 + sum_b2 + sum_b3;
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+        sum1 += __shfl_down(sum1, off, WARP_SIZE);
+    if ((tid & (WARP_SIZE - 1)) == 0) warp_sums[NUM_WARPS + (tid / WARP_SIZE)] = sum1;
+
+    __syncthreads();
+    if (tid == 0) {
+        float s0 = 0, s1 = 0;
+        for (int w = 0; w < NUM_WARPS; w++) { s0 += warp_sums[w]; s1 += warp_sums[NUM_WARPS + w]; }
+        output[row0] = s0;
+        if (has_row1) output[row1] = s1;
+    }
+}
+
+// ===========================================================================
+// VARIANT B: 8-element unroll per iteration (halves loop count)
+// For K=4096, WG=256: loop runs 2 iterations instead of 4
+// ===========================================================================
+__launch_bounds__(WORKGROUP_SIZE)
+__global__ void split12_matvec_v3_unroll8_multirow(
+    const uint8_t* __restrict__ sign_mantissa,
+    const uint8_t* __restrict__ groups,
+    int base_exp,
+    const int16_t* __restrict__ activations,
+    float* __restrict__ output,
+    int M, int K)
+{
+    const int row0 = blockIdx.x * 2;
+    const int row1 = row0 + 1;
+    const int tid = threadIdx.x;
+    __shared__ float warp_sums[NUM_WARPS * 2];
+
+    float sa0 = 0.0f, sa1 = 0.0f, sa2 = 0.0f, sa3 = 0.0f;
+    float sa4 = 0.0f, sa5 = 0.0f, sa6 = 0.0f, sa7 = 0.0f;
+    float sb0 = 0.0f, sb1 = 0.0f, sb2 = 0.0f, sb3 = 0.0f;
+    float sb4 = 0.0f, sb5 = 0.0f, sb6 = 0.0f, sb7 = 0.0f;
+
+    const int has_row1 = (row1 < M);
+
+    const uint8_t* sm_ptr0 = sign_mantissa + (int64_t)row0 * K + tid;
+    const uint8_t* gr_ptr0 = groups + (int64_t)row0 * K / 2 + tid / 2;
+    const uint8_t* sm_ptr1 = sign_mantissa + (int64_t)row1 * K + tid;
+    const uint8_t* gr_ptr1 = groups + (int64_t)row1 * K / 2 + tid / 2;
+    const int16_t* act_base = activations + tid;
+
+    const int is_odd = tid & 1;
+
+    int col = tid;
+    for (; col + WORKGROUP_SIZE * 7 < K; col += WORKGROUP_SIZE * 8) {
+        float a0 = bf16_to_float(TURBO_LDG(act_base));
+        float a1 = bf16_to_float(TURBO_LDG(act_base + WORKGROUP_SIZE));
+        float a2 = bf16_to_float(TURBO_LDG(act_base + WORKGROUP_SIZE * 2));
+        float a3 = bf16_to_float(TURBO_LDG(act_base + WORKGROUP_SIZE * 3));
+        float a4 = bf16_to_float(TURBO_LDG(act_base + WORKGROUP_SIZE * 4));
+        float a5 = bf16_to_float(TURBO_LDG(act_base + WORKGROUP_SIZE * 5));
+        float a6 = bf16_to_float(TURBO_LDG(act_base + WORKGROUP_SIZE * 6));
+        float a7 = bf16_to_float(TURBO_LDG(act_base + WORKGROUP_SIZE * 7));
+
+        uint8_t sm0_0 = TURBO_LDG(sm_ptr0);
+        uint8_t sm0_1 = TURBO_LDG(sm_ptr0 + WORKGROUP_SIZE);
+        uint8_t sm0_2 = TURBO_LDG(sm_ptr0 + WORKGROUP_SIZE * 2);
+        uint8_t sm0_3 = TURBO_LDG(sm_ptr0 + WORKGROUP_SIZE * 3);
+        uint8_t sm0_4 = TURBO_LDG(sm_ptr0 + WORKGROUP_SIZE * 4);
+        uint8_t sm0_5 = TURBO_LDG(sm_ptr0 + WORKGROUP_SIZE * 5);
+        uint8_t sm0_6 = TURBO_LDG(sm_ptr0 + WORKGROUP_SIZE * 6);
+        uint8_t sm0_7 = TURBO_LDG(sm_ptr0 + WORKGROUP_SIZE * 7);
+        uint8_t gb0_0 = TURBO_LDG(gr_ptr0);
+        uint8_t gb0_1 = TURBO_LDG(gr_ptr0 + WORKGROUP_SIZE / 2);
+        uint8_t gb0_2 = TURBO_LDG(gr_ptr0 + WORKGROUP_SIZE);
+        uint8_t gb0_3 = TURBO_LDG(gr_ptr0 + WORKGROUP_SIZE * 3 / 2);
+        uint8_t gb0_4 = TURBO_LDG(gr_ptr0 + WORKGROUP_SIZE * 2);
+        uint8_t gb0_5 = TURBO_LDG(gr_ptr0 + WORKGROUP_SIZE * 5 / 2);
+        uint8_t gb0_6 = TURBO_LDG(gr_ptr0 + WORKGROUP_SIZE * 3);
+        uint8_t gb0_7 = TURBO_LDG(gr_ptr0 + WORKGROUP_SIZE * 7 / 2);
+
+        uint32_t g0_0 = is_odd ? (gb0_0 >> 4) : (gb0_0 & 0xF);
+        uint32_t g0_1 = is_odd ? (gb0_1 >> 4) : (gb0_1 & 0xF);
+        uint32_t g0_2 = is_odd ? (gb0_2 >> 4) : (gb0_2 & 0xF);
+        uint32_t g0_3 = is_odd ? (gb0_3 >> 4) : (gb0_3 & 0xF);
+        uint32_t g0_4 = is_odd ? (gb0_4 >> 4) : (gb0_4 & 0xF);
+        uint32_t g0_5 = is_odd ? (gb0_5 >> 4) : (gb0_5 & 0xF);
+        uint32_t g0_6 = is_odd ? (gb0_6 >> 4) : (gb0_6 & 0xF);
+        uint32_t g0_7 = is_odd ? (gb0_7 >> 4) : (gb0_7 & 0xF);
+
+        union { uint32_t u; float f; } c0, c1, c2, c3, c4, c5, c6, c7;
+        c0.u = (((uint32_t)(sm0_0 >> 7)) << 15 | ((uint32_t)(base_exp + g0_0)) << 7 | (sm0_0 & 0x7F)) << 16;
+        c1.u = (((uint32_t)(sm0_1 >> 7)) << 15 | ((uint32_t)(base_exp + g0_1)) << 7 | (sm0_1 & 0x7F)) << 16;
+        c2.u = (((uint32_t)(sm0_2 >> 7)) << 15 | ((uint32_t)(base_exp + g0_2)) << 7 | (sm0_2 & 0x7F)) << 16;
+        c3.u = (((uint32_t)(sm0_3 >> 7)) << 15 | ((uint32_t)(base_exp + g0_3)) << 7 | (sm0_3 & 0x7F)) << 16;
+        c4.u = (((uint32_t)(sm0_4 >> 7)) << 15 | ((uint32_t)(base_exp + g0_4)) << 7 | (sm0_4 & 0x7F)) << 16;
+        c5.u = (((uint32_t)(sm0_5 >> 7)) << 15 | ((uint32_t)(base_exp + g0_5)) << 7 | (sm0_5 & 0x7F)) << 16;
+        c6.u = (((uint32_t)(sm0_6 >> 7)) << 15 | ((uint32_t)(base_exp + g0_6)) << 7 | (sm0_6 & 0x7F)) << 16;
+        c7.u = (((uint32_t)(sm0_7 >> 7)) << 15 | ((uint32_t)(base_exp + g0_7)) << 7 | (sm0_7 & 0x7F)) << 16;
+
+        sa0 += c0.f * a0; sa1 += c1.f * a1; sa2 += c2.f * a2; sa3 += c3.f * a3;
+        sa4 += c4.f * a4; sa5 += c5.f * a5; sa6 += c6.f * a6; sa7 += c7.f * a7;
+
+        if (has_row1) {
+            uint8_t sm1_0 = TURBO_LDG(sm_ptr1);
+            uint8_t sm1_1 = TURBO_LDG(sm_ptr1 + WORKGROUP_SIZE);
+            uint8_t sm1_2 = TURBO_LDG(sm_ptr1 + WORKGROUP_SIZE * 2);
+            uint8_t sm1_3 = TURBO_LDG(sm_ptr1 + WORKGROUP_SIZE * 3);
+            uint8_t sm1_4 = TURBO_LDG(sm_ptr1 + WORKGROUP_SIZE * 4);
+            uint8_t sm1_5 = TURBO_LDG(sm_ptr1 + WORKGROUP_SIZE * 5);
+            uint8_t sm1_6 = TURBO_LDG(sm_ptr1 + WORKGROUP_SIZE * 6);
+            uint8_t sm1_7 = TURBO_LDG(sm_ptr1 + WORKGROUP_SIZE * 7);
+            uint8_t gb1_0 = TURBO_LDG(gr_ptr1);
+            uint8_t gb1_1 = TURBO_LDG(gr_ptr1 + WORKGROUP_SIZE / 2);
+            uint8_t gb1_2 = TURBO_LDG(gr_ptr1 + WORKGROUP_SIZE);
+            uint8_t gb1_3 = TURBO_LDG(gr_ptr1 + WORKGROUP_SIZE * 3 / 2);
+            uint8_t gb1_4 = TURBO_LDG(gr_ptr1 + WORKGROUP_SIZE * 2);
+            uint8_t gb1_5 = TURBO_LDG(gr_ptr1 + WORKGROUP_SIZE * 5 / 2);
+            uint8_t gb1_6 = TURBO_LDG(gr_ptr1 + WORKGROUP_SIZE * 3);
+            uint8_t gb1_7 = TURBO_LDG(gr_ptr1 + WORKGROUP_SIZE * 7 / 2);
+
+            uint32_t g1_0 = is_odd ? (gb1_0 >> 4) : (gb1_0 & 0xF);
+            uint32_t g1_1 = is_odd ? (gb1_1 >> 4) : (gb1_1 & 0xF);
+            uint32_t g1_2 = is_odd ? (gb1_2 >> 4) : (gb1_2 & 0xF);
+            uint32_t g1_3 = is_odd ? (gb1_3 >> 4) : (gb1_3 & 0xF);
+            uint32_t g1_4 = is_odd ? (gb1_4 >> 4) : (gb1_4 & 0xF);
+            uint32_t g1_5 = is_odd ? (gb1_5 >> 4) : (gb1_5 & 0xF);
+            uint32_t g1_6 = is_odd ? (gb1_6 >> 4) : (gb1_6 & 0xF);
+            uint32_t g1_7 = is_odd ? (gb1_7 >> 4) : (gb1_7 & 0xF);
+
+            union { uint32_t u; float f; } d0, d1, d2, d3, d4, d5, d6, d7;
+            d0.u = (((uint32_t)(sm1_0 >> 7)) << 15 | ((uint32_t)(base_exp + g1_0)) << 7 | (sm1_0 & 0x7F)) << 16;
+            d1.u = (((uint32_t)(sm1_1 >> 7)) << 15 | ((uint32_t)(base_exp + g1_1)) << 7 | (sm1_1 & 0x7F)) << 16;
+            d2.u = (((uint32_t)(sm1_2 >> 7)) << 15 | ((uint32_t)(base_exp + g1_2)) << 7 | (sm1_2 & 0x7F)) << 16;
+            d3.u = (((uint32_t)(sm1_3 >> 7)) << 15 | ((uint32_t)(base_exp + g1_3)) << 7 | (sm1_3 & 0x7F)) << 16;
+            d4.u = (((uint32_t)(sm1_4 >> 7)) << 15 | ((uint32_t)(base_exp + g1_4)) << 7 | (sm1_4 & 0x7F)) << 16;
+            d5.u = (((uint32_t)(sm1_5 >> 7)) << 15 | ((uint32_t)(base_exp + g1_5)) << 7 | (sm1_5 & 0x7F)) << 16;
+            d6.u = (((uint32_t)(sm1_6 >> 7)) << 15 | ((uint32_t)(base_exp + g1_6)) << 7 | (sm1_6 & 0x7F)) << 16;
+            d7.u = (((uint32_t)(sm1_7 >> 7)) << 15 | ((uint32_t)(base_exp + g1_7)) << 7 | (sm1_7 & 0x7F)) << 16;
+
+            sb0 += d0.f * a0; sb1 += d1.f * a1; sb2 += d2.f * a2; sb3 += d3.f * a3;
+            sb4 += d4.f * a4; sb5 += d5.f * a5; sb6 += d6.f * a6; sb7 += d7.f * a7;
+        }
+
+        sm_ptr0 += WORKGROUP_SIZE * 8;
+        gr_ptr0 += WORKGROUP_SIZE * 8 / 2;
+        sm_ptr1 += WORKGROUP_SIZE * 8;
+        gr_ptr1 += WORKGROUP_SIZE * 8 / 2;
+        act_base += WORKGROUP_SIZE * 8;
+    }
+    // 4-element tail
+    for (; col + WORKGROUP_SIZE * 3 < K; col += WORKGROUP_SIZE * 4) {
+        float a0 = bf16_to_float(TURBO_LDG(act_base));
+        float a1 = bf16_to_float(TURBO_LDG(act_base + WORKGROUP_SIZE));
+        float a2 = bf16_to_float(TURBO_LDG(act_base + WORKGROUP_SIZE * 2));
+        float a3 = bf16_to_float(TURBO_LDG(act_base + WORKGROUP_SIZE * 3));
+
+        uint8_t sm0_0 = TURBO_LDG(sm_ptr0); uint8_t sm0_1 = TURBO_LDG(sm_ptr0 + WORKGROUP_SIZE);
+        uint8_t sm0_2 = TURBO_LDG(sm_ptr0 + WORKGROUP_SIZE * 2); uint8_t sm0_3 = TURBO_LDG(sm_ptr0 + WORKGROUP_SIZE * 3);
+        uint8_t gb0_0 = TURBO_LDG(gr_ptr0); uint8_t gb0_1 = TURBO_LDG(gr_ptr0 + WORKGROUP_SIZE / 2);
+        uint8_t gb0_2 = TURBO_LDG(gr_ptr0 + WORKGROUP_SIZE); uint8_t gb0_3 = TURBO_LDG(gr_ptr0 + WORKGROUP_SIZE * 3 / 2);
+
+        uint32_t g0_0 = is_odd ? (gb0_0 >> 4) : (gb0_0 & 0xF);
+        uint32_t g0_1 = is_odd ? (gb0_1 >> 4) : (gb0_1 & 0xF);
+        uint32_t g0_2 = is_odd ? (gb0_2 >> 4) : (gb0_2 & 0xF);
+        uint32_t g0_3 = is_odd ? (gb0_3 >> 4) : (gb0_3 & 0xF);
+
+        union { uint32_t u; float f; } c0, c1, c2, c3;
+        c0.u = (((uint32_t)(sm0_0 >> 7)) << 15 | ((uint32_t)(base_exp + g0_0)) << 7 | (sm0_0 & 0x7F)) << 16;
+        c1.u = (((uint32_t)(sm0_1 >> 7)) << 15 | ((uint32_t)(base_exp + g0_1)) << 7 | (sm0_1 & 0x7F)) << 16;
+        c2.u = (((uint32_t)(sm0_2 >> 7)) << 15 | ((uint32_t)(base_exp + g0_2)) << 7 | (sm0_2 & 0x7F)) << 16;
+        c3.u = (((uint32_t)(sm0_3 >> 7)) << 15 | ((uint32_t)(base_exp + g0_3)) << 7 | (sm0_3 & 0x7F)) << 16;
+
+        sa0 += c0.f * a0; sa1 += c1.f * a1; sa2 += c2.f * a2; sa3 += c3.f * a3;
+
+        if (has_row1) {
+            uint8_t sm1_0 = TURBO_LDG(sm_ptr1); uint8_t sm1_1 = TURBO_LDG(sm_ptr1 + WORKGROUP_SIZE);
+            uint8_t sm1_2 = TURBO_LDG(sm_ptr1 + WORKGROUP_SIZE * 2); uint8_t sm1_3 = TURBO_LDG(sm_ptr1 + WORKGROUP_SIZE * 3);
+            uint8_t gb1_0 = TURBO_LDG(gr_ptr1); uint8_t gb1_1 = TURBO_LDG(gr_ptr1 + WORKGROUP_SIZE / 2);
+            uint8_t gb1_2 = TURBO_LDG(gr_ptr1 + WORKGROUP_SIZE); uint8_t gb1_3 = TURBO_LDG(gr_ptr1 + WORKGROUP_SIZE * 3 / 2);
+
+            uint32_t g1_0 = is_odd ? (gb1_0 >> 4) : (gb1_0 & 0xF);
+            uint32_t g1_1 = is_odd ? (gb1_1 >> 4) : (gb1_1 & 0xF);
+            uint32_t g1_2 = is_odd ? (gb1_2 >> 4) : (gb1_2 & 0xF);
+            uint32_t g1_3 = is_odd ? (gb1_3 >> 4) : (gb1_3 & 0xF);
+
+            union { uint32_t u; float f; } d0, d1, d2, d3;
+            d0.u = (((uint32_t)(sm1_0 >> 7)) << 15 | ((uint32_t)(base_exp + g1_0)) << 7 | (sm1_0 & 0x7F)) << 16;
+            d1.u = (((uint32_t)(sm1_1 >> 7)) << 15 | ((uint32_t)(base_exp + g1_1)) << 7 | (sm1_1 & 0x7F)) << 16;
+            d2.u = (((uint32_t)(sm1_2 >> 7)) << 15 | ((uint32_t)(base_exp + g1_2)) << 7 | (sm1_2 & 0x7F)) << 16;
+            d3.u = (((uint32_t)(sm1_3 >> 7)) << 15 | ((uint32_t)(base_exp + g1_3)) << 7 | (sm1_3 & 0x7F)) << 16;
+
+            sb0 += d0.f * a0; sb1 += d1.f * a1; sb2 += d2.f * a2; sb3 += d3.f * a3;
+        }
+
+        sm_ptr0 += WORKGROUP_SIZE * 4; gr_ptr0 += WORKGROUP_SIZE * 4 / 2;
+        sm_ptr1 += WORKGROUP_SIZE * 4; gr_ptr1 += WORKGROUP_SIZE * 4 / 2;
+        act_base += WORKGROUP_SIZE * 4;
+    }
+    // Single-element tail
+    for (; col < K; col += WORKGROUP_SIZE) {
+        float a = bf16_to_float(TURBO_LDG(act_base));
+        uint8_t sm0 = TURBO_LDG(sm_ptr0); uint8_t gb0 = TURBO_LDG(gr_ptr0);
+        uint32_t g0 = is_odd ? (gb0 >> 4) : (gb0 & 0xF);
+        union { uint32_t u; float f; } c0;
+        c0.u = (((uint32_t)(sm0 >> 7)) << 15 | ((uint32_t)(base_exp + g0)) << 7 | (sm0 & 0x7F)) << 16;
+        sa0 += c0.f * a;
+        if (has_row1) {
+            uint8_t sm1 = TURBO_LDG(sm_ptr1); uint8_t gb1 = TURBO_LDG(gr_ptr1);
+            uint32_t g1 = is_odd ? (gb1 >> 4) : (gb1 & 0xF);
+            union { uint32_t u; float f; } c1;
+            c1.u = (((uint32_t)(sm1 >> 7)) << 15 | ((uint32_t)(base_exp + g1)) << 7 | (sm1 & 0x7F)) << 16;
+            sb0 += c1.f * a;
+        }
+        sm_ptr0 += WORKGROUP_SIZE; gr_ptr0 += WORKGROUP_SIZE / 2;
+        sm_ptr1 += WORKGROUP_SIZE; gr_ptr1 += WORKGROUP_SIZE / 2;
+        act_base += WORKGROUP_SIZE;
+    }
+
+    float sum0 = sa0 + sa1 + sa2 + sa3 + sa4 + sa5 + sa6 + sa7;
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+        sum0 += __shfl_down(sum0, off, WARP_SIZE);
+    if ((tid & (WARP_SIZE - 1)) == 0) warp_sums[tid / WARP_SIZE] = sum0;
+
+    float sum1 = sb0 + sb1 + sb2 + sb3 + sb4 + sb5 + sb6 + sb7;
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+        sum1 += __shfl_down(sum1, off, WARP_SIZE);
+    if ((tid & (WARP_SIZE - 1)) == 0) warp_sums[NUM_WARPS + (tid / WARP_SIZE)] = sum1;
+
+    __syncthreads();
+    if (tid == 0) {
+        float s0 = 0, s1 = 0;
+        for (int w = 0; w < NUM_WARPS; w++) { s0 += warp_sums[w]; s1 += warp_sums[NUM_WARPS + w]; }
+        output[row0] = s0;
+        if (has_row1) output[row1] = s1;
+    }
+}
+
+// ===========================================================================
+// VARIANT C: Vectorized uint32_t loads for sign_mantissa (4 bytes at once)
+// and uint16_t loads for groups (2 bytes = 4 nibbles at once)
+// Thread tid loads 4 consecutive elements via wide loads instead of strided bytes
+// ===========================================================================
+
+// Helper: decode 4 elements from a uint32_t of sm bytes + uint16_t of gr bytes
+// Element layout: b0(even)->low nibble, b1(odd)->high nibble, b2(even)->low, b3(odd)->high
+__device__ __forceinline__
+void decode_vec4(uint32_t sm_vec, uint16_t gr_vec, int base_exp,
+                 float& w0, float& w1, float& w2, float& w3) {
+    uint8_t sm0 = (uint8_t)(sm_vec);
+    uint8_t sm1 = (uint8_t)(sm_vec >> 8);
+    uint8_t sm2 = (uint8_t)(sm_vec >> 16);
+    uint8_t sm3 = (uint8_t)(sm_vec >> 24);
+    uint8_t gr01 = (uint8_t)(gr_vec);
+    uint8_t gr23 = (uint8_t)(gr_vec >> 8);
+
+    uint32_t g0 = gr01 & 0xF;
+    uint32_t g1 = gr01 >> 4;
+    uint32_t g2 = gr23 & 0xF;
+    uint32_t g3 = gr23 >> 4;
+
+    union { uint32_t u; float f; } c0, c1, c2, c3;
+    c0.u = (((uint32_t)(sm0 >> 7)) << 15 | ((uint32_t)(base_exp + g0)) << 7 | (sm0 & 0x7F)) << 16;
+    c1.u = (((uint32_t)(sm1 >> 7)) << 15 | ((uint32_t)(base_exp + g1)) << 7 | (sm1 & 0x7F)) << 16;
+    c2.u = (((uint32_t)(sm2 >> 7)) << 15 | ((uint32_t)(base_exp + g2)) << 7 | (sm2 & 0x7F)) << 16;
+    c3.u = (((uint32_t)(sm3 >> 7)) << 15 | ((uint32_t)(base_exp + g3)) << 7 | (sm3 & 0x7F)) << 16;
+    w0 = c0.f; w1 = c1.f; w2 = c2.f; w3 = c3.f;
+}
+
+__launch_bounds__(WORKGROUP_SIZE)
+__global__ void split12_matvec_v3_vec4_multirow(
+    const uint8_t* __restrict__ sign_mantissa,
+    const uint8_t* __restrict__ groups,
+    int base_exp,
+    const int16_t* __restrict__ activations,
+    float* __restrict__ output,
+    int M, int K)
+{
+    const int row0 = blockIdx.x * 2;
+    const int row1 = row0 + 1;
+    const int tid = threadIdx.x;
+    __shared__ float warp_sums[NUM_WARPS * 2];
+
+    float sum_a0 = 0.0f, sum_a1 = 0.0f;
+    float sum_b0 = 0.0f, sum_b1 = 0.0f;
+
+    const int has_row1 = (row1 < M);
+
+    // Vec4 addressing: thread tid loads 4 consecutive bytes at offset tid*4
+    // With 256 threads, one pass covers 256*4 = 1024 elements
+    const uint8_t* sm_base0 = sign_mantissa + (int64_t)row0 * K;
+    const uint8_t* gr_base0 = groups + (int64_t)row0 * K / 2;
+    const uint8_t* sm_base1 = sign_mantissa + (int64_t)row1 * K;
+    const uint8_t* gr_base1 = groups + (int64_t)row1 * K / 2;
+
+    int elem = tid * 4;
+    for (; elem + WORKGROUP_SIZE * 4 - 1 < K; elem += WORKGROUP_SIZE * 4) {
+        uint32_t sm_v0 = *(const uint32_t*)(sm_base0 + elem);
+        uint16_t gr_v0 = *(const uint16_t*)(gr_base0 + elem / 2);
+        float w0_0, w0_1, w0_2, w0_3;
+        decode_vec4(sm_v0, gr_v0, base_exp, w0_0, w0_1, w0_2, w0_3);
+
+        float a0 = bf16_to_float(TURBO_LDG(activations + elem));
+        float a1 = bf16_to_float(TURBO_LDG(activations + elem + 1));
+        float a2 = bf16_to_float(TURBO_LDG(activations + elem + 2));
+        float a3 = bf16_to_float(TURBO_LDG(activations + elem + 3));
+
+        sum_a0 += w0_0 * a0 + w0_1 * a1 + w0_2 * a2 + w0_3 * a3;
+
+        if (has_row1) {
+            uint32_t sm_v1 = *(const uint32_t*)(sm_base1 + elem);
+            uint16_t gr_v1 = *(const uint16_t*)(gr_base1 + elem / 2);
+            float w1_0, w1_1, w1_2, w1_3;
+            decode_vec4(sm_v1, gr_v1, base_exp, w1_0, w1_1, w1_2, w1_3);
+            sum_b0 += w1_0 * a0 + w1_1 * a1 + w1_2 * a2 + w1_3 * a3;
+        }
+    }
+    // Scalar tail
+    for (; elem < K; elem++) {
+        int is_odd_e = elem & 1;
+        uint8_t sm = sm_base0[elem];
+        uint8_t gb = gr_base0[elem / 2];
+        uint32_t g = is_odd_e ? (gb >> 4) : (gb & 0xF);
+        union { uint32_t u; float f; } c;
+        c.u = (((uint32_t)(sm >> 7)) << 15 | ((uint32_t)(base_exp + g)) << 7 | (sm & 0x7F)) << 16;
+        float a = bf16_to_float(activations[elem]);
+        sum_a0 += c.f * a;
+        if (has_row1) {
+            uint8_t sm1 = sm_base1[elem];
+            uint8_t gb1 = gr_base1[elem / 2];
+            uint32_t g1 = is_odd_e ? (gb1 >> 4) : (gb1 & 0xF);
+            union { uint32_t u; float f; } c1;
+            c1.u = (((uint32_t)(sm1 >> 7)) << 15 | ((uint32_t)(base_exp + g1)) << 7 | (sm1 & 0x7F)) << 16;
+            sum_b0 += c1.f * a;
+        }
+    }
+
+    float sum0 = sum_a0 + sum_a1;
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+        sum0 += __shfl_down(sum0, off, WARP_SIZE);
+    if ((tid & (WARP_SIZE - 1)) == 0) warp_sums[tid / WARP_SIZE] = sum0;
+
+    float sum1 = sum_b0 + sum_b1;
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
+        sum1 += __shfl_down(sum1, off, WARP_SIZE);
+    if ((tid & (WARP_SIZE - 1)) == 0) warp_sums[NUM_WARPS + (tid / WARP_SIZE)] = sum1;
+
+    __syncthreads();
+    if (tid == 0) {
+        float s0 = 0, s1 = 0;
+        for (int w = 0; w < NUM_WARPS; w++) { s0 += warp_sums[w]; s1 += warp_sums[NUM_WARPS + w]; }
+        output[row0] = s0;
+        if (has_row1) output[row1] = s1;
+    }
+}
+
+// ===========================================================================
+// DUAL kernel variants (gate+up fused, same 3 optimization strategies)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Dual v3_ldg: __ldg() on all reads
+// ---------------------------------------------------------------------------
+__launch_bounds__(WORKGROUP_SIZE)
+__global__ void split12_matvec_v3_ldg_dual(
+    const uint8_t* __restrict__ sm_a, const uint8_t* __restrict__ gr_a, int base_exp_a,
+    const uint8_t* __restrict__ sm_b, const uint8_t* __restrict__ gr_b, int base_exp_b,
+    const int16_t* __restrict__ activations,
+    float*         __restrict__ output_a,
+    float*         __restrict__ output_b,
+    int M, int K)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    __shared__ float warp_sums_a[NUM_WARPS];
+    __shared__ float warp_sums_b[NUM_WARPS];
+
+    float sa0 = 0.0f, sa1 = 0.0f, sa2 = 0.0f, sa3 = 0.0f;
+    float sb0 = 0.0f, sb1 = 0.0f, sb2 = 0.0f, sb3 = 0.0f;
+
+    const uint8_t* sma_ptr = sm_a + (int64_t)row * K + tid;
+    const uint8_t* gra_ptr = gr_a + (int64_t)row * K / 2 + tid / 2;
+    const uint8_t* smb_ptr = sm_b + (int64_t)row * K + tid;
+    const uint8_t* grb_ptr = gr_b + (int64_t)row * K / 2 + tid / 2;
+    const int16_t* act_base = activations + tid;
+
+    const int is_odd = tid & 1;
+
+    int col = tid;
+    for (; col + WORKGROUP_SIZE * 3 < K; col += WORKGROUP_SIZE * 4) {
+        float af0 = bf16_to_float(TURBO_LDG(act_base));
+        float af1 = bf16_to_float(TURBO_LDG(act_base + WORKGROUP_SIZE));
+        float af2 = bf16_to_float(TURBO_LDG(act_base + WORKGROUP_SIZE * 2));
+        float af3 = bf16_to_float(TURBO_LDG(act_base + WORKGROUP_SIZE * 3));
+
+        uint8_t sma0 = TURBO_LDG(sma_ptr);
+        uint8_t sma1 = TURBO_LDG(sma_ptr + WORKGROUP_SIZE);
+        uint8_t sma2 = TURBO_LDG(sma_ptr + WORKGROUP_SIZE * 2);
+        uint8_t sma3 = TURBO_LDG(sma_ptr + WORKGROUP_SIZE * 3);
+        uint8_t gba0 = TURBO_LDG(gra_ptr);
+        uint8_t gba1 = TURBO_LDG(gra_ptr + WORKGROUP_SIZE / 2);
+        uint8_t gba2 = TURBO_LDG(gra_ptr + WORKGROUP_SIZE);
+        uint8_t gba3 = TURBO_LDG(gra_ptr + WORKGROUP_SIZE * 3 / 2);
+
+        uint32_t ga0 = is_odd ? (gba0 >> 4) : (gba0 & 0xF);
+        uint32_t ga1 = is_odd ? (gba1 >> 4) : (gba1 & 0xF);
+        uint32_t ga2 = is_odd ? (gba2 >> 4) : (gba2 & 0xF);
+        uint32_t ga3 = is_odd ? (gba3 >> 4) : (gba3 & 0xF);
+
+        union { uint32_t u; float f; } ca0, ca1, ca2, ca3;
+        ca0.u = (((uint32_t)(sma0 >> 7)) << 15 | ((uint32_t)(base_exp_a + ga0)) << 7 | (sma0 & 0x7F)) << 16;
+        ca1.u = (((uint32_t)(sma1 >> 7)) << 15 | ((uint32_t)(base_exp_a + ga1)) << 7 | (sma1 & 0x7F)) << 16;
+        ca2.u = (((uint32_t)(sma2 >> 7)) << 15 | ((uint32_t)(base_exp_a + ga2)) << 7 | (sma2 & 0x7F)) << 16;
+        ca3.u = (((uint32_t)(sma3 >> 7)) << 15 | ((uint32_t)(base_exp_a + ga3)) << 7 | (sma3 & 0x7F)) << 16;
+
+        sa0 += ca0.f * af0; sa1 += ca1.f * af1; sa2 += ca2.f * af2; sa3 += ca3.f * af3;
+
+        uint8_t smb0 = TURBO_LDG(smb_ptr);
+        uint8_t smb1 = TURBO_LDG(smb_ptr + WORKGROUP_SIZE);
+        uint8_t smb2 = TURBO_LDG(smb_ptr + WORKGROUP_SIZE * 2);
+        uint8_t smb3 = TURBO_LDG(smb_ptr + WORKGROUP_SIZE * 3);
+        uint8_t gbb0 = TURBO_LDG(grb_ptr);
+        uint8_t gbb1 = TURBO_LDG(grb_ptr + WORKGROUP_SIZE / 2);
+        uint8_t gbb2 = TURBO_LDG(grb_ptr + WORKGROUP_SIZE);
+        uint8_t gbb3 = TURBO_LDG(grb_ptr + WORKGROUP_SIZE * 3 / 2);
+
+        uint32_t gb0 = is_odd ? (gbb0 >> 4) : (gbb0 & 0xF);
+        uint32_t gb1 = is_odd ? (gbb1 >> 4) : (gbb1 & 0xF);
+        uint32_t gb2 = is_odd ? (gbb2 >> 4) : (gbb2 & 0xF);
+        uint32_t gb3 = is_odd ? (gbb3 >> 4) : (gbb3 & 0xF);
+
+        union { uint32_t u; float f; } cb0, cb1, cb2, cb3;
+        cb0.u = (((uint32_t)(smb0 >> 7)) << 15 | ((uint32_t)(base_exp_b + gb0)) << 7 | (smb0 & 0x7F)) << 16;
+        cb1.u = (((uint32_t)(smb1 >> 7)) << 15 | ((uint32_t)(base_exp_b + gb1)) << 7 | (smb1 & 0x7F)) << 16;
+        cb2.u = (((uint32_t)(smb2 >> 7)) << 15 | ((uint32_t)(base_exp_b + gb2)) << 7 | (smb2 & 0x7F)) << 16;
+        cb3.u = (((uint32_t)(smb3 >> 7)) << 15 | ((uint32_t)(base_exp_b + gb3)) << 7 | (smb3 & 0x7F)) << 16;
+
+        sb0 += cb0.f * af0; sb1 += cb1.f * af1; sb2 += cb2.f * af2; sb3 += cb3.f * af3;
+
+        sma_ptr += WORKGROUP_SIZE * 4; gra_ptr += WORKGROUP_SIZE * 4 / 2;
+        smb_ptr += WORKGROUP_SIZE * 4; grb_ptr += WORKGROUP_SIZE * 4 / 2;
+        act_base += WORKGROUP_SIZE * 4;
+    }
+    for (; col < K; col += WORKGROUP_SIZE) {
+        float af = bf16_to_float(TURBO_LDG(act_base));
+        uint8_t sma = TURBO_LDG(sma_ptr); uint8_t gba = TURBO_LDG(gra_ptr);
+        uint32_t ga = is_odd ? (gba >> 4) : (gba & 0xF);
+        union { uint32_t u; float f; } ca;
+        ca.u = (((uint32_t)(sma >> 7)) << 15 | ((uint32_t)(base_exp_a + ga)) << 7 | (sma & 0x7F)) << 16;
+        sa0 += ca.f * af;
+        uint8_t smb = TURBO_LDG(smb_ptr); uint8_t gbb = TURBO_LDG(grb_ptr);
+        uint32_t gb = is_odd ? (gbb >> 4) : (gbb & 0xF);
+        union { uint32_t u; float f; } cb;
+        cb.u = (((uint32_t)(smb >> 7)) << 15 | ((uint32_t)(base_exp_b + gb)) << 7 | (smb & 0x7F)) << 16;
+        sb0 += cb.f * af;
+        sma_ptr += WORKGROUP_SIZE; gra_ptr += WORKGROUP_SIZE / 2;
+        smb_ptr += WORKGROUP_SIZE; grb_ptr += WORKGROUP_SIZE / 2;
+        act_base += WORKGROUP_SIZE;
+    }
+
+    float sum_a = sa0 + sa1 + sa2 + sa3;
+    float sum_b = sb0 + sb1 + sb2 + sb3;
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        sum_a += __shfl_down(sum_a, off, WARP_SIZE);
+        sum_b += __shfl_down(sum_b, off, WARP_SIZE);
+    }
+    if ((tid & (WARP_SIZE - 1)) == 0) {
+        warp_sums_a[tid / WARP_SIZE] = sum_a;
+        warp_sums_b[tid / WARP_SIZE] = sum_b;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float sa = 0, sb = 0;
+        for (int w = 0; w < NUM_WARPS; w++) { sa += warp_sums_a[w]; sb += warp_sums_b[w]; }
+        output_a[row] = sa; output_b[row] = sb;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dual v3_unroll8: 8-element unroll per iteration
+// ---------------------------------------------------------------------------
+__launch_bounds__(WORKGROUP_SIZE)
+__global__ void split12_matvec_v3_unroll8_dual(
+    const uint8_t* __restrict__ sm_a, const uint8_t* __restrict__ gr_a, int base_exp_a,
+    const uint8_t* __restrict__ sm_b, const uint8_t* __restrict__ gr_b, int base_exp_b,
+    const int16_t* __restrict__ activations,
+    float*         __restrict__ output_a,
+    float*         __restrict__ output_b,
+    int M, int K)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    __shared__ float warp_sums_a[NUM_WARPS];
+    __shared__ float warp_sums_b[NUM_WARPS];
+
+    float sa0=0, sa1=0, sa2=0, sa3=0, sa4=0, sa5=0, sa6=0, sa7=0;
+    float sb0=0, sb1=0, sb2=0, sb3=0, sb4=0, sb5=0, sb6=0, sb7=0;
+
+    const uint8_t* sma_ptr = sm_a + (int64_t)row * K + tid;
+    const uint8_t* gra_ptr = gr_a + (int64_t)row * K / 2 + tid / 2;
+    const uint8_t* smb_ptr = sm_b + (int64_t)row * K + tid;
+    const uint8_t* grb_ptr = gr_b + (int64_t)row * K / 2 + tid / 2;
+    const int16_t* act_base = activations + tid;
+    const int is_odd = tid & 1;
+
+    int col = tid;
+    for (; col + WORKGROUP_SIZE * 7 < K; col += WORKGROUP_SIZE * 8) {
+        float af0 = bf16_to_float(TURBO_LDG(act_base));
+        float af1 = bf16_to_float(TURBO_LDG(act_base + WORKGROUP_SIZE));
+        float af2 = bf16_to_float(TURBO_LDG(act_base + WORKGROUP_SIZE * 2));
+        float af3 = bf16_to_float(TURBO_LDG(act_base + WORKGROUP_SIZE * 3));
+        float af4 = bf16_to_float(TURBO_LDG(act_base + WORKGROUP_SIZE * 4));
+        float af5 = bf16_to_float(TURBO_LDG(act_base + WORKGROUP_SIZE * 5));
+        float af6 = bf16_to_float(TURBO_LDG(act_base + WORKGROUP_SIZE * 6));
+        float af7 = bf16_to_float(TURBO_LDG(act_base + WORKGROUP_SIZE * 7));
+
+        // Tensor A
+        uint8_t a0s = TURBO_LDG(sma_ptr); uint8_t a1s = TURBO_LDG(sma_ptr + WORKGROUP_SIZE);
+        uint8_t a2s = TURBO_LDG(sma_ptr + WORKGROUP_SIZE*2); uint8_t a3s = TURBO_LDG(sma_ptr + WORKGROUP_SIZE*3);
+        uint8_t a4s = TURBO_LDG(sma_ptr + WORKGROUP_SIZE*4); uint8_t a5s = TURBO_LDG(sma_ptr + WORKGROUP_SIZE*5);
+        uint8_t a6s = TURBO_LDG(sma_ptr + WORKGROUP_SIZE*6); uint8_t a7s = TURBO_LDG(sma_ptr + WORKGROUP_SIZE*7);
+        uint8_t a0g = TURBO_LDG(gra_ptr); uint8_t a1g = TURBO_LDG(gra_ptr + WORKGROUP_SIZE/2);
+        uint8_t a2g = TURBO_LDG(gra_ptr + WORKGROUP_SIZE); uint8_t a3g = TURBO_LDG(gra_ptr + WORKGROUP_SIZE*3/2);
+        uint8_t a4g = TURBO_LDG(gra_ptr + WORKGROUP_SIZE*2); uint8_t a5g = TURBO_LDG(gra_ptr + WORKGROUP_SIZE*5/2);
+        uint8_t a6g = TURBO_LDG(gra_ptr + WORKGROUP_SIZE*3); uint8_t a7g = TURBO_LDG(gra_ptr + WORKGROUP_SIZE*7/2);
+
+        #define DECODE_S12(sm_val, gb_val, bexp) ({ \
+            uint32_t _g = is_odd ? ((gb_val) >> 4) : ((gb_val) & 0xF); \
+            union { uint32_t u; float f; } _c; \
+            _c.u = (((uint32_t)((sm_val) >> 7)) << 15 | ((uint32_t)((bexp) + _g)) << 7 | ((sm_val) & 0x7F)) << 16; \
+            _c.f; })
+
+        sa0 += DECODE_S12(a0s, a0g, base_exp_a) * af0;
+        sa1 += DECODE_S12(a1s, a1g, base_exp_a) * af1;
+        sa2 += DECODE_S12(a2s, a2g, base_exp_a) * af2;
+        sa3 += DECODE_S12(a3s, a3g, base_exp_a) * af3;
+        sa4 += DECODE_S12(a4s, a4g, base_exp_a) * af4;
+        sa5 += DECODE_S12(a5s, a5g, base_exp_a) * af5;
+        sa6 += DECODE_S12(a6s, a6g, base_exp_a) * af6;
+        sa7 += DECODE_S12(a7s, a7g, base_exp_a) * af7;
+
+        // Tensor B
+        uint8_t b0s = TURBO_LDG(smb_ptr); uint8_t b1s = TURBO_LDG(smb_ptr + WORKGROUP_SIZE);
+        uint8_t b2s = TURBO_LDG(smb_ptr + WORKGROUP_SIZE*2); uint8_t b3s = TURBO_LDG(smb_ptr + WORKGROUP_SIZE*3);
+        uint8_t b4s = TURBO_LDG(smb_ptr + WORKGROUP_SIZE*4); uint8_t b5s = TURBO_LDG(smb_ptr + WORKGROUP_SIZE*5);
+        uint8_t b6s = TURBO_LDG(smb_ptr + WORKGROUP_SIZE*6); uint8_t b7s = TURBO_LDG(smb_ptr + WORKGROUP_SIZE*7);
+        uint8_t b0g = TURBO_LDG(grb_ptr); uint8_t b1g = TURBO_LDG(grb_ptr + WORKGROUP_SIZE/2);
+        uint8_t b2g = TURBO_LDG(grb_ptr + WORKGROUP_SIZE); uint8_t b3g = TURBO_LDG(grb_ptr + WORKGROUP_SIZE*3/2);
+        uint8_t b4g = TURBO_LDG(grb_ptr + WORKGROUP_SIZE*2); uint8_t b5g = TURBO_LDG(grb_ptr + WORKGROUP_SIZE*5/2);
+        uint8_t b6g = TURBO_LDG(grb_ptr + WORKGROUP_SIZE*3); uint8_t b7g = TURBO_LDG(grb_ptr + WORKGROUP_SIZE*7/2);
+
+        sb0 += DECODE_S12(b0s, b0g, base_exp_b) * af0;
+        sb1 += DECODE_S12(b1s, b1g, base_exp_b) * af1;
+        sb2 += DECODE_S12(b2s, b2g, base_exp_b) * af2;
+        sb3 += DECODE_S12(b3s, b3g, base_exp_b) * af3;
+        sb4 += DECODE_S12(b4s, b4g, base_exp_b) * af4;
+        sb5 += DECODE_S12(b5s, b5g, base_exp_b) * af5;
+        sb6 += DECODE_S12(b6s, b6g, base_exp_b) * af6;
+        sb7 += DECODE_S12(b7s, b7g, base_exp_b) * af7;
+
+        sma_ptr += WORKGROUP_SIZE * 8; gra_ptr += WORKGROUP_SIZE * 8 / 2;
+        smb_ptr += WORKGROUP_SIZE * 8; grb_ptr += WORKGROUP_SIZE * 8 / 2;
+        act_base += WORKGROUP_SIZE * 8;
+    }
+    // 4-element tail
+    for (; col + WORKGROUP_SIZE * 3 < K; col += WORKGROUP_SIZE * 4) {
+        float af0 = bf16_to_float(TURBO_LDG(act_base));
+        float af1 = bf16_to_float(TURBO_LDG(act_base + WORKGROUP_SIZE));
+        float af2 = bf16_to_float(TURBO_LDG(act_base + WORKGROUP_SIZE * 2));
+        float af3 = bf16_to_float(TURBO_LDG(act_base + WORKGROUP_SIZE * 3));
+
+        sa0 += DECODE_S12(TURBO_LDG(sma_ptr), TURBO_LDG(gra_ptr), base_exp_a) * af0;
+        sa1 += DECODE_S12(TURBO_LDG(sma_ptr+WORKGROUP_SIZE), TURBO_LDG(gra_ptr+WORKGROUP_SIZE/2), base_exp_a) * af1;
+        sa2 += DECODE_S12(TURBO_LDG(sma_ptr+WORKGROUP_SIZE*2), TURBO_LDG(gra_ptr+WORKGROUP_SIZE), base_exp_a) * af2;
+        sa3 += DECODE_S12(TURBO_LDG(sma_ptr+WORKGROUP_SIZE*3), TURBO_LDG(gra_ptr+WORKGROUP_SIZE*3/2), base_exp_a) * af3;
+
+        sb0 += DECODE_S12(TURBO_LDG(smb_ptr), TURBO_LDG(grb_ptr), base_exp_b) * af0;
+        sb1 += DECODE_S12(TURBO_LDG(smb_ptr+WORKGROUP_SIZE), TURBO_LDG(grb_ptr+WORKGROUP_SIZE/2), base_exp_b) * af1;
+        sb2 += DECODE_S12(TURBO_LDG(smb_ptr+WORKGROUP_SIZE*2), TURBO_LDG(grb_ptr+WORKGROUP_SIZE), base_exp_b) * af2;
+        sb3 += DECODE_S12(TURBO_LDG(smb_ptr+WORKGROUP_SIZE*3), TURBO_LDG(grb_ptr+WORKGROUP_SIZE*3/2), base_exp_b) * af3;
+
+        sma_ptr += WORKGROUP_SIZE * 4; gra_ptr += WORKGROUP_SIZE * 4 / 2;
+        smb_ptr += WORKGROUP_SIZE * 4; grb_ptr += WORKGROUP_SIZE * 4 / 2;
+        act_base += WORKGROUP_SIZE * 4;
+    }
+    // Single-element tail
+    for (; col < K; col += WORKGROUP_SIZE) {
+        float af = bf16_to_float(TURBO_LDG(act_base));
+        sa0 += DECODE_S12(TURBO_LDG(sma_ptr), TURBO_LDG(gra_ptr), base_exp_a) * af;
+        sb0 += DECODE_S12(TURBO_LDG(smb_ptr), TURBO_LDG(grb_ptr), base_exp_b) * af;
+        sma_ptr += WORKGROUP_SIZE; gra_ptr += WORKGROUP_SIZE / 2;
+        smb_ptr += WORKGROUP_SIZE; grb_ptr += WORKGROUP_SIZE / 2;
+        act_base += WORKGROUP_SIZE;
+    }
+    #undef DECODE_S12
+
+    float sum_a = sa0 + sa1 + sa2 + sa3 + sa4 + sa5 + sa6 + sa7;
+    float sum_b = sb0 + sb1 + sb2 + sb3 + sb4 + sb5 + sb6 + sb7;
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        sum_a += __shfl_down(sum_a, off, WARP_SIZE);
+        sum_b += __shfl_down(sum_b, off, WARP_SIZE);
+    }
+    if ((tid & (WARP_SIZE - 1)) == 0) {
+        warp_sums_a[tid / WARP_SIZE] = sum_a;
+        warp_sums_b[tid / WARP_SIZE] = sum_b;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float sa = 0, sb = 0;
+        for (int w = 0; w < NUM_WARPS; w++) { sa += warp_sums_a[w]; sb += warp_sums_b[w]; }
+        output_a[row] = sa; output_b[row] = sb;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dual v3_vec4: vectorized uint32_t loads
+// ---------------------------------------------------------------------------
+__launch_bounds__(WORKGROUP_SIZE)
+__global__ void split12_matvec_v3_vec4_dual(
+    const uint8_t* __restrict__ sm_a, const uint8_t* __restrict__ gr_a, int base_exp_a,
+    const uint8_t* __restrict__ sm_b, const uint8_t* __restrict__ gr_b, int base_exp_b,
+    const int16_t* __restrict__ activations,
+    float*         __restrict__ output_a,
+    float*         __restrict__ output_b,
+    int M, int K)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    __shared__ float warp_sums_a[NUM_WARPS];
+    __shared__ float warp_sums_b[NUM_WARPS];
+
+    float sa0 = 0.0f, sa1 = 0.0f;
+    float sb0 = 0.0f, sb1 = 0.0f;
+
+    const uint8_t* sma_base = sm_a + (int64_t)row * K;
+    const uint8_t* gra_base = gr_a + (int64_t)row * K / 2;
+    const uint8_t* smb_base = sm_b + (int64_t)row * K;
+    const uint8_t* grb_base = gr_b + (int64_t)row * K / 2;
+
+    int elem = tid * 4;
+    for (; elem + WORKGROUP_SIZE * 4 - 1 < K; elem += WORKGROUP_SIZE * 4) {
+        uint32_t sma_v = *(const uint32_t*)(sma_base + elem);
+        uint16_t gra_v = *(const uint16_t*)(gra_base + elem / 2);
+        float wa0, wa1, wa2, wa3;
+        decode_vec4(sma_v, gra_v, base_exp_a, wa0, wa1, wa2, wa3);
+
+        float a0 = bf16_to_float(TURBO_LDG(activations + elem));
+        float a1 = bf16_to_float(TURBO_LDG(activations + elem + 1));
+        float a2 = bf16_to_float(TURBO_LDG(activations + elem + 2));
+        float a3 = bf16_to_float(TURBO_LDG(activations + elem + 3));
+
+        sa0 += wa0 * a0 + wa1 * a1 + wa2 * a2 + wa3 * a3;
+
+        uint32_t smb_v = *(const uint32_t*)(smb_base + elem);
+        uint16_t grb_v = *(const uint16_t*)(grb_base + elem / 2);
+        float wb0, wb1, wb2, wb3;
+        decode_vec4(smb_v, grb_v, base_exp_b, wb0, wb1, wb2, wb3);
+
+        sb0 += wb0 * a0 + wb1 * a1 + wb2 * a2 + wb3 * a3;
+    }
+    // Scalar tail
+    for (; elem < K; elem++) {
+        int is_odd_e = elem & 1;
+        float a = bf16_to_float(activations[elem]);
+        uint8_t sma = sma_base[elem]; uint8_t gba = gra_base[elem / 2];
+        uint32_t ga = is_odd_e ? (gba >> 4) : (gba & 0xF);
+        union { uint32_t u; float f; } ca;
+        ca.u = (((uint32_t)(sma >> 7)) << 15 | ((uint32_t)(base_exp_a + ga)) << 7 | (sma & 0x7F)) << 16;
+        sa0 += ca.f * a;
+        uint8_t smb = smb_base[elem]; uint8_t gbb = grb_base[elem / 2];
+        uint32_t gb = is_odd_e ? (gbb >> 4) : (gbb & 0xF);
+        union { uint32_t u; float f; } cb;
+        cb.u = (((uint32_t)(smb >> 7)) << 15 | ((uint32_t)(base_exp_b + gb)) << 7 | (smb & 0x7F)) << 16;
+        sb0 += cb.f * a;
+    }
+
+    float sum_a = sa0 + sa1;
+    float sum_b = sb0 + sb1;
+    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+        sum_a += __shfl_down(sum_a, off, WARP_SIZE);
+        sum_b += __shfl_down(sum_b, off, WARP_SIZE);
+    }
+    if ((tid & (WARP_SIZE - 1)) == 0) {
+        warp_sums_a[tid / WARP_SIZE] = sum_a;
+        warp_sums_b[tid / WARP_SIZE] = sum_b;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float sa = 0, sb = 0;
+        for (int w = 0; w < NUM_WARPS; w++) { sa += warp_sums_a[w]; sb += warp_sums_b[w]; }
+        output_a[row] = sa; output_b[row] = sb;
+    }
+}
+
+// ===========================================================================
+// Launch wrappers for all v3 variants + original v2
+// ===========================================================================
 extern "C" {
+
+// --- v3 Multirow launch wrappers ---
+
+int launch_split12_v3_ldg_async(
+    const void* sign_mantissa, const void* groups, int base_exp,
+    const void* activations, void* output, int M, int K, void* stream)
+{
+    if (M >= 2) {
+        int grid = (M + 1) / 2;
+        hipLaunchKernelGGL(split12_matvec_v3_ldg_multirow,
+            dim3(grid), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
+            (const uint8_t*)sign_mantissa, (const uint8_t*)groups, base_exp,
+            (const int16_t*)activations, (float*)output, M, K);
+    } else {
+        hipLaunchKernelGGL(split12_matvec_v2,
+            dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
+            (const uint8_t*)sign_mantissa, (const uint8_t*)groups, base_exp,
+            (const int16_t*)activations, (float*)output, M, K);
+    }
+    return 0;
+}
+
+int launch_split12_v3_unroll8_async(
+    const void* sign_mantissa, const void* groups, int base_exp,
+    const void* activations, void* output, int M, int K, void* stream)
+{
+    if (M >= 2) {
+        int grid = (M + 1) / 2;
+        hipLaunchKernelGGL(split12_matvec_v3_unroll8_multirow,
+            dim3(grid), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
+            (const uint8_t*)sign_mantissa, (const uint8_t*)groups, base_exp,
+            (const int16_t*)activations, (float*)output, M, K);
+    } else {
+        hipLaunchKernelGGL(split12_matvec_v2,
+            dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
+            (const uint8_t*)sign_mantissa, (const uint8_t*)groups, base_exp,
+            (const int16_t*)activations, (float*)output, M, K);
+    }
+    return 0;
+}
+
+int launch_split12_v3_vec4_async(
+    const void* sign_mantissa, const void* groups, int base_exp,
+    const void* activations, void* output, int M, int K, void* stream)
+{
+    if (M >= 2) {
+        int grid = (M + 1) / 2;
+        hipLaunchKernelGGL(split12_matvec_v3_vec4_multirow,
+            dim3(grid), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
+            (const uint8_t*)sign_mantissa, (const uint8_t*)groups, base_exp,
+            (const int16_t*)activations, (float*)output, M, K);
+    } else {
+        hipLaunchKernelGGL(split12_matvec_v2,
+            dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
+            (const uint8_t*)sign_mantissa, (const uint8_t*)groups, base_exp,
+            (const int16_t*)activations, (float*)output, M, K);
+    }
+    return 0;
+}
+
+// --- v3 Dual launch wrappers ---
+
+int launch_split12_v3_ldg_dual_async(
+    const void* sm_a, const void* gr_a, int base_exp_a,
+    const void* sm_b, const void* gr_b, int base_exp_b,
+    const void* activations,
+    void* output_a, void* output_b,
+    int M, int K, void* stream)
+{
+    hipLaunchKernelGGL(split12_matvec_v3_ldg_dual,
+        dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
+        (const uint8_t*)sm_a, (const uint8_t*)gr_a, base_exp_a,
+        (const uint8_t*)sm_b, (const uint8_t*)gr_b, base_exp_b,
+        (const int16_t*)activations,
+        (float*)output_a, (float*)output_b,
+        M, K);
+    return 0;
+}
+
+int launch_split12_v3_unroll8_dual_async(
+    const void* sm_a, const void* gr_a, int base_exp_a,
+    const void* sm_b, const void* gr_b, int base_exp_b,
+    const void* activations,
+    void* output_a, void* output_b,
+    int M, int K, void* stream)
+{
+    hipLaunchKernelGGL(split12_matvec_v3_unroll8_dual,
+        dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
+        (const uint8_t*)sm_a, (const uint8_t*)gr_a, base_exp_a,
+        (const uint8_t*)sm_b, (const uint8_t*)gr_b, base_exp_b,
+        (const int16_t*)activations,
+        (float*)output_a, (float*)output_b,
+        M, K);
+    return 0;
+}
+
+int launch_split12_v3_vec4_dual_async(
+    const void* sm_a, const void* gr_a, int base_exp_a,
+    const void* sm_b, const void* gr_b, int base_exp_b,
+    const void* activations,
+    void* output_a, void* output_b,
+    int M, int K, void* stream)
+{
+    hipLaunchKernelGGL(split12_matvec_v3_vec4_dual,
+        dim3(M), dim3(WORKGROUP_SIZE), 0, (hipStream_t)stream,
+        (const uint8_t*)sm_a, (const uint8_t*)gr_a, base_exp_a,
+        (const uint8_t*)sm_b, (const uint8_t*)gr_b, base_exp_b,
+        (const int16_t*)activations,
+        (float*)output_a, (float*)output_b,
+        M, K);
+    return 0;
+}
+
+// --- Original v2 wrappers (unchanged) ---
 
 int launch_split12_v2_async(
     const void* sign_mantissa, const void* groups, int base_exp,

@@ -30,14 +30,43 @@ extern "C" {
     int launch_split12_batch4_async(const void* sm, const void* gr, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, int M, int K, void* stream);
     int launch_split12_batch8_async(const void* sm, const void* gr, int base_exp, const void* a0, const void* a1, const void* a2, const void* a3, const void* a4, const void* a5, const void* a6, const void* a7, const void* esc_row_base, const void* esc_counts, const void* esc_vals, void* o0, void* o1, void* o2, void* o3, void* o4, void* o5, void* o6, void* o7, int M, int K, void* stream);
 
+    // Batched B=1 patch correction (eliminates ~192 tiny launches per token)
+    int launch_patches_b1_batched_async(void* descs_gpu, const void* descs_cpu, int num_descs, int max_M, void* stream);
+
 #ifdef TURBO_NVIDIA
     // NVIDIA kernels (nvidia_kernels.cu)
     int nv_launch_split12_v2_async(const void* sm, const void* gr, int base_exp, const void* act, void* out, int M, int K, void* stream);
+    int nv_launch_split12_v2_dual_async(const void* sm_a, const void* gr_a, int base_exp_a, const void* sm_b, const void* gr_b, int base_exp_b, const void* act, void* out_a, void* out_b, int M, int K, void* stream);
     int nv_launch_patches_async(const void* row_off, const void* cols, const void* correct, const void* wrong, const void* act, void* out, int M, void* stream);
     int nv_launch_split12_fused_gemm_async(const void* sm, const void* gr, int base_exp, const void* act, int act_stride, void* out, int out_stride, int M, int K, int B, void* stream, const void* patch_row_off, const void* patch_cols, const void* patch_correct, const void* patch_wrong);
     int nv_launch_patches_batch_async(const void* row_off, const void* cols, const void* correct, const void* wrong, const void* nonempty_rows, int num_nonempty, const void* act, int act_stride, void* out, int out_stride, int B, void* stream);
     int nv_launch_split12_cublas_batch_async(const void* sm, const void* gr, int base_exp, const void* act, int act_stride, void* out, int out_stride, void* bf16_weight_buf, int buf_half_elems, int M, int K, int B, void* stream);
 #endif
+}
+
+// Must match PatchBatchDesc in decompress_v2.hip exactly
+struct PatchBatchDesc {
+    const int32_t* row_offsets;
+    const int32_t* patch_cols;
+    const int16_t* patch_correct;
+    const int16_t* patch_wrong;
+    const int16_t* activations;
+    float*         output;
+    int            M;
+};
+
+// Helper: fill a PatchBatchDesc from a CompressedWeight if it has patches
+static inline bool fill_patch_desc(PatchBatchDesc& d, const CompressedWeight& w,
+                                   const int16_t* bf16_in, float* fp32_out) {
+    if (w.num_patches <= 0 || !w.row_offsets) return false;
+    d.row_offsets   = w.row_offsets;
+    d.patch_cols    = w.patch_cols;
+    d.patch_correct = w.patch_correct;
+    d.patch_wrong   = w.patch_wrong;
+    d.activations   = bf16_in;
+    d.output        = fp32_out;
+    d.M             = w.M;
+    return true;
 }
 
 #define SEQ(buf, s, sz) ((buf) + (s) * (sz))
@@ -136,6 +165,8 @@ InferenceState* create_inference_state(Model* model, int batch_size, int max_seq
     GPU_CHECK(hipStreamCreateWithFlags(&s->stream, hipStreamNonBlocking));
     GPU_CHECK(hipStreamCreateWithFlags(&s->stream2, hipStreamNonBlocking));
     GPU_CHECK(hipEventCreateWithFlags(&s->sync_event, hipEventDisableTiming));
+    // Batched patch descriptor buffer: max 8 descriptors (7 per layer + 1 output_proj)
+    GPU_CHECK(hipMalloc(&s->patch_descs_gpu, 8 * sizeof(PatchBatchDesc)));
 #ifdef TURBO_NVIDIA
     // Ping-pong BF16 buffers for decode+cuBLAS: only needed for weights with M < 4096
     // Fused GEMM handles M >= 4096 without materializing BF16 weights
@@ -174,6 +205,7 @@ void free_inference_state(InferenceState* state) {
     if (state->attn_scores_buf) hipFree(state->attn_scores_buf);
     hipFree(state->d_positions); hipFree(state->d_tokens);
     hipFree(state->bf16_act); hipFree(state->bf16_act2);
+    if (state->patch_descs_gpu) hipFree(state->patch_descs_gpu);
     if (state->stream2) hipStreamDestroy(state->stream2);
     if (state->sync_event) hipEventDestroy(state->sync_event);
     delete state;
@@ -234,32 +266,70 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
     PROF_EVENT_DECL();
     PROF_EVENT_CREATE();
 
-    // Split12 matvec + separate patches (inline patches was slower due to extra args)
-    #define MATVEC_B1(w, bf16_in, fp32_out) do { \
+    // Split12 matvec WITHOUT patches (patches batched separately to reduce launches)
+    #define MATVEC_B1_NOPATCH(w, bf16_in, fp32_out) do { \
         if ((w).split_sm) { \
-            launch_split12_v2_async((w).split_sm, (w).split_gr, (w).base_exp, bf16_in, fp32_out, (w).M, (w).K, stream); \
-            if ((w).num_patches > 0 && (w).row_offsets) \
-                launch_patches_v2_async((w).row_offsets, (w).patch_cols, (w).patch_correct, (w).patch_wrong, \
-                                        bf16_in, fp32_out, (w).M, stream); \
+            NV_OR_HIP_SPLIT12_V2(w, bf16_in, fp32_out); \
         } else { \
             launch_structured12_v2_async((w).packed, (w).base_exp, bf16_in, fp32_out, (w).M, (w).K, stream, \
                 (w).row_offsets, (w).patch_cols, (w).patch_correct, (w).patch_wrong); \
         } \
     } while(0)
 
+    // Legacy macro with inline patches (backward compat)
+    #define MATVEC_B1(w, bf16_in, fp32_out) do { \
+        if ((w).split_sm) { \
+            NV_OR_HIP_SPLIT12_V2(w, bf16_in, fp32_out); \
+            NV_OR_HIP_PATCHES(w, bf16_in, fp32_out); \
+        } else { \
+            launch_structured12_v2_async((w).packed, (w).base_exp, bf16_in, fp32_out, (w).M, (w).K, stream, \
+                (w).row_offsets, (w).patch_cols, (w).patch_correct, (w).patch_wrong); \
+        } \
+    } while(0)
+
+#ifdef TURBO_NVIDIA
+    #define NV_OR_HIP_SPLIT12_V2(w, bf16_in, fp32_out) \
+        nv_launch_split12_v2_async((w).split_sm, (w).split_gr, (w).base_exp, bf16_in, fp32_out, (w).M, (w).K, stream)
+    #define NV_OR_HIP_PATCHES(w, bf16_in, fp32_out) do { \
+        if ((w).num_patches > 0 && (w).row_offsets) \
+            nv_launch_patches_async((w).row_offsets, (w).patch_cols, (w).patch_correct, (w).patch_wrong, \
+                                    bf16_in, fp32_out, (w).M, stream); \
+    } while(0)
+#else
+    #define NV_OR_HIP_SPLIT12_V2(w, bf16_in, fp32_out) \
+        launch_split12_v2_async((w).split_sm, (w).split_gr, (w).base_exp, bf16_in, fp32_out, (w).M, (w).K, stream)
+    #define NV_OR_HIP_PATCHES(w, bf16_in, fp32_out) do { \
+        if ((w).num_patches > 0 && (w).row_offsets) \
+            launch_patches_v2_async((w).row_offsets, (w).patch_cols, (w).patch_correct, (w).patch_wrong, \
+                                    bf16_in, fp32_out, (w).M, stream); \
+    } while(0)
+#endif
+
+    // Batched patch descriptor array (stack-allocated, async-copied to GPU per batch)
+    PatchBatchDesc patch_descs[8];
+
     for (int layer = 0; layer < cfg.n_layer; layer++) {
         auto& L = m->layers[layer];
 
-        // Fused RMSNorm → BF16 for Q/K/V input
+        // Fused RMSNorm -> BF16 for Q/K/V input
         PROF_START(stream);
         if (layer == 0)
             launch_rms_norm_bf16_batch(cur, L.attn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
         PROF_END_NORM(stream);
 
+        // --- Attention: wq+wk+wv matvecs, then ONE batched patch launch ---
         PROF_START(stream);
-        MATVEC_B1(L.wq, bf16_a, state->q_buf);
-        MATVEC_B1(L.wk, bf16_a, state->k_buf);
-        MATVEC_B1(L.wv, bf16_a, state->v_buf);
+        MATVEC_B1_NOPATCH(L.wq, bf16_a, state->q_buf);
+        MATVEC_B1_NOPATCH(L.wk, bf16_a, state->k_buf);
+        MATVEC_B1_NOPATCH(L.wv, bf16_a, state->v_buf);
+        // Batched patches for wq+wk+wv (1 launch instead of 3)
+        if (L.wq.split_sm) {
+            int nd = 0, max_M = 0;
+            if (fill_patch_desc(patch_descs[nd], L.wq, bf16_a, state->q_buf)) { max_M = std::max(max_M, L.wq.M); nd++; }
+            if (fill_patch_desc(patch_descs[nd], L.wk, bf16_a, state->k_buf)) { max_M = std::max(max_M, L.wk.M); nd++; }
+            if (fill_patch_desc(patch_descs[nd], L.wv, bf16_a, state->v_buf)) { max_M = std::max(max_M, L.wv.M); nd++; }
+            if (nd > 0) launch_patches_b1_batched_async(state->patch_descs_gpu, patch_descs, nd, max_M, stream);
+        }
         PROF_END_MV(stream);
 
         PROF_START(stream);
@@ -274,26 +344,40 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
         else
             launch_flash_attention(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
                 bf16_a, cfg.n_head, cfg.n_head_kv, head_dim, pos+1, m->max_seq_len, scale, stream);
-
         PROF_END_ATTN(stream);
 
+        // --- wo matvec + patch ---
         PROF_START(stream);
-        MATVEC_B1(L.wo, bf16_a, res);
+        MATVEC_B1_NOPATCH(L.wo, bf16_a, res);
+        if (L.wo.split_sm) {
+            int nd = 0;
+            if (fill_patch_desc(patch_descs[nd], L.wo, bf16_a, res)) nd++;
+            if (nd > 0) launch_patches_b1_batched_async(state->patch_descs_gpu, patch_descs, nd, L.wo.M, stream);
+        }
         PROF_END_MV(stream);
 
         PROF_START(stream);
         launch_add_rms_norm_bf16_batch(res, cur, L.ffn_norm, bf16_a, n, cfg.rms_norm_eps, 1, stream);
         PROF_END_NORM(stream);
 
+        // --- FFN: gate+up dual kernel + batched patches (1 launch instead of 2) ---
         PROF_START(stream);
-        // Fused dual kernel: gate + up share activation reads (1 launch instead of 2)
         if (L.w_gate.split_sm && L.w_up.split_sm) {
+#ifdef TURBO_NVIDIA
+            nv_launch_split12_v2_dual_async(
+#else
             launch_split12_v2_dual_async(
+#endif
                 L.w_gate.split_sm, L.w_gate.split_gr, L.w_gate.base_exp,
                 L.w_up.split_sm, L.w_up.split_gr, L.w_up.base_exp,
                 bf16_a,
                 state->ffn_gate, state->ffn_up,
                 L.w_gate.M, L.w_gate.K, stream);
+            // Batched patches for gate+up (1 launch instead of 2)
+            int nd = 0, max_M = 0;
+            if (fill_patch_desc(patch_descs[nd], L.w_gate, bf16_a, state->ffn_gate)) { max_M = std::max(max_M, L.w_gate.M); nd++; }
+            if (fill_patch_desc(patch_descs[nd], L.w_up, bf16_a, state->ffn_up))     { max_M = std::max(max_M, L.w_up.M); nd++; }
+            if (nd > 0) launch_patches_b1_batched_async(state->patch_descs_gpu, patch_descs, nd, max_M, stream);
         } else {
             launch_structured12_v2_dual_async(
                 L.w_gate.packed, L.w_gate.base_exp,
@@ -302,21 +386,20 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
                 state->ffn_gate, state->ffn_up,
                 L.w_gate.M, L.w_gate.K, stream);
         }
-        // Patch corrections — still separate for dual (inline would need 2 sets of patch args)
-        if (L.w_gate.num_patches > 0 && L.w_gate.row_offsets)
-            launch_patches_v2_async(L.w_gate.row_offsets, L.w_gate.patch_cols, L.w_gate.patch_correct, L.w_gate.patch_wrong,
-                                    bf16_a, state->ffn_gate, L.w_gate.M, stream);
-        if (L.w_up.num_patches > 0 && L.w_up.row_offsets)
-            launch_patches_v2_async(L.w_up.row_offsets, L.w_up.patch_cols, L.w_up.patch_correct, L.w_up.patch_wrong,
-                                    bf16_a, state->ffn_up, L.w_up.M, stream);
         PROF_END_MV(stream);
 
         PROF_START(stream);
         launch_silu_mul_bf16_batch(state->ffn_gate, state->ffn_up, bf16_b, cfg.n_ff, 1, stream);
         PROF_END_SILU(stream);
 
+        // --- w_down matvec + patch ---
         PROF_START(stream);
-        MATVEC_B1(L.w_down, bf16_b, cur);
+        MATVEC_B1_NOPATCH(L.w_down, bf16_b, cur);
+        if (L.w_down.split_sm) {
+            int nd = 0;
+            if (fill_patch_desc(patch_descs[nd], L.w_down, bf16_b, cur)) nd++;
+            if (nd > 0) launch_patches_b1_batched_async(state->patch_descs_gpu, patch_descs, nd, L.w_down.M, stream);
+        }
         PROF_END_MV(stream);
 
         PROF_START(stream);
@@ -331,12 +414,20 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
 
     // Output projection (bf16_a already set by fused add+norm above)
     PROF_START(stream);
-    MATVEC_B1(m->output_proj, bf16_a, state->logits);
+    MATVEC_B1_NOPATCH(m->output_proj, bf16_a, state->logits);
+    if (m->output_proj.split_sm) {
+        int nd = 0;
+        if (fill_patch_desc(patch_descs[nd], m->output_proj, bf16_a, state->logits)) nd++;
+        if (nd > 0) launch_patches_b1_batched_async(state->patch_descs_gpu, patch_descs, nd, m->output_proj.M, stream);
+    }
     PROF_END_MV(stream);
     PROF_EVENT_DESTROY();
     PROF_TOKEN();
     state->positions[0] = pos + 1;
+    #undef MATVEC_B1_NOPATCH
     #undef MATVEC_B1
+    #undef NV_OR_HIP_SPLIT12_V2
+    #undef NV_OR_HIP_PATCHES
 }
 
 // B=8 batch8 matvec: prefer split12 when available
