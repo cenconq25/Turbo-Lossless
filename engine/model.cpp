@@ -4,6 +4,7 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <algorithm>
 
 
 // Read entire binary file into host memory
@@ -246,9 +247,25 @@ Model* load_model(const std::string& model_path, int device_id) {
 
     // Allocate KV cache
     int head_dim = cfg.n_embd / cfg.n_head;
-    // Max context length — configurable via TURBO_CTX env var (default 2048)
+    // Max context length — use model's limit, capped by available VRAM
+    // Override with TURBO_CTX env var
     const char* ctx_env = getenv("TURBO_CTX");
-    m->max_seq_len = ctx_env ? atoi(ctx_env) : 2048;
+    if (ctx_env) {
+        m->max_seq_len = atoi(ctx_env);
+    } else {
+        // Use model's native context limit (from config.json max_position_embeddings)
+        int model_ctx = cfg.n_ctx > 0 ? cfg.n_ctx : 2048;
+        // Cap to fit in VRAM: each context token costs n_layer * n_head_kv * head_dim * 2 * 2 bytes (K+V, FP16)
+        size_t bytes_per_token = (size_t)cfg.n_layer * cfg.n_head_kv * head_dim * 2 * sizeof(int16_t);
+        size_t free_mem = 0, total_mem = 0;
+        hipMemGetInfo(&free_mem, &total_mem);
+        // Reserve 512 MB for inference buffers, use rest for KV cache
+        size_t kv_budget = free_mem > 512*1024*1024 ? free_mem - 512*1024*1024 : free_mem / 2;
+        int max_by_vram = (int)(kv_budget / bytes_per_token);
+        m->max_seq_len = std::min(model_ctx, max_by_vram);
+        // Minimum 2048
+        if (m->max_seq_len < 2048) m->max_seq_len = 2048;
+    }
     if (m->max_seq_len < 128) m->max_seq_len = 128;
     printf("  Context length: %d\n", m->max_seq_len);
     size_t kv_size = (size_t)cfg.n_layer * m->max_seq_len * cfg.n_head_kv * head_dim;
