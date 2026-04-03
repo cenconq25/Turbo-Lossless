@@ -93,19 +93,25 @@ Single GPU — NVIDIA RTX 5070 Ti 16 GB (Blackwell, 896 GB/s). All tok/s, 200-to
 
 ### Compression Analysis (sampled from first shard of each model)
 
-| Model | Params | Type | Escape Rate | Compression | BF16 Size | Compressed |
-|-------|-------:|:----:|------------:|:-----------:|----------:|-----------:|
-| Llama 3.1 8B | 8.0B | Dense | 0.021% | 1.33x | 16.1 GB | ~12.0 GB |
-| Mistral 7B | 7.25B | Dense | 0.031% | 1.33x | 14.5 GB | ~10.9 GB |
-| Mixtral 8x7B | 46.7B | MoE | 0.050% | **1.33x** | ~93 GB | ~70 GB |
-| Llama 3.1 70B | 70B | Dense | 0.018% | **1.33x** | ~140 GB | ~105 GB |
-| Qwen 2.5 72B | 72B | Dense | 1.060% | 1.31x | ~144 GB | ~110 GB |
+| Model | Params | Type | Escape Rate | Compression |
+|-------|-------:|:----:|------------:|:-----------:|
+| **Llama 3.1 405B** | 405B | Dense LLM | **0.034%** | **1.33x** |
+| Llama 3.1 70B | 70B | Dense LLM | 0.018% | 1.33x |
+| Llama 3.1 8B | 8.0B | Dense LLM | 0.021% | 1.33x |
+| Mistral 7B | 7.25B | Dense LLM | 0.031% | 1.33x |
+| Mixtral 8x7B | 46.7B | **MoE LLM** | 0.050% | 1.33x |
+| Qwen 2.5 72B | 72B | Dense LLM | 1.060% | 1.31x |
+| Gemma 4 31B | 31.3B | Dense LLM | 0.071% | 1.33x |
+| **SDXL UNet** | 2.6B | **Image (FP16)** | **0.233%** | **1.33x** |
+| Gemma 4 E4B | 8.0B | Multimodal | 1.512% | 1.31x |
+| Gemma 4 E2B | 5.1B | Multimodal | 2.344% | 1.30x |
 
 **Key findings:**
-- Dense models (Llama, Mistral) have <0.05% escape rates — near-perfect compression
-- **MoE works** — Mixtral expert weights compress just as well as dense weights (0.05%)
-- **70B scales** — Llama 70B has the lowest escape rate (0.018%), better than 7B
-- Qwen 72B has higher escapes (1.06%) driven by its 152K vocab embedding layer
+- **Scales to 405B** — Llama 405B has 0.034% escapes, same as 8B. Compression is size-independent.
+- **MoE works** — Mixtral expert weights compress identically to dense (0.05%)
+- **Image models work** — SDXL UNet (FP16) compresses at 1.33x with 0.23% escapes
+- **Multimodal outliers** — Gemma E2B/E4B have 1.5-2.3% escapes (wider weight distributions from vision/audio training)
+- Dense text LLMs consistently achieve <0.1% escape rates regardless of model size
 
 ---
 
