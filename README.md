@@ -29,6 +29,19 @@ Sign and mantissa pass through unchanged.
 
 The 0.03% of weights outside this window get group=0 (escape). Their exact BF16 value is stored in a small side table (~3 MB for a 7B model). **Zero information loss.**
 
+| | Turbo Lossless |
+|---|---|
+| **Format** | BF16 only |
+| **Lossless** | Yes, 100% bit-perfect |
+| **Bits/weight** | 12.0 (fixed) |
+| **Compression** | 1.33x |
+| **Exponent coverage** | 15 consecutive (99.97%) |
+| **Escape rate** | 0.03% |
+| **Decode cost** | 1 integer ADD |
+| **Encoding** | 4-bit group (fixed width) |
+| **Storage** | Byte-aligned (zero read amplification) |
+| **Hardware** | NVIDIA + AMD |
+
 ### The Storage (Split12)
 
 12 bits doesn't align to bytes. Packing them contiguously would force the GPU to load 8 bytes and bit-shift to extract 1.5 bytes — wasting bandwidth. Instead, we split the 12 bits into two byte-aligned arrays:
