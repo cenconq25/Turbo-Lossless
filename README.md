@@ -114,9 +114,9 @@ CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./turbo-engine models/mistral-7b-instruct-tu
 | `TURBO_FAST=1` | Pre-computed escape counts (+10% speed, +361 MB VRAM) |
 | `TURBO_CTX=N` | Max context length (default 2048) |
 | `TURBO_PROFILE=1` | Per-token timing breakdown |
-| `TURBO_KERNEL=1\|2\|3` | Kernel version: V1 baseline, V2 cp.async, **V3 TMA** (default) |
+| `TURBO_KERNEL=1\|2\|3` | Fused GEMM kernel for B>=64: V1 baseline, V2 cp.async, **V3 TMA** (default). No effect at B<=32 |
 
-V3 TMA auto-selects for B>=64, V2 for B<64. No manual override needed.
+B<=32 always uses split12 per-row matvec. B>=64 uses fused decode+GEMM (V3 TMA by default, override with `TURBO_KERNEL`).
 
 ---
 
