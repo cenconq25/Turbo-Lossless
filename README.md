@@ -33,7 +33,7 @@ Stored as two byte-aligned arrays (**Split12**) — zero GPU read amplification:
 | **Bits/weight** | **12.0 (fixed)** | ~11.3 | ~11.0 | ~11 | ~10.6 | ~11.6 |
 | **Decode cost** | **1 ADD** | Bitmap+popcount | Huffman LUT | CPU zstd | ANS | CAM |
 | **Escape rate** | **0.03%** | ~3% | 0% | 0% | 0% | 0% |
-| **Fused GEMM?** | Matvec | Tensor core | No | No | No | ASIC |
+| **Fused decode?** | **Yes** (matvec) | **Yes** (tensor core) | No (separate) | No | No | ASIC only |
 | **GPU decode** | Yes | Yes | Yes | No (CPU) | Yes | No (ASIC) |
 | **Hardware** | **NVIDIA + AMD** | NVIDIA | NVIDIA | CPU | NVIDIA | Custom |
 
