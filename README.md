@@ -65,7 +65,7 @@ B=8:  decode -> 8x FMA    (2.4x faster than BF16)
 
 ### RTX 5070 Ti 16GB (NVIDIA Blackwell, 896 GB/s)
 
-#### Mistral 7B Instruct (7.25B params, escape rate 0.031%)
+#### Mistral 7B Instruct (7.25B params, escape rate 0.031%, **1.33x compression**)
 
 | Batch | Kernel | vLLM BF16 | Turbo 12-bit | vs vLLM | Model VRAM | Overhead |
 |------:|:------:|----------:|-------------:|:-------:|-----------:|---------:|
@@ -79,7 +79,7 @@ B=8:  decode -> 8x FMA    (2.4x faster than BF16)
 
 vLLM: model 13.2 GB + overhead 2.1 GB = **15.3 GB** (max 1 user). Turbo: **12.7 GB** at B=256 — 3.3 GB free on 16 GB card.
 
-#### Llama 3.1 8B Instruct (8.03B params, escape rate 0.021%)
+#### Llama 3.1 8B Instruct (8.03B params, escape rate 0.021%, **1.33x compression**)
 
 | Batch | Kernel | vLLM BF16 | Turbo 12-bit | Model VRAM | Overhead |
 |------:|:------:|----------:|-------------:|-----------:|---------:|
@@ -99,7 +99,7 @@ vLLM OOMs loading Llama 8B BF16 (needs ~15 GB weights + ~2 GB overhead > 16 GB).
 |  | vLLM BF16 (Mistral) | Turbo (Mistral) | vLLM BF16 (Llama) | Turbo (Llama) |
 |--|---------------------:|----------------:|-------------------:|--------------:|
 | **Model weights** | 13,510 MiB | **10,433 MiB** | ~15,050 MiB | **11,738 MiB** |
-| **Compression ratio** | 1.00x | **1.33x** | 1.00x | **1.33x** |
+| **Compression ratio** | 1.00x | **1.33x** (universal) | 1.00x | **1.33x** (universal) |
 | **Runtime overhead (B=1)** | ~2,115 MiB | **~917 MiB** | OOM | **~938 MiB** |
 | **Total VRAM (B=1)** | 15,625 MiB | **11,350 MiB** | OOM | **12,676 MiB** |
 | **Total VRAM (B=256)** | OOM (1 max) | **13,028 MiB** | OOM | **14,448 MiB** |
@@ -170,21 +170,21 @@ Now uses `forward_batch_tiled` with V3 TMA tensor cores at B>=16. Max batch limi
 
 | Model | Params | Escape Rate | Compression | Tokenizer | Status |
 |-------|-------:|------------:|:-----------:|-----------|--------|
-| Mistral 7B Instruct | 7.25B | 0.031% | 1.36x | sentencepiece | **Tested** (AMD + NVIDIA + TP=2) |
-| Llama 3.1 8B Instruct | 8.03B | 0.021% | 1.42x | HF BPE | **Tested** (AMD + NVIDIA + TP=2) |
-| Any BF16 safetensors transformer | varies | ~0.02-0.03% | ~1.33-1.42x | sentencepiece or HF BPE | Should work |
+| Mistral 7B Instruct | 7.25B | 0.031% | **1.33x** | sentencepiece | **Tested** (AMD + NVIDIA + TP=2) |
+| Llama 3.1 8B Instruct | 8.03B | 0.021% | **1.33x** | HF BPE | **Tested** (AMD + NVIDIA + TP=2) |
+| Any BF16 safetensors transformer | varies | 0.02-2.3% | **1.33x** | sentencepiece or HF BPE | Should work |
 
 ### Compression Rate Analysis (BF16 Models)
 
-All BF16 models compress to exactly **1.33x** (16→12 bits). The escape rate determines patch table overhead:
+**Universal 1.33x compression** — every BF16 model compresses identically (16→12 bits per weight). The escape rate only affects the small CSR patch table overhead:
 
-| Model | Params | BF16 Size | 12-bit Size | Saves | Escape Rate | Notes |
-|-------|-------:|----------:|------------:|------:|------------:|-------|
-| Llama 3.1 8B | 8.03B | 16.1 GB | 12.0 GB | 4.0 GB | **0.034%** | Best — tightest exponent clustering |
-| Gemma 4 31B | 31.27B | 62.6 GB | 46.9 GB | 15.6 GB | **0.061%** | Excellent — dense text model |
-| Mistral 7B | 7.25B | 29.0 GB | 21.7 GB | 7.3 GB | **0.082%** | Great — includes shared tensors |
-| Gemma 4 E4B | 8.00B | 16.0 GB | 12.0 GB | 4.0 GB | **1.512%** | High — multimodal training |
-| Gemma 4 E2B | 5.12B | 10.3 GB | 7.7 GB | 2.6 GB | **2.344%** | Highest — wider weight distribution |
+| Model | Params | BF16 Size | 12-bit Size | Compression | Saves | Escape Rate | Notes |
+|-------|-------:|----------:|------------:|:-----------:|------:|------------:|-------|
+| Llama 3.1 8B | 8.03B | 16.1 GB | 12.0 GB | **1.33x** | 4.0 GB | **0.034%** | Best — tightest exponent clustering |
+| Gemma 4 31B | 31.27B | 62.6 GB | 46.9 GB | **1.33x** | 15.6 GB | **0.061%** | Excellent — dense text model |
+| Mistral 7B | 7.25B | 29.0 GB | 21.7 GB | **1.33x** | 7.3 GB | **0.082%** | Great — includes shared tensors |
+| Gemma 4 E4B | 8.00B | 16.0 GB | 12.0 GB | **1.33x** | 4.0 GB | **1.512%** | High — multimodal training |
+| Gemma 4 E2B | 5.12B | 10.3 GB | 7.7 GB | **1.33x** | 2.6 GB | **2.344%** | Highest — wider weight distribution |
 
 **Key insight:** Dense text models (Llama, Mistral, Gemma 31B) have escape rates < 0.1% — near-perfect for our compression. Multimodal models (Gemma E2B/E4B) have 30-70x higher escape rates due to wider weight distributions from vision/audio training, but still compress at 1.33x. The higher escape rate only increases the CSR patch table size (~120M patches vs ~3M), adding ~230 MB VRAM overhead vs ~6 MB.
 
