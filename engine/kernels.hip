@@ -27,46 +27,6 @@ __device__ __forceinline__ int16_t float_to_bf16(float val) {
 }
 
 // ============================================================
-// RMSNorm: y = x * rsqrt(mean(x²) + eps) * weight
-// ============================================================
-__global__ void rms_norm_kernel(
-    const float* __restrict__ x,      // [n]
-    const float* __restrict__ weight,  // [n]
-    float* __restrict__ y,            // [n]
-    int n, float eps)
-{
-    // One block per row, threads cooperate on reduction
-    // Safe for in-place (x == y): reads all x first, syncs, then writes
-    extern __shared__ float sdata[];
-    int tid = threadIdx.x;
-
-    // Pass 1: compute sum of squares
-    float sum_sq = 0.0f;
-    for (int i = tid; i < n; i += blockDim.x) {
-        float v = x[i];
-        sum_sq += v * v;
-    }
-
-    // Block reduction
-    sdata[tid] = sum_sq;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        __syncthreads();
-    }
-    float rms = rsqrtf(sdata[0] / n + eps);
-    __syncthreads();
-
-    // Pass 2: read x, compute, write y (safe because all threads have rms now)
-    // For in-place safety: each thread reads its elements, computes, writes
-    // This is safe because thread i only writes to indices i, i+blockDim, i+2*blockDim...
-    // and reads the same indices — no cross-thread read/write conflict
-    for (int i = tid; i < n; i += blockDim.x) {
-        y[i] = x[i] * rms * weight[i];
-    }
-}
-
-// ============================================================
 // RoPE: Rotary Position Embeddings (with precomputed frequencies)
 // ============================================================
 
@@ -74,46 +34,6 @@ __global__ void rms_norm_kernel(
 static float* d_rope_freqs = nullptr;
 static int d_rope_freqs_dim = 0;
 
-__global__ void rope_kernel(
-    float* __restrict__ q,   // [n_head, head_dim]
-    float* __restrict__ k,   // [n_head_kv, head_dim]
-    const float* __restrict__ freqs,  // [half_dim] precomputed
-    int head_dim, int n_head, int n_head_kv,
-    int position)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int half_dim = head_dim / 2;
-
-    // Apply to Q heads
-    if (idx < n_head * half_dim) {
-        int head = idx / half_dim;
-        int d = idx % half_dim;
-        float angle = position * freqs[d];
-        float cos_a, sin_a;
-        __sincosf(angle, &sin_a, &cos_a);
-
-        int base = head * head_dim;
-        float x0 = q[base + d];
-        float x1 = q[base + d + half_dim];
-        q[base + d]            = x0 * cos_a - x1 * sin_a;
-        q[base + d + half_dim] = x0 * sin_a + x1 * cos_a;
-    }
-
-    // Apply to K heads
-    if (idx < n_head_kv * half_dim) {
-        int head = idx / half_dim;
-        int d = idx % half_dim;
-        float angle = position * freqs[d];
-        float cos_a, sin_a;
-        __sincosf(angle, &sin_a, &cos_a);
-
-        int base = head * head_dim;
-        float x0 = k[base + d];
-        float x1 = k[base + d + half_dim];
-        k[base + d]            = x0 * cos_a - x1 * sin_a;
-        k[base + d + half_dim] = x0 * sin_a + x1 * cos_a;
-    }
-}
 
 // ============================================================
 // SiLU(gate) * up — SwiGLU activation for MLP
@@ -206,12 +126,6 @@ __global__ void argmax_kernel(
 // ============================================================
 extern "C" {
 
-void launch_rms_norm(const float* x, const float* weight, float* y,
-                     int n, float eps, hipStream_t stream) {
-    int threads = min(1024, n);
-    rms_norm_kernel<<<1, threads, threads * sizeof(float), stream>>>(x, weight, y, n, eps);
-}
-
 void launch_rope_init(int head_dim, float theta_base) {
     if (d_rope_freqs && d_rope_freqs_dim == head_dim) return;
     int half_dim = head_dim / 2;
@@ -223,16 +137,6 @@ void launch_rope_init(int head_dim, float theta_base) {
     hipMemcpy(d_rope_freqs, h_freqs, half_dim * sizeof(float), hipMemcpyHostToDevice);
     d_rope_freqs_dim = head_dim;
     delete[] h_freqs;
-}
-
-void launch_rope(float* q, float* k, int head_dim, int n_head, int n_head_kv,
-                 int position, float theta, hipStream_t stream) {
-    launch_rope_init(head_dim, theta);
-    int half_dim = head_dim / 2;
-    int max_threads = max(n_head, n_head_kv) * half_dim;
-    int threads = 256;
-    int blocks = (max_threads + threads - 1) / threads;
-    rope_kernel<<<blocks, threads, 0, stream>>>(q, k, d_rope_freqs, head_dim, n_head, n_head_kv, position);
 }
 
 void launch_embed_lookup(const int16_t* embd_table, const int* token_ids,
@@ -258,37 +162,6 @@ void launch_argmax_batch(const float* logits, int* results, int n_vocab, int bat
 // ============================================================
 // Attention: Q×K^T → softmax → ×V with GQA support
 // ============================================================
-
-// Store K and V into the KV cache at the current position
-__global__ void store_kv_kernel(
-    const float* __restrict__ k_in,     // [n_head_kv * head_dim] FP32
-    const float* __restrict__ v_in,     // [n_head_kv * head_dim] FP32
-    int16_t* __restrict__ kv_cache_k,   // [max_seq, n_head_kv, head_dim] BF16
-    int16_t* __restrict__ kv_cache_v,
-    int pos, int n_head_kv, int head_dim, int max_seq)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = n_head_kv * head_dim;
-    if (idx >= total) return;
-
-    int cache_idx = pos * total + idx;
-    kv_cache_k[cache_idx] = float_to_bf16(k_in[idx]);
-    kv_cache_v[cache_idx] = float_to_bf16(v_in[idx]);
-}
-
-extern "C" {
-
-void launch_store_kv(const float* k, const float* v,
-                     int16_t* kv_k, int16_t* kv_v,
-                     int pos, int n_head_kv, int head_dim, int max_seq,
-                     hipStream_t stream) {
-    int total = n_head_kv * head_dim;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
-    store_kv_kernel<<<blocks, threads, 0, stream>>>(k, v, kv_k, kv_v, pos, n_head_kv, head_dim, max_seq);
-}
-
-}
 
 // ============================================================
 // Fused RoPE + Store KV (B=1 only): saves one kernel launch
@@ -373,84 +246,6 @@ void launch_rope_store_kv(float* q, float* k, const float* v,
 }
 
 // ============================================================
-// FP32 → BF16 conversion kernel (GPU, replaces CPU conversion)
-// ============================================================
-__global__ void fp32_to_bf16_kernel(
-    const float* __restrict__ input,
-    int16_t* __restrict__ output,
-    int n)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-    output[idx] = float_to_bf16(input[idx]);
-}
-
-extern "C" {
-void launch_fp32_to_bf16(const float* input, int16_t* output, int n, hipStream_t stream) {
-    int threads = 256;
-    int blocks = (n + threads - 1) / threads;
-    fp32_to_bf16_kernel<<<blocks, threads, 0, stream>>>(input, output, n);
-}
-}
-
-// ============================================================
-// Batched RMSNorm: process B vectors of length n in one launch
-// x,y are [batch_size * n], weight is [n] (shared across batch)
-// One block per batch item, threads cooperate on reduction
-// ============================================================
-__global__ void rms_norm_batch_kernel(
-    const float* __restrict__ x,      // [batch_size * n]
-    const float* __restrict__ weight,  // [n]
-    float* __restrict__ y,            // [batch_size * n]
-    int n, float eps, int batch_size)
-{
-    int batch = blockIdx.x;
-    if (batch >= batch_size) return;
-
-    extern __shared__ float sdata[];
-    int tid = threadIdx.x;
-    int offset = batch * n;
-
-    // Pass 1: compute sum of squares
-    float sum_sq = 0.0f;
-    for (int i = tid; i < n; i += blockDim.x) {
-        float v = x[offset + i];
-        sum_sq += v * v;
-    }
-
-    sdata[tid] = sum_sq;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        __syncthreads();
-    }
-    float rms = rsqrtf(sdata[0] / n + eps);
-    __syncthreads();
-
-    // Pass 2: normalize and scale
-    for (int i = tid; i < n; i += blockDim.x) {
-        y[offset + i] = x[offset + i] * rms * weight[i];
-    }
-}
-
-// ============================================================
-// Batched SiLU multiply: SiLU(gate) * up for B*n elements
-// ============================================================
-__global__ void silu_mul_batch_kernel(
-    const float* __restrict__ gate,   // [batch_size * n]
-    const float* __restrict__ up,     // [batch_size * n]
-    float* __restrict__ out,          // [batch_size * n]
-    int n, int batch_size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = batch_size * n;
-    if (idx >= total) return;
-    float g = gate[idx];
-    float silu = g / (1.0f + expf(-g));
-    out[idx] = silu * up[idx];
-}
-
-// ============================================================
 // Batched add: y[i] += x[i] for batch_size * n elements
 // ============================================================
 __global__ void add_batch_kernel(
@@ -464,19 +259,6 @@ __global__ void add_batch_kernel(
     y[idx] += x[idx];
 }
 
-// ============================================================
-// Batched memcpy: GPU-side copy of batch_size * n floats
-// ============================================================
-__global__ void memcpy_batch_kernel(
-    float* __restrict__ dst,
-    const float* __restrict__ src,
-    int n, int batch_size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = batch_size * n;
-    if (idx >= total) return;
-    dst[idx] = src[idx];
-}
 
 // ============================================================
 // Fused RMSNorm → BF16 output (eliminates separate fp32_to_bf16 launch)
@@ -589,13 +371,6 @@ __global__ void silu_mul_bf16_batch_kernel(
 
 extern "C" {
 
-void launch_rms_norm_batch(const float* x, const float* weight, float* y,
-                           int n, float eps, int batch_size, hipStream_t stream) {
-    int threads = min(1024, n);  // more threads = faster reduction for large n
-    rms_norm_batch_kernel<<<batch_size, threads, threads * sizeof(float), stream>>>(
-        x, weight, y, n, eps, batch_size);
-}
-
 void launch_rms_norm_bf16_batch(const float* x, const float* weight, int16_t* y,
                                 int n, float eps, int batch_size, hipStream_t stream) {
     int threads = min(1024, n);
@@ -612,14 +387,6 @@ void launch_add_rms_norm_bf16_batch(float* x, const float* residual, const float
         x, residual, weight, y, n, eps, batch_size);
 }
 
-void launch_silu_mul_batch(const float* gate, const float* up, float* out,
-                           int n, int batch_size, hipStream_t stream) {
-    int threads = 256;
-    int total = batch_size * n;
-    int blocks = (total + threads - 1) / threads;
-    silu_mul_batch_kernel<<<blocks, threads, 0, stream>>>(gate, up, out, n, batch_size);
-}
-
 void launch_silu_mul_bf16_batch(const float* gate, const float* up, int16_t* out,
                                 int n, int batch_size, hipStream_t stream) {
     int threads = 256;
@@ -633,13 +400,6 @@ void launch_add_batch(float* y, const float* x, int n, int batch_size, hipStream
     int total = batch_size * n;
     int blocks = (total + threads - 1) / threads;
     add_batch_kernel<<<blocks, threads, 0, stream>>>(y, x, n, batch_size);
-}
-
-void launch_memcpy_batch(float* dst, const float* src, int n, int batch_size, hipStream_t stream) {
-    int threads = 256;
-    int total = batch_size * n;
-    int blocks = (total + threads - 1) / threads;
-    memcpy_batch_kernel<<<blocks, threads, 0, stream>>>(dst, src, n, batch_size);
 }
 
 }

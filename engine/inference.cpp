@@ -80,7 +80,6 @@ static inline bool fill_patch_desc(PatchBatchDesc& d, const CompressedWeight& w,
         (w).M, (w).K, strm); \
 } while(0)
 
-// NVIDIA tensor core GEMM: decode → shared mem → WMMA (sm_80+ Ampere/Hopper/Ada/Blackwell)
 #ifdef TURBO_NVIDIA
 static int s_force_cublas = -1;
 static void check_force_cublas() {
@@ -90,38 +89,6 @@ static void check_force_cublas() {
         if (s_force_cublas) printf("  TURBO_CUBLAS=1: all tensors use cuBLAS path\n");
     }
 }
-#define FUSED_MATVEC(w, bf16_in, out_buf, n_in, n_out, bs, strm) do { \
-    if ((w).split_sm) { \
-        /* Route through fused or cuBLAS based on TURBO_CUBLAS env */ \
-        if ((w).M >= 4096 && !s_force_cublas) { \
-            nv_launch_split12_fused_gemm_async((w).split_sm, (w).split_gr, (w).base_exp, \
-                bf16_in, n_in, out_buf, n_out, (w).M, (w).K, bs, strm, \
-                nullptr, nullptr, nullptr, nullptr); \
-        } else { \
-            nv_launch_split12_cublas_batch_async((w).split_sm, (w).split_gr, (w).base_exp, \
-                bf16_in, n_in, out_buf, n_out, state->weight_buf, state->weight_buf_half, \
-                (w).M, (w).K, bs, strm); \
-        } \
-        if ((w).num_nonempty_rows > 0) \
-            nv_launch_patches_batch_async((w).row_offsets, (w).patch_cols, \
-                (w).patch_correct, (w).patch_wrong, \
-                (w).patch_nonempty_rows, (w).num_nonempty_rows, \
-                bf16_in, n_in, out_buf, n_out, bs, strm); \
-    } \
-} while(0)
-
-// CUBLAS_MATVEC: decode split12 → BF16 buffer → cuBLAS GEMM + batched patches
-#define CUBLAS_MATVEC(w, bf16_in, out_buf, n_in, n_out, bs, strm, wbuf, wbuf_half) do { \
-    if ((w).split_sm) { \
-        nv_launch_split12_cublas_batch_async((w).split_sm, (w).split_gr, (w).base_exp, \
-            bf16_in, n_in, out_buf, n_out, wbuf, wbuf_half, (w).M, (w).K, bs, strm); \
-        if ((w).num_nonempty_rows > 0) \
-            nv_launch_patches_batch_async((w).row_offsets, (w).patch_cols, \
-                (w).patch_correct, (w).patch_wrong, \
-                (w).patch_nonempty_rows, (w).num_nonempty_rows, \
-                bf16_in, n_in, out_buf, n_out, bs, strm); \
-    } \
-} while(0)
 #endif
 
 InferenceState* create_inference_state(Model* model, int batch_size, int max_seq_len) {
@@ -213,9 +180,7 @@ static float s_prof_matvec = 0, s_prof_nonmv = 0;
 #define PROF_START(strm) do { if (s_profile) hipEventRecord(_pE0, strm); } while(0)
 #define PROF_END_MV(strm) do { if (s_profile) { hipEventRecord(_pE1, strm); hipEventSynchronize(_pE1); \
     float _ms; hipEventElapsedTime(&_ms, _pE0, _pE1); s_prof_matvec += _ms; } } while(0)
-#define PROF_END_NM(strm) do { if (s_profile) { hipEventRecord(_pE1, strm); hipEventSynchronize(_pE1); \
-    float _ms; hipEventElapsedTime(&_ms, _pE0, _pE1); s_prof_nonmv += _ms; } } while(0)
-static float s_prof_attn = 0, s_prof_norm = 0, s_prof_silu = 0, s_prof_misc = 0;
+static float s_prof_attn = 0, s_prof_norm = 0, s_prof_silu = 0;
 #define PROF_END_ATTN(strm) do { if (s_profile) { hipEventRecord(_pE1, strm); hipEventSynchronize(_pE1); \
     float _ms; hipEventElapsedTime(&_ms, _pE0, _pE1); s_prof_attn += _ms; s_prof_nonmv += _ms; } } while(0)
 #define PROF_END_NORM(strm) do { if (s_profile) { hipEventRecord(_pE1, strm); hipEventSynchronize(_pE1); \
@@ -227,7 +192,7 @@ static float s_prof_attn = 0, s_prof_norm = 0, s_prof_silu = 0, s_prof_misc = 0;
     printf("  [PROFILE] %d tok: mv %.1f (%.0f%%) | attn %.1f norm %.1f silu %.1f misc %.1f | total %.1f (%.1f t/s)\n", \
         s_profile_tokens, s_prof_matvec, 100*s_prof_matvec/total, s_prof_attn, s_prof_norm, s_prof_silu, \
         s_prof_nonmv - s_prof_attn - s_prof_norm - s_prof_silu, total, 10000.0f/total); \
-    s_prof_matvec = s_prof_nonmv = s_prof_attn = s_prof_norm = s_prof_silu = s_prof_misc = 0; } } while(0)
+    s_prof_matvec = s_prof_nonmv = s_prof_attn = s_prof_norm = s_prof_silu = 0; } } while(0)
 
 // B=1 forward — optimized: no redundant memcpy, single sync at end
 static void forward_b1(InferenceState* state, const int* token_ids) {
@@ -257,13 +222,6 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
     #define MATVEC_B1_NOPATCH(w, bf16_in, fp32_out) do { \
         if (!(w).split_sm) { fprintf(stderr, "ERROR: split12 data missing for weight %dx%d\n", (w).M, (w).K); exit(1); } \
         NV_OR_HIP_SPLIT12_V2(w, bf16_in, fp32_out); \
-    } while(0)
-
-    // Legacy macro with inline patches (backward compat)
-    #define MATVEC_B1(w, bf16_in, fp32_out) do { \
-        if (!(w).split_sm) { fprintf(stderr, "ERROR: split12 data missing for weight %dx%d\n", (w).M, (w).K); exit(1); } \
-        NV_OR_HIP_SPLIT12_V2(w, bf16_in, fp32_out); \
-        NV_OR_HIP_PATCHES(w, bf16_in, fp32_out); \
     } while(0)
 
 #ifdef TURBO_NVIDIA

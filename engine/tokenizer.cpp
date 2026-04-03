@@ -40,22 +40,6 @@ struct HFTokenizer {
     int bos_id, eos_id;
 };
 
-// Simple JSON string extraction (no external lib needed)
-static std::string extract_json_string(const std::string& json, const std::string& key) {
-    std::string search = "\"" + key + "\"";
-    size_t pos = json.find(search);
-    if (pos == std::string::npos) return "";
-    pos = json.find(":", pos);
-    if (pos == std::string::npos) return "";
-    pos = json.find("\"", pos + 1);
-    if (pos == std::string::npos) return "";
-    size_t end = json.find("\"", pos + 1);
-    // Handle escaped quotes
-    while (end != std::string::npos && json[end - 1] == '\\') end = json.find("\"", end + 1);
-    if (end == std::string::npos) return "";
-    return json.substr(pos + 1, end - pos - 1);
-}
-
 static int extract_json_int(const std::string& json, const std::string& key) {
     std::string search = "\"" + key + "\"";
     size_t pos = json.find(search);

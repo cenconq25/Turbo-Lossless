@@ -7,7 +7,7 @@
 - **Up to 2.93x faster** than vLLM at B=256
 - Runs models **where competitors OOM** (Llama 8B, Yi 9B on 16 GB)
 
-**BF16 safetensors only.** No GGUF, no FP16, no FP32, no quantized formats.
+**BF16 safetensors** (FP16 auto-cast supported). No GGUF, no FP32, no quantized formats.
 
 ---
 
@@ -15,7 +15,7 @@
 
 ### The Compression
 
-BF16 is 16 bits per weight: `[1-bit sign][8-bit exponent][7-bit mantissa]`. Neural network weights cluster tightly — only ~40 of 256 possible exponent values are used, and **15 consecutive exponents cover 99.97%** of all weights.
+BF16 is 16 bits per weight: `[1-bit sign][8-bit exponent][7-bit mantissa]`. Neural network weights cluster tightly — only ~40 of 256 possible exponent values are used, and **15 consecutive exponents cover 99.97%** of all weights. This happens because weights are initialized from narrow distributions (Xavier, He) and stay clustered near zero through training via regularization and gradient descent. Since BF16 exponents encode magnitude on a log scale, 15 consecutive exponents span a ~32,768x magnitude range — more than enough to cover essentially all trained weights.
 
 We pick the best 15-exponent window per tensor (called `BaseExp`) and replace the 8-bit exponent with a 4-bit group number (1-15):
 
@@ -90,6 +90,22 @@ Single GPU — NVIDIA RTX 5070 Ti 16 GB (Blackwell, 896 GB/s). All tok/s, 200-to
 | Mistral 7B | 13.5 GB | 15.3 GB | **11.1 GB** | All fit |
 | Llama 3.1 8B | 15.0 GB | OOM | **12.4 GB** | vLLM OOM |
 | Yi 1.5 9B | OOM | OOM | **~14.5 GB** | Only Turbo |
+
+### Compression Analysis (sampled from first shard of each model)
+
+| Model | Params | Type | Escape Rate | Compression | BF16 Size | Compressed |
+|-------|-------:|:----:|------------:|:-----------:|----------:|-----------:|
+| Llama 3.1 8B | 8.0B | Dense | 0.021% | 1.33x | 16.1 GB | ~12.0 GB |
+| Mistral 7B | 7.25B | Dense | 0.031% | 1.33x | 14.5 GB | ~10.9 GB |
+| Mixtral 8x7B | 46.7B | MoE | 0.050% | **1.33x** | ~93 GB | ~70 GB |
+| Llama 3.1 70B | 70B | Dense | 0.018% | **1.33x** | ~140 GB | ~105 GB |
+| Qwen 2.5 72B | 72B | Dense | 1.060% | 1.31x | ~144 GB | ~110 GB |
+
+**Key findings:**
+- Dense models (Llama, Mistral) have <0.05% escape rates — near-perfect compression
+- **MoE works** — Mixtral expert weights compress just as well as dense weights (0.05%)
+- **70B scales** — Llama 70B has the lowest escape rate (0.018%), better than 7B
+- Qwen 72B has higher escapes (1.06%) driven by its 152K vocab embedding layer
 
 ---
 

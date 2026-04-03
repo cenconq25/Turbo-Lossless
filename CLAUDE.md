@@ -170,32 +170,31 @@ for each layer:
   [layer 0: rms_norm_bf16(cur) -> bf16_a]
   [layer 1+: bf16_a already set by previous layer's fused add+norm]
 
-  MATVEC_B1(wq, bf16_a) -> q_buf        // split12 or structured12 auto-select
-  MATVEC_B1(wk, bf16_a) -> k_buf
-  MATVEC_B1(wv, bf16_a) -> v_buf
+  MATVEC_B1_NOPATCH(wq, bf16_a) -> q_buf
+  MATVEC_B1_NOPATCH(wk, bf16_a) -> k_buf
+  MATVEC_B1_NOPATCH(wv, bf16_a) -> v_buf
   rope_store_kv(q, k, v -> kv_cache)    // fused RoPE + KV store
   attention(q, kv_cache) -> bf16_a       // outputs BF16 directly (no fp32_to_bf16)
-  MATVEC_B1(wo, bf16_a) -> res
+  MATVEC_B1_NOPATCH(wo, bf16_a) -> res
   add_rms_norm_bf16(res, cur) -> bf16_a  // fused add + norm for FFN
   split12_dual(gate+up, bf16_a) -> ffn_gate, ffn_up  // fused gate+up
   + patches for gate and up
   silu_mul_bf16(gate, up) -> bf16_b
-  MATVEC_B1(w_down, bf16_b) -> cur
+  MATVEC_B1_NOPATCH(w_down, bf16_b) -> cur
   add_rms_norm_bf16(cur, res, NEXT_attn_norm) -> bf16_a  // cross-layer fusion!
 
-MATVEC_B1(output_proj, bf16_a) -> logits
+MATVEC_B1_NOPATCH(output_proj, bf16_a) -> logits
 argmax(logits) -> next_token
 ```
 
-### MATVEC_B1 Macro
+### MATVEC_B1_NOPATCH Macro
 
-Auto-selects kernel: split12 (if .sm.bin loaded) or structured12 (fallback).
-Patches applied separately via `apply_patches_v2`.
+Uses split12 kernel (.sm.bin required).
+Patches applied separately via batched `apply_patches_v2`.
 
 ### B=4 / B=8 Forward
 
 Same structure but uses `BATCH4_MATVEC` / `BATCH8_MATVEC` macros.
-These also auto-select split12 vs structured12.
 Batch kernels decode weight once, multiply by B activation vectors.
 
 ## Tokenizer (tokenizer.cpp — 379 lines)
