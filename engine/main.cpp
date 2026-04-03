@@ -146,13 +146,22 @@ int main(int argc, char** argv) {
                 printf("Context shifting: discarding %d oldest tokens\n", discard);
                 // Shift KV cache: move [discard..current_pos) → [0..current_pos-discard)
                 int kv_dim = model->config.n_head_kv * (model->config.n_embd / model->config.n_head);
+                size_t n_head_kv = model->config.n_head_kv;
                 for (int layer = 0; layer < model->config.n_layer; layer++) {
                     size_t kv_off = (size_t)layer * model->max_seq_len * kv_dim;
                     size_t src = kv_off + (size_t)discard * kv_dim;
                     size_t dst = kv_off;
-                    size_t bytes = (size_t)(current_pos - discard) * kv_dim * sizeof(int16_t);
+                    size_t bytes = (size_t)(current_pos - discard) * kv_dim * sizeof(int8_t);
                     hipMemcpy(model->kv_cache_k + dst, model->kv_cache_k + src, bytes, hipMemcpyDeviceToDevice);
                     hipMemcpy(model->kv_cache_v + dst, model->kv_cache_v + src, bytes, hipMemcpyDeviceToDevice);
+
+                    // Shift scale factors (per-head per-position)
+                    size_t scale_layer_off = (size_t)layer * model->max_seq_len * n_head_kv;
+                    size_t scale_src = scale_layer_off + (size_t)discard * n_head_kv;
+                    size_t scale_dst = scale_layer_off;
+                    size_t scale_bytes = (size_t)(current_pos - discard) * n_head_kv * sizeof(float);
+                    hipMemcpy(model->kv_scale_k + scale_dst, model->kv_scale_k + scale_src, scale_bytes, hipMemcpyDeviceToDevice);
+                    hipMemcpy(model->kv_scale_v + scale_dst, model->kv_scale_v + scale_src, scale_bytes, hipMemcpyDeviceToDevice);
                 }
                 current_pos -= discard;
             }
