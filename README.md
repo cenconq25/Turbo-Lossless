@@ -106,26 +106,6 @@ Dense LLMs: <0.1% escapes. MoE: same. Image/video: works. Multimodal: higher esc
 ./turbo models/mistral-7b-instruct-turbo -i
 ```
 
-Interactive mode loads the model **once** (~4s), then keeps it in VRAM. Every subsequent prompt goes straight to generation at full speed — no reloading:
-
-```
-  ✓ Model loaded in 4s — staying in VRAM
-
-  ▶ What is gravity?
-
-  turbo
-  Gravity is a fundamental force of nature...
-  ─────────────────────────────────────
-  153 tokens  •  60.3 tok/s  •  2.73s
-
-  ▶ What is DNA?          ← no reload, instant
-
-  turbo
-  DNA stands for deoxyribonucleic acid...
-  ─────────────────────────────────────
-  200 tokens  •  60.2 tok/s  •  3.52s
-```
-
 First run will auto-build the engine. To convert a HuggingFace model:
 ```bash
 ./turbo models/mistral-7b-instruct "Hello" 200    # auto-converts to turbo format
