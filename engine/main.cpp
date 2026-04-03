@@ -71,7 +71,7 @@ int main(int argc, char** argv) {
     // Check for interactive mode
     bool interactive = false;
     std::string prompt;
-    int max_tokens = 200;
+    int max_tokens = 1024;
     int batch_size = 1;
 
     if (argc >= 3 && std::string(argv[2]) == "--interactive") {

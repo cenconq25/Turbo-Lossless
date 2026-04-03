@@ -177,7 +177,7 @@ run_single() {
 
 interactive() {
     # Persistent mode: model loads ONCE, stays in VRAM
-    local model="$1" max="${MAX_TOKENS:-200}"
+    local model="$1" max="${MAX_TOKENS:-1024}"
     echo ""
     local t0=$(date +%s)
 
