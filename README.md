@@ -29,40 +29,25 @@ Sign and mantissa pass through unchanged.
 
 The 0.03% of weights outside this window get group=0 (escape). Their exact BF16 value is stored in a small side table (~3 MB for a 7B model). **Zero information loss.**
 
-| | Turbo Lossless |
-|---|---|
-| **Format** | BF16 only |
-| **Lossless** | Yes, 100% bit-perfect |
-| **Bits/weight** | 12.0 (fixed) |
-| **Compression** | 1.33x |
-| **Exponent coverage** | 15 consecutive (99.97%) |
-| **Escape rate** | 0.03% |
-| **Decode cost** | 1 integer ADD |
-| **Encoding** | 4-bit group (fixed width) |
-| **Storage** | Byte-aligned (zero read amplification) |
-| **Hardware** | NVIDIA + AMD |
-
-### Related Work: Lossless BF16 Compression
+### Lossless BF16 Compression: Landscape
 
 All methods exploit the same observation: BF16 exponents have ~2.6 bits of entropy in 8 bits. The approaches differ in encoding, decode cost, and GPU integration.
 
-| Method | Venue | Bits/Weight | Decode | Fused GEMM? | Notes |
-|--------|-------|:----------:|--------|:-----------:|-------|
-| **Turbo (ours)** | — | **12.0** | 1 ADD | Matvec | Fixed-width, byte-aligned, 0.03% escapes |
-| **ZipServ** | ASPLOS'26 | ~11.3 | Bitmap+popcount | Yes (tensor core) | 3-bit codeword, ~3% escapes, NVIDIA only |
-| **DFloat11** | NeurIPS'25 | ~11.0 | Huffman LUT | No (separate) | Variable-length, 2-phase kernel |
-| **ZipNN** | IEEE'25 | ~11 | CPU zstd | No (CPU only) | Storage/transfer only, no VRAM savings |
-| **NeuZip** | arXiv'24 | ~10.6 | ANS | No | Also supports training |
-| **Huff-LLM** | arXiv'25 | ~11.6 | CAM | ASIC only | Custom silicon, not GPU |
-
-**How Turbo differs:**
-- **vs ZipServ** — We use fixed 4-bit groups (15 exponents, 0.03% escapes) vs their 3-bit bitmap codewords (7 exponents, ~3% escapes). We store in byte-aligned arrays; they use tile-structured bitmaps. We decode with 1 ADD; they need bitmap+popcount. We support AMD + NVIDIA; they are NVIDIA-only. They compress ~8% more (11.3 vs 12.0 bits) at the cost of more complex decode.
-- **vs DFloat11** — They use variable-length Huffman codes which break GPU parallelism (40% slower than BF16 at B=1). We use fixed-length encoding that matches BF16 speed at B=1. They compress slightly more (~11 bits) but cannot fuse with GEMM.
-- **vs ZipNN** — CPU-only compression for storage/transfer. No GPU decode, no VRAM savings during inference. Complementary, not competitive.
-- **vs NeuZip** — ANS entropy coding with significant decode overhead. Also supports training (unique), but inference is slower than BF16.
-- **vs Huff-LLM** — Custom ASIC design, not deployable on commodity GPUs.
-
-All approaches exploit the same well-known observation: BF16 exponent redundancy (~2.6 bits entropy in 8-bit field), documented independently by multiple groups since 2024.
+| | **Turbo (ours)** | **ZipServ** | **DFloat11** | **ZipNN** | **NeuZip** | **Huff-LLM** |
+|---|---|---|---|---|---|---|
+| **Venue** | — | ASPLOS'26 | NeurIPS'25 | IEEE'25 | arXiv'24 | arXiv'25 |
+| **Lossless** | Yes | Yes | Yes | Yes | Yes | Yes |
+| **Bits/weight** | **12.0 (fixed)** | ~11.3 (avg) | ~11.0 (avg) | ~11 | ~10.6 | ~11.6 |
+| **Compression** | 1.33x | 1.41x | 1.43x | 1.33-1.50x | 1.50x | 1.37x |
+| **Encoding** | 4-bit group (fixed) | 3-bit bitmap (fixed) | Huffman (variable) | Byte-split+zstd | ANS | Huffman |
+| **Exponents** | 15 consecutive | 7 consecutive | All (entropy-coded) | All | All | All |
+| **Escape rate** | **0.03%** | ~3% | 0% (all encoded) | 0% | 0% | 0% |
+| **Decode cost** | **1 ADD** | Bitmap+popcount | Huffman LUT | CPU zstd | ANS decode | CAM lookup |
+| **Fused GEMM?** | Matvec (fused) | Tensor core (fused) | No (separate) | No (CPU only) | No | ASIC only |
+| **GPU decode** | Yes | Yes | Yes | **No (CPU)** | Yes | **No (ASIC)** |
+| **VRAM savings** | Yes | Yes | Yes | **No** | Yes | N/A |
+| **Hardware** | **NVIDIA + AMD** | NVIDIA only | NVIDIA only | CPU | NVIDIA | Custom ASIC |
+| **Open source** | Yes | Yes | Yes | Yes | Yes | No |
 
 ### The Storage (Split12)
 
