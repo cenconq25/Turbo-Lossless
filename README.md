@@ -12,26 +12,34 @@
 
 ## How It Works
 
-BF16 weights have sparse exponents — only ~40 of 256 possible values are used, and 15 consecutive exponents cover 99.97%. We replace the 8-bit exponent with a 4-bit group code:
+### The Compression
+
+BF16 is 16 bits per weight: `[1-bit sign][8-bit exponent][7-bit mantissa]`. Neural network weights cluster tightly — only ~40 of 256 possible exponent values are used, and **15 consecutive exponents cover 99.97%** of all weights.
+
+We pick the best 15-exponent window per tensor (called `BaseExp`) and replace the 8-bit exponent with a 4-bit group number (1-15):
 
 ```
-BF16:        [sign 1][exponent 8][mantissa 7]  = 16 bits
-Turbo 12-bit: [group 4][sign 1][mantissa 7]    = 12 bits
+BF16:         [sign 1][exponent 8][mantissa 7]  = 16 bits
+Turbo 12-bit: [group 4][sign 1][mantissa 7]     = 12 bits
 
-Decode: exponent = BaseExp + group  (one integer ADD)
+Decode: exponent = BaseExp + group   (one integer ADD)
+Sign and mantissa pass through unchanged.
 ```
 
-**1.33x compression, zero information loss.** The 0.03% of outlier values are stored exactly in a small CSR escape table (~3 MB for 7B model).
+The 0.03% of weights outside this window get group=0 (escape). Their exact BF16 value is stored in a small side table (~3 MB for a 7B model). **Zero information loss.**
 
-### Storage: Split12 Format
+### The Storage (Split12)
 
-The 12-bit values are stored on disk and GPU as two byte-aligned arrays:
+12 bits doesn't align to bytes. Packing them contiguously would force the GPU to load 8 bytes and bit-shift to extract 1.5 bytes — wasting bandwidth. Instead, we split the 12 bits into two byte-aligned arrays:
 
 ```
-Array 1 (.sm.bin): [sign 1][mantissa 7] = 1 byte per element     ← perfectly aligned
-Array 2 (.gr.bin): [group 4][group 4]   = 0.5 byte per element   ← nibble-packed, byte-aligned
+File 1 (.sm.bin):  [S|MMMMMMM] [S|MMMMMMM] ...   1 byte per weight (sign + mantissa)
+File 2 (.gr.bin):  [GGGG|GGGG] [GGGG|GGGG] ...   2 groups packed per byte (4-bit nibbles)
 ```
-Every byte loaded is useful data → **zero read amplification**. 1.5 bytes/element = 1.33x compression.
+
+Why pack 2 groups per byte? Because the smallest unit a GPU can load is 1 byte. Storing one 4-bit group per byte would waste 4 bits (= no compression). Packing two per byte uses all 8 bits. Adjacent weights share a byte — the GPU loads it once and extracts each nibble with a single AND + shift.
+
+**Result:** 1 byte + 0.5 byte = **1.5 bytes per weight = 1.33x compression**. Every byte loaded is useful data — zero read amplification.
 
 ---
 
