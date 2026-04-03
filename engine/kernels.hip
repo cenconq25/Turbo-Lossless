@@ -164,22 +164,22 @@ void launch_argmax_batch(const float* logits, int* results, int n_vocab, int bat
 // ============================================================
 
 // ============================================================
-// Fused RoPE + Store KV (B=1 only): saves one kernel launch
+// Fused RoPE + INT8 KV Store (B=1 only)
+// Two-phase approach:
+//   Phase 1: RoPE rotation on Q and K (flat dispatch, no cooperation needed)
+//   Phase 2: INT8 quantized KV store (one block per kv_head, cooperative absmax)
 // ============================================================
-__global__ void rope_store_kv_kernel(
+
+// Phase 1: RoPE on Q and K (flat dispatch, same structure as before)
+__global__ void rope_qk_kernel(
     float* __restrict__ q,              // [n_head, head_dim]
     float* __restrict__ k,              // [n_head_kv, head_dim]
-    const float* __restrict__ v_in,     // [n_head_kv * head_dim] FP32
-    int16_t* __restrict__ kv_cache_k,   // [max_seq, n_head_kv, head_dim] BF16
-    int16_t* __restrict__ kv_cache_v,
     const float* __restrict__ freqs,    // [half_dim] precomputed
     int head_dim, int n_head, int n_head_kv,
-    int position, int max_seq)
+    int position)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int half_dim = head_dim / 2;
-    int kv_total = n_head_kv * head_dim;
-    int cache_base = position * kv_total;
 
     // RoPE on Q heads
     if (idx < n_head * half_dim) {
@@ -196,7 +196,7 @@ __global__ void rope_store_kv_kernel(
         q[base + d + half_dim] = x0 * sin_a + x1 * cos_a;
     }
 
-    // RoPE on K heads + store rotated K to cache (no race: same thread rotates and stores)
+    // RoPE on K heads (rotate in-place; cache store handled by phase 2)
     if (idx < n_head_kv * half_dim) {
         int head = idx / half_dim;
         int d = idx % half_dim;
@@ -207,40 +207,129 @@ __global__ void rope_store_kv_kernel(
         int base = head * head_dim;
         float x0 = k[base + d];
         float x1 = k[base + d + half_dim];
-        float r0 = x0 * cos_a - x1 * sin_a;
-        float r1 = x0 * sin_a + x1 * cos_a;
-        // Write back to K buffer (needed by attention kernel)
-        k[base + d]            = r0;
-        k[base + d + half_dim] = r1;
-        // Store rotated K directly to cache (avoids race with separate store)
-        kv_cache_k[cache_base + base + d]            = float_to_bf16(r0);
-        kv_cache_k[cache_base + base + d + half_dim] = float_to_bf16(r1);
+        k[base + d]            = x0 * cos_a - x1 * sin_a;
+        k[base + d + half_dim] = x0 * sin_a + x1 * cos_a;
+    }
+}
+
+// Phase 2: INT8 quantized KV store
+// Grid: (n_head_kv, 2) -- x=kv_head, y=0(K)/1(V)
+// Threads: head_dim (rounded up to warp multiple)
+// Each block cooperatively finds absmax via warp shuffle, computes scale,
+// then quantizes all head_dim values to int8.
+__global__ void store_kv_int8_kernel(
+    const float* __restrict__ k_in,     // [n_head_kv * head_dim] rotated K (FP32)
+    const float* __restrict__ v_in,     // [n_head_kv * head_dim] V (FP32)
+    int8_t* __restrict__ kv_cache_k,    // [max_seq, n_head_kv, head_dim] INT8
+    int8_t* __restrict__ kv_cache_v,
+    float* __restrict__ kv_scale_k,     // [max_seq, n_head_kv] per-head scale
+    float* __restrict__ kv_scale_v,
+    int head_dim, int n_head_kv,
+    int position, int max_seq)
+{
+    int kv_head = blockIdx.x;
+    int is_v = blockIdx.y;  // 0 = K, 1 = V
+    int tid = threadIdx.x;
+
+    if (kv_head >= n_head_kv) return;
+
+    // Shared memory for warp-level absmax reduction
+    extern __shared__ float smem[];
+
+    const float* src = is_v ? v_in : k_in;
+    int8_t* dst = is_v ? kv_cache_v : kv_cache_k;
+    float* scale_dst = is_v ? kv_scale_v : kv_scale_k;
+
+    int src_offset = kv_head * head_dim;
+    int kv_total = n_head_kv * head_dim;
+    int cache_offset = position * kv_total + kv_head * head_dim;
+    int scale_offset = position * n_head_kv + kv_head;
+
+    // Step 1: Load value and compute thread-local absmax
+    float val = 0.0f;
+    float thread_absmax = 0.0f;
+    if (tid < head_dim) {
+        val = src[src_offset + tid];
+        thread_absmax = fabsf(val);
     }
 
-    // Store V to cache (no rotation, just FP32->BF16 conversion)
-    if (idx < kv_total) {
-        kv_cache_v[cache_base + idx] = float_to_bf16(v_in[idx]);
+    // Step 2: Warp-level absmax reduction via shuffle
+    int lane = tid % WARP_SIZE;
+    int warp_id = tid / WARP_SIZE;
+    float warp_max = thread_absmax;
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        float other = __shfl_xor(warp_max, offset, WARP_SIZE);
+        warp_max = fmaxf(warp_max, other);
+    }
+
+    // Step 3: Write per-warp max to shared memory
+    int num_warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
+    if (lane == 0) {
+        smem[warp_id] = warp_max;
+    }
+    __syncthreads();
+
+    // Step 4: First warp reduces across all warps to get global absmax
+    float global_max = 0.0f;
+    if (tid < num_warps) {
+        global_max = smem[tid];
+    }
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        float other = __shfl_xor(global_max, offset, WARP_SIZE);
+        global_max = fmaxf(global_max, other);
+    }
+
+    // Step 5: Broadcast global_max to all threads via shared memory
+    if (tid == 0) {
+        smem[0] = global_max;
+    }
+    __syncthreads();
+    global_max = smem[0];
+
+    // scale = absmax / 127; inv_scale = 127 / absmax (for quantization)
+    float scale = global_max / 127.0f;
+    float inv_scale = (global_max > 0.0f) ? 127.0f / global_max : 0.0f;
+
+    // Step 6: Quantize to int8 and store (symmetric: clamp to [-127, 127])
+    if (tid < head_dim) {
+        float q_val = rintf(val * inv_scale);
+        q_val = fminf(fmaxf(q_val, -127.0f), 127.0f);
+        dst[cache_offset + tid] = (int8_t)((int)q_val);
+    }
+
+    // Step 7: Store scale factor (one per kv_head per position)
+    if (tid == 0) {
+        scale_dst[scale_offset] = scale;
     }
 }
 
 extern "C" {
 
 void launch_rope_store_kv(float* q, float* k, const float* v,
-    int16_t* kv_k, int16_t* kv_v,
+    int8_t* kv_k, int8_t* kv_v,
+    float* kv_scale_k, float* kv_scale_v,
     int head_dim, int n_head, int n_head_kv, int position,
     int max_seq, float theta, hipStream_t stream)
 {
     launch_rope_init(head_dim, theta);
     int half_dim = head_dim / 2;
-    // Need enough threads for: max(n_head * half_dim, n_head_kv * head_dim)
+
+    // Phase 1: RoPE on Q and K (flat dispatch)
     int rope_threads = max(n_head, n_head_kv) * half_dim;
-    int kv_threads = n_head_kv * head_dim;
-    int max_threads = max(rope_threads, kv_threads);
     int threads = 256;
-    int blocks = (max_threads + threads - 1) / threads;
-    rope_store_kv_kernel<<<blocks, threads, 0, stream>>>(
-        q, k, v, kv_k, kv_v, d_rope_freqs,
-        head_dim, n_head, n_head_kv, position, max_seq);
+    int blocks = (rope_threads + threads - 1) / threads;
+    rope_qk_kernel<<<blocks, threads, 0, stream>>>(
+        q, k, d_rope_freqs, head_dim, n_head, n_head_kv, position);
+
+    // Phase 2: INT8 quantized KV store
+    // One block per kv_head x 2 (K and V), head_dim threads per block
+    int store_threads = ((head_dim + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
+    int num_warps = (store_threads + WARP_SIZE - 1) / WARP_SIZE;
+    int smem_bytes = num_warps * sizeof(float);
+    dim3 grid(n_head_kv, 2);  // x=kv_head, y=0(K)/1(V)
+    store_kv_int8_kernel<<<grid, store_threads, smem_bytes, stream>>>(
+        k, v, kv_k, kv_v, kv_scale_k, kv_scale_v,
+        head_dim, n_head_kv, position, max_seq);
 }
 
 }
@@ -409,8 +498,10 @@ void launch_add_batch(float* y, const float* x, int n, int batch_size, hipStream
 // ============================================================================
 __global__ void attention_all_heads_kernel(
     const float* __restrict__ q,
-    const int16_t* __restrict__ k_cache,
-    const int16_t* __restrict__ v_cache,
+    const int8_t* __restrict__ k_cache,
+    const int8_t* __restrict__ v_cache,
+    const float* __restrict__ kv_scale_k,
+    const float* __restrict__ kv_scale_v,
     int16_t* __restrict__ output,
     int seq_len, int max_seq, int n_head_kv, int head_dim,
     int gqa_ratio, float scale)
@@ -427,12 +518,13 @@ __global__ void attention_all_heads_kernel(
         q_shared[i] = q[head * head_dim + i];
     __syncthreads();
 
-    // Q·K^T
+    // Q·K^T with INT8 dequantization
     for (int t = tid; t < seq_len; t += blockDim.x) {
         int k_base = t * n_head_kv * head_dim + kv_head * head_dim;
+        float sk = kv_scale_k[t * n_head_kv + kv_head];
         float dot = 0.0f;
         for (int d = 0; d < head_dim; d++)
-            dot += q_shared[d] * bf16_to_float(k_cache[k_base + d]);
+            dot += q_shared[d] * ((float)k_cache[k_base + d] * sk);
         scores[t] = dot * scale;
     }
     __syncthreads();
@@ -481,18 +573,21 @@ __global__ void attention_all_heads_kernel(
         scores[t] *= inv_sum;
     __syncthreads();
 
-    // Weighted sum of V
+    // Weighted sum of V with INT8 dequantization
     for (int d = tid; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         int v_off = kv_head * head_dim + d;
-        for (int t = 0; t < seq_len; t++)
-            acc += scores[t] * bf16_to_float(v_cache[t * n_head_kv * head_dim + v_off]);
+        for (int t = 0; t < seq_len; t++) {
+            float sv = kv_scale_v[t * n_head_kv + kv_head];
+            acc += scores[t] * ((float)v_cache[t * n_head_kv * head_dim + v_off] * sv);
+        }
         output[head * head_dim + d] = float_to_bf16(acc);
     }
 }
 
 extern "C" {
-void launch_attention_all_heads(const float* q, const int16_t* k_cache, const int16_t* v_cache,
+void launch_attention_all_heads(const float* q, const int8_t* k_cache, const int8_t* v_cache,
+    const float* kv_scale_k, const float* kv_scale_v,
     int16_t* output, int n_head, int n_head_kv, int head_dim, int seq_len, int max_seq,
     float scale, hipStream_t stream)
 {
@@ -500,7 +595,7 @@ void launch_attention_all_heads(const float* q, const int16_t* k_cache, const in
     int threads = 128;  // per head block
     int smem = (seq_len + head_dim) * sizeof(float) + 16 * sizeof(float);
     attention_all_heads_kernel<<<n_head, threads, smem, stream>>>(
-        q, k_cache, v_cache, output, seq_len, max_seq, n_head_kv, head_dim, gqa_ratio, scale);
+        q, k_cache, v_cache, kv_scale_k, kv_scale_v, output, seq_len, max_seq, n_head_kv, head_dim, gqa_ratio, scale);
 }
 }
 
@@ -510,8 +605,10 @@ void launch_attention_all_heads(const float* q, const int16_t* k_cache, const in
 // ============================================================================
 __global__ void attention_all_heads_batch_kernel(
     const float* __restrict__ q,           // [batch_size * n_head * head_dim]
-    const int16_t* __restrict__ kv_cache_k, // [n_layer * max_seq * n_head_kv * head_dim] (shared)
-    const int16_t* __restrict__ kv_cache_v,
+    const int8_t* __restrict__ kv_cache_k,  // [n_layer * max_seq * n_head_kv * head_dim] INT8
+    const int8_t* __restrict__ kv_cache_v,
+    const float* __restrict__ kv_scale_k,  // [max_seq * n_head_kv] per-(position, kv_head) scale
+    const float* __restrict__ kv_scale_v,
     int16_t* __restrict__ output,          // [batch_size * n_head * head_dim] BF16
     const int* __restrict__ positions,     // [batch_size] current position per sequence
     int n_head, int n_head_kv, int head_dim,
@@ -536,15 +633,19 @@ __global__ void attention_all_heads_batch_kernel(
         q_shared[i] = q[seq * n_total + head * head_dim + i];
     __syncthreads();
 
-    // Q·K^T  (KV cache offset depends on whether cache is shared or per-sequence)
-    const int16_t* k = kv_cache_k + (size_t)seq * kv_stride;
-    const int16_t* v = kv_cache_v + (size_t)seq * kv_stride;
+    // Q·K^T with INT8 dequantization (KV cache offset depends on whether cache is shared or per-sequence)
+    const int8_t* k = kv_cache_k + (size_t)seq * kv_stride;
+    const int8_t* v = kv_cache_v + (size_t)seq * kv_stride;
+    // Scale arrays have stride max_seq * n_head_kv per sequence
+    const float* sk_base = kv_scale_k + (size_t)seq * (kv_stride / head_dim);
+    const float* sv_base = kv_scale_v + (size_t)seq * (kv_stride / head_dim);
 
     for (int t = tid; t < seq_len; t += blockDim.x) {
-        int k_base = t * n_head_kv * head_dim + kv_head * head_dim;
+        int k_off = t * n_head_kv * head_dim + kv_head * head_dim;
+        float sk = sk_base[t * n_head_kv + kv_head];
         float dot = 0.0f;
         for (int d = 0; d < head_dim; d++)
-            dot += q_shared[d] * bf16_to_float(k[k_base + d]);
+            dot += q_shared[d] * ((float)k[k_off + d] * sk);
         scores[t] = dot * scale;
     }
     __syncthreads();
@@ -578,19 +679,22 @@ __global__ void attention_all_heads_batch_kernel(
     for (int t = tid; t < seq_len; t += blockDim.x) scores[t] *= inv_sum;
     __syncthreads();
 
-    // Weighted sum of V
+    // Weighted sum of V with INT8 dequantization
     for (int d = tid; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         int v_off = kv_head * head_dim + d;
-        for (int t = 0; t < seq_len; t++)
-            acc += scores[t] * bf16_to_float(v[t * n_head_kv * head_dim + v_off]);
+        for (int t = 0; t < seq_len; t++) {
+            float sv = sv_base[t * n_head_kv + kv_head];
+            acc += scores[t] * ((float)v[t * n_head_kv * head_dim + v_off] * sv);
+        }
         output[seq * n_total + head * head_dim + d] = float_to_bf16(acc);
     }
 }
 
 extern "C" {
 void launch_attention_all_heads_batch(
-    const float* q, const int16_t* kv_k, const int16_t* kv_v,
+    const float* q, const int8_t* kv_k, const int8_t* kv_v,
+    const float* kv_scale_k, const float* kv_scale_v,
     int16_t* output, const int* positions,
     int n_head, int n_head_kv, int head_dim,
     int max_seq, float scale, int batch_size, int kv_stride,
@@ -602,7 +706,7 @@ void launch_attention_all_heads_batch(
     int smem = (max_seq + head_dim) * sizeof(float) + 16 * sizeof(float);
     dim3 grid(n_head, batch_size);
     attention_all_heads_batch_kernel<<<grid, threads, smem, stream>>>(
-        q, kv_k, kv_v, output, positions, n_head, n_head_kv, head_dim,
+        q, kv_k, kv_v, kv_scale_k, kv_scale_v, output, positions, n_head, n_head_kv, head_dim,
         max_seq, gqa_ratio, scale, kv_stride);
 }
 }
@@ -649,23 +753,95 @@ __global__ void rope_batch_kernel(
     }
 }
 
-// Batched KV store: store B sequences' K,V into cache
-__global__ void store_kv_batch_kernel(
+// Batched KV store with INT8 quantization: store B sequences' K,V into cache
+// Grid: (n_head_kv, 2, batch_size) -- x=kv_head, y=0(K)/1(V), z=sequence
+// Threads: head_dim (rounded up to warp multiple)
+// Each block cooperatively quantizes one (sequence, kv_head) group.
+__global__ void store_kv_batch_int8_kernel(
     const float* __restrict__ k_in,    // [batch_size * kv_dim]
     const float* __restrict__ v_in,
-    int16_t* __restrict__ kv_k,        // [max_seq * kv_dim]
-    int16_t* __restrict__ kv_v,
+    int8_t* __restrict__ kv_k,         // [max_seq * kv_dim] INT8
+    int8_t* __restrict__ kv_v,
+    float* __restrict__ kv_scale_k,    // [max_seq * n_head_kv]
+    float* __restrict__ kv_scale_v,
     const int* __restrict__ positions,
-    int kv_dim, int max_seq, int batch_size)
+    int head_dim, int n_head_kv,
+    int max_seq, int batch_size)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int seq = blockIdx.y;
-    if (seq >= batch_size || idx >= kv_dim) return;
+    int kv_head = blockIdx.x;
+    int is_v = blockIdx.y;  // 0 = K, 1 = V
+    int seq = blockIdx.z;
+    int tid = threadIdx.x;
+
+    if (kv_head >= n_head_kv || seq >= batch_size) return;
+
+    extern __shared__ float smem[];
+
+    const float* src = is_v ? v_in : k_in;
+    int8_t* dst = is_v ? kv_v : kv_k;
+    float* scale_dst = is_v ? kv_scale_v : kv_scale_k;
+
+    int kv_dim = n_head_kv * head_dim;
     int pos = positions[seq];
-    int cache_idx = pos * kv_dim + idx;
-    int src_idx = seq * kv_dim + idx;
-    kv_k[cache_idx] = float_to_bf16(k_in[src_idx]);
-    kv_v[cache_idx] = float_to_bf16(v_in[src_idx]);
+    int src_offset = seq * kv_dim + kv_head * head_dim;
+    int cache_offset = pos * kv_dim + kv_head * head_dim;
+    int scale_offset = pos * n_head_kv + kv_head;
+
+    // Step 1: Load value and compute thread-local absmax
+    float val = 0.0f;
+    float thread_absmax = 0.0f;
+    if (tid < head_dim) {
+        val = src[src_offset + tid];
+        thread_absmax = fabsf(val);
+    }
+
+    // Step 2: Warp-level absmax reduction via shuffle
+    int lane = tid % WARP_SIZE;
+    int warp_id = tid / WARP_SIZE;
+    float warp_max = thread_absmax;
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        float other = __shfl_xor(warp_max, offset, WARP_SIZE);
+        warp_max = fmaxf(warp_max, other);
+    }
+
+    // Step 3: Write per-warp max to shared memory
+    int num_warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
+    if (lane == 0) {
+        smem[warp_id] = warp_max;
+    }
+    __syncthreads();
+
+    // Step 4: First warp reduces across all warps
+    float global_max = 0.0f;
+    if (tid < num_warps) {
+        global_max = smem[tid];
+    }
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        float other = __shfl_xor(global_max, offset, WARP_SIZE);
+        global_max = fmaxf(global_max, other);
+    }
+
+    // Step 5: Broadcast global_max
+    if (tid == 0) {
+        smem[0] = global_max;
+    }
+    __syncthreads();
+    global_max = smem[0];
+
+    float scale = global_max / 127.0f;
+    float inv_scale = (global_max > 0.0f) ? 127.0f / global_max : 0.0f;
+
+    // Step 6: Quantize and store
+    if (tid < head_dim) {
+        float q_val = rintf(val * inv_scale);
+        q_val = fminf(fmaxf(q_val, -127.0f), 127.0f);
+        dst[cache_offset + tid] = (int8_t)((int)q_val);
+    }
+
+    // Step 7: Store scale factor
+    if (tid == 0) {
+        scale_dst[scale_offset] = scale;
+    }
 }
 
 extern "C" {
@@ -682,11 +858,19 @@ void launch_rope_batch(float* q, float* k, const int* positions,
 }
 
 void launch_store_kv_batch(const float* k, const float* v,
-    int16_t* kv_k, int16_t* kv_v, const int* positions,
-    int kv_dim, int max_seq, int batch_size, hipStream_t stream) {
-    dim3 grid((kv_dim + 255) / 256, batch_size);
-    store_kv_batch_kernel<<<grid, 256, 0, stream>>>(
-        k, v, kv_k, kv_v, positions, kv_dim, max_seq, batch_size);
+    int8_t* kv_k, int8_t* kv_v,
+    float* kv_scale_k, float* kv_scale_v,
+    const int* positions,
+    int kv_dim, int max_seq, int n_head_kv, int head_dim,
+    int batch_size, hipStream_t stream) {
+    // kv_dim = n_head_kv * head_dim (passed for compatibility, derived internally)
+    int store_threads = ((head_dim + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
+    int num_warps = (store_threads + WARP_SIZE - 1) / WARP_SIZE;
+    int smem_bytes = num_warps * sizeof(float);
+    dim3 grid(n_head_kv, 2, batch_size);  // x=kv_head, y=0(K)/1(V), z=seq
+    store_kv_batch_int8_kernel<<<grid, store_threads, smem_bytes, stream>>>(
+        k, v, kv_k, kv_v, kv_scale_k, kv_scale_v,
+        positions, head_dim, n_head_kv, max_seq, batch_size);
 }
 }
 
@@ -698,8 +882,10 @@ void launch_store_kv_batch(const float* k, const float* v,
 
 __global__ void flash_attention_kernel(
     const float* __restrict__ q,
-    const int16_t* __restrict__ k_cache,
-    const int16_t* __restrict__ v_cache,
+    const int8_t* __restrict__ k_cache,
+    const int8_t* __restrict__ v_cache,
+    const float* __restrict__ kv_scale_k,
+    const float* __restrict__ kv_scale_v,
     int16_t* __restrict__ output,
     int seq_len, int n_head_kv, int head_dim,
     int gqa_ratio, float scale)
@@ -712,8 +898,8 @@ __global__ void flash_attention_kernel(
     extern __shared__ float smem_fa_raw[];
     char* smem = (char*)smem_fa_raw;
     float*   q_s     = (float*)smem;                                     // [head_dim]
-    int16_t* kv_tile = (int16_t*)(smem + head_dim * sizeof(float));      // [FA_TC][head_dim]
-    float*   scores  = (float*)(smem + head_dim * 4 + FA_TC * head_dim * 2); // [FA_TC]
+    float*   kv_tile = (float*)(smem + head_dim * sizeof(float));        // [FA_TC][head_dim] floats
+    float*   scores  = (float*)(smem + head_dim * 4 + FA_TC * head_dim * 4); // [FA_TC]
     float*   warp_r  = scores + FA_TC;                                    // [4]
 
     // Load Q once
@@ -731,11 +917,12 @@ __global__ void flash_attention_kernel(
         int t_start = tile * FA_TC;
         int t_len = min(FA_TC, seq_len - t_start);
 
-        // Phase A: Load K tile [t_len][head_dim] as BF16 into LDS
+        // Phase A: Load K tile [t_len][head_dim] — dequantize INT8 to float during load
         int total = t_len * head_dim;
         for (int i = tid; i < total; i += blockDim.x) {
             int row = i / head_dim, col = i % head_dim;
-            kv_tile[i] = k_cache[(t_start + row) * kv_stride + kv_head * head_dim + col];
+            float sk = kv_scale_k[(t_start + row) * n_head_kv + kv_head];
+            kv_tile[i] = (float)k_cache[(t_start + row) * kv_stride + kv_head * head_dim + col] * sk;
         }
         __syncthreads();
 
@@ -744,7 +931,7 @@ __global__ void flash_attention_kernel(
         if (tid < t_len) {
             float dot = 0.0f;
             for (int d = 0; d < head_dim; d++)
-                dot += q_s[d] * bf16_to_float(kv_tile[tid * head_dim + d]);
+                dot += q_s[d] * kv_tile[tid * head_dim + d];
             s = dot * scale;
         }
         scores[tid] = s;
@@ -782,17 +969,18 @@ __global__ void flash_attention_kernel(
 
         __syncthreads();
 
-        // Phase B: Load V tile (reuses kv_tile LDS region)
+        // Phase B: Load V tile (reuses kv_tile LDS region) — dequantize INT8 to float
         for (int i = tid; i < total; i += blockDim.x) {
             int row = i / head_dim, col = i % head_dim;
-            kv_tile[i] = v_cache[(t_start + row) * kv_stride + kv_head * head_dim + col];
+            float sv = kv_scale_v[(t_start + row) * n_head_kv + kv_head];
+            kv_tile[i] = (float)v_cache[(t_start + row) * kv_stride + kv_head * head_dim + col] * sv;
         }
         __syncthreads();
 
         // Phase B: Accumulate P·V — thread tid handles output dim tid
         float pv = 0.0f;
         for (int t = 0; t < t_len; t++)
-            pv += scores[t] * bf16_to_float(kv_tile[t * head_dim + tid]);
+            pv += scores[t] * kv_tile[t * head_dim + tid];
         O_acc += pv;
 
         m_prev = m_new;
@@ -807,8 +995,10 @@ __global__ void flash_attention_kernel(
 // Flash Attention Batch — B sequences × N heads
 __global__ void flash_attention_batch_kernel(
     const float* __restrict__ q,
-    const int16_t* __restrict__ kv_cache_k,
-    const int16_t* __restrict__ kv_cache_v,
+    const int8_t* __restrict__ kv_cache_k,
+    const int8_t* __restrict__ kv_cache_v,
+    const float* __restrict__ kv_scale_k,
+    const float* __restrict__ kv_scale_v,
     int16_t* __restrict__ output,
     const int* __restrict__ positions,
     int n_head, int n_head_kv, int head_dim,
@@ -826,13 +1016,16 @@ __global__ void flash_attention_batch_kernel(
     extern __shared__ float smem_fa_raw[];
     char* smem = (char*)smem_fa_raw;
     float*   q_s     = (float*)smem;
-    int16_t* kv_tile = (int16_t*)(smem + head_dim * sizeof(float));
-    float*   scores  = (float*)(smem + head_dim * 4 + FA_TC * head_dim * 2);
+    float*   kv_tile = (float*)(smem + head_dim * sizeof(float));        // [FA_TC][head_dim] floats
+    float*   scores  = (float*)(smem + head_dim * 4 + FA_TC * head_dim * 4);
     float*   warp_r  = scores + FA_TC;
 
     // KV cache offset for this sequence
-    const int16_t* k_base = kv_cache_k + (size_t)seq * kv_stride_batch;
-    const int16_t* v_base = kv_cache_v + (size_t)seq * kv_stride_batch;
+    const int8_t* k_base = kv_cache_k + (size_t)seq * kv_stride_batch;
+    const int8_t* v_base = kv_cache_v + (size_t)seq * kv_stride_batch;
+    // Scale arrays: stride is kv_stride_batch / head_dim = max_seq * n_head_kv per sequence
+    const float* sk_base = kv_scale_k + (size_t)seq * (kv_stride_batch / head_dim);
+    const float* sv_base = kv_scale_v + (size_t)seq * (kv_stride_batch / head_dim);
 
     q_s[tid] = q[seq * n_total + head * head_dim + tid];
     __syncthreads();
@@ -845,10 +1038,11 @@ __global__ void flash_attention_batch_kernel(
         int t_len = min(FA_TC, seq_len - t_start);
         int total = t_len * head_dim;
 
-        // Load K tile
+        // Load K tile — dequantize INT8 to float during load
         for (int i = tid; i < total; i += blockDim.x) {
             int row = i / head_dim, col = i % head_dim;
-            kv_tile[i] = k_base[(t_start + row) * kv_stride + kv_head * head_dim + col];
+            float sk = sk_base[(t_start + row) * n_head_kv + kv_head];
+            kv_tile[i] = (float)k_base[(t_start + row) * kv_stride + kv_head * head_dim + col] * sk;
         }
         __syncthreads();
 
@@ -856,7 +1050,7 @@ __global__ void flash_attention_batch_kernel(
         if (tid < t_len) {
             float dot = 0.0f;
             for (int d = 0; d < head_dim; d++)
-                dot += q_s[d] * bf16_to_float(kv_tile[tid * head_dim + d]);
+                dot += q_s[d] * kv_tile[tid * head_dim + d];
             s = dot * scale;
         }
         scores[tid] = s;
@@ -888,16 +1082,17 @@ __global__ void flash_attention_batch_kernel(
         float l_new = correction * l_prev + p_sum;
         __syncthreads();
 
-        // Load V tile
+        // Load V tile — dequantize INT8 to float during load
         for (int i = tid; i < total; i += blockDim.x) {
             int row = i / head_dim, col = i % head_dim;
-            kv_tile[i] = v_base[(t_start + row) * kv_stride + kv_head * head_dim + col];
+            float sv = sv_base[(t_start + row) * n_head_kv + kv_head];
+            kv_tile[i] = (float)v_base[(t_start + row) * kv_stride + kv_head * head_dim + col] * sv;
         }
         __syncthreads();
 
         float pv = 0.0f;
         for (int t = 0; t < t_len; t++)
-            pv += scores[t] * bf16_to_float(kv_tile[t * head_dim + tid]);
+            pv += scores[t] * kv_tile[t * head_dim + tid];
         O_acc += pv;
 
         m_prev = m_new;
@@ -909,18 +1104,21 @@ __global__ void flash_attention_batch_kernel(
 }
 
 extern "C" {
-void launch_flash_attention(const float* q, const int16_t* k_cache, const int16_t* v_cache,
+void launch_flash_attention(const float* q, const int8_t* k_cache, const int8_t* v_cache,
+    const float* kv_scale_k, const float* kv_scale_v,
     int16_t* output, int n_head, int n_head_kv, int head_dim, int seq_len, int max_seq,
     float scale, hipStream_t stream)
 {
     int gqa_ratio = n_head / n_head_kv;
     int threads = head_dim;  // 128 for Mistral
-    int smem = head_dim * 4 + FA_TC * head_dim * 2 + FA_TC * 4 + 16;
+    // kv_tile is now float (4 bytes) instead of int16_t (2 bytes)
+    int smem = head_dim * 4 + FA_TC * head_dim * 4 + FA_TC * 4 + 16;
     flash_attention_kernel<<<n_head, threads, smem, stream>>>(
-        q, k_cache, v_cache, output, seq_len, n_head_kv, head_dim, gqa_ratio, scale);
+        q, k_cache, v_cache, kv_scale_k, kv_scale_v, output, seq_len, n_head_kv, head_dim, gqa_ratio, scale);
 }
 
-void launch_flash_attention_batch(const float* q, const int16_t* kv_k, const int16_t* kv_v,
+void launch_flash_attention_batch(const float* q, const int8_t* kv_k, const int8_t* kv_v,
+    const float* kv_scale_k, const float* kv_scale_v,
     int16_t* output, const int* positions,
     int n_head, int n_head_kv, int head_dim,
     int max_seq, float scale, int batch_size, int kv_stride,
@@ -928,10 +1126,11 @@ void launch_flash_attention_batch(const float* q, const int16_t* kv_k, const int
 {
     int gqa_ratio = n_head / n_head_kv;
     int threads = head_dim;
-    int smem = head_dim * 4 + FA_TC * head_dim * 2 + FA_TC * 4 + 16;
+    // kv_tile is now float (4 bytes) instead of int16_t (2 bytes)
+    int smem = head_dim * 4 + FA_TC * head_dim * 4 + FA_TC * 4 + 16;
     dim3 grid(n_head, batch_size);
     flash_attention_batch_kernel<<<grid, threads, smem, stream>>>(
-        q, kv_k, kv_v, output, positions, n_head, n_head_kv, head_dim,
+        q, kv_k, kv_v, kv_scale_k, kv_scale_v, output, positions, n_head, n_head_kv, head_dim,
         max_seq, gqa_ratio, scale, kv_stride);
 }
 }

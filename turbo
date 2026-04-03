@@ -27,7 +27,10 @@ show_banner() {
 BANNER
     echo -e "${RESET}"
     echo -e "  ${WHITE}BF16 → 12-bit lossless  •  Decode with 1 ADD${RESET}"
-    echo -e "  ${DIM}1.33x smaller  •  2.93x faster  •  Zero precision loss${RESET}"
+    echo -e "  ${DIM}1.33x smaller  •  up to 2.93x faster (B=256)  •  Zero precision loss${RESET}"
+    echo ""
+    echo -e "  ${YELLOW}Proof of concept — showcasing compression + fused decode.${RESET}"
+    echo -e "  ${YELLOW}KV cache not fully optimised; expect slowdown over long conversations.${RESET}"
     echo ""
 }
 
@@ -132,6 +135,7 @@ show_response() {
     local speed=$(echo "$out" | grep "Decode speed" | grep -oP '[\d.]+' | head -1)
     local tokens=$(echo "$out" | grep "Generated tokens" | grep -oP '\d+')
     local time=$(echo "$out" | grep "Total time" | grep -oP '[\d.]+')
+    local context=$(echo "$out" | grep "Context:" | grep -oP '[\d]+ / [\d]+')
 
     if [ "$show_prompt" = "yes" ]; then
         echo -e "  ${GREEN}${BOLD}▶${RESET} ${BOLD}$prompt${RESET}"
@@ -149,7 +153,9 @@ show_response() {
     fi
     echo ""
     echo -e "  ${DIM}─────────────────────────────────────${RESET}"
-    echo -e "  ${DIM}${tokens:-?} tokens  •  ${speed:-?} tok/s  •  ${time:-?}s${RESET}"
+    local ctx_info=""
+    [ -n "$context" ] && ctx_info="  •  ctx ${context}"
+    echo -e "  ${DIM}${tokens:-?} tokens  •  ${speed:-?} tok/s  •  ${time:-?}s${ctx_info}${RESET}"
 }
 
 run_single() {
@@ -172,7 +178,7 @@ run_single() {
 
 interactive() {
     # Persistent mode: model loads ONCE, stays in VRAM
-    local model="$1" max="${MAX_TOKENS:-200}"
+    local model="$1" max="${MAX_TOKENS:-1024}"
     echo ""
     local t0=$(date +%s)
 
@@ -180,8 +186,8 @@ interactive() {
     local fifo_in=$(mktemp -u) fifo_out=$(mktemp -u)
     mkfifo "$fifo_in" "$fifo_out"
 
-    # stdbuf forces line-buffered stdout so progress lines arrive immediately through the fifo
-    TURBO_FAST=1 stdbuf -oL "$ENGINE" "$model" --interactive "$max" < "$fifo_in" > "$fifo_out" 2>/dev/null &
+    # Engine sets stdout unbuffered in interactive mode, so no stdbuf needed
+    TURBO_FAST=1 "$ENGINE" "$model" --interactive "$max" < "$fifo_in" > "$fifo_out" 2>/dev/null &
     local epid=$!
     exec 3>"$fifo_in"
     exec 4<"$fifo_out"
@@ -202,7 +208,7 @@ interactive() {
                 local bar_len=30
                 local filled=$(( pct * bar_len / 100 ))
                 local empty=$(( bar_len - filled ))
-                local bar=$(printf "%${filled}s" | tr ' ' '#')$(printf "%${empty}s" | tr ' ' '-')
+                local bar=$(printf "%${filled}s" | tr ' ' '|')$(printf "%${empty}s" | tr ' ' '-')
                 echo -ne "\r  ${CYAN}${bar}${RESET} ${DIM}${pct}% (${loaded}/${n_layers} layers)${RESET}\033[K"
             fi
         fi

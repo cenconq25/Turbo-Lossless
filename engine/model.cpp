@@ -4,6 +4,7 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <algorithm>
 
 
 // Read entire binary file into host memory
@@ -246,17 +247,39 @@ Model* load_model(const std::string& model_path, int device_id) {
 
     // Allocate KV cache
     int head_dim = cfg.n_embd / cfg.n_head;
-    // Max context length — configurable via TURBO_CTX env var (default 2048)
+    // Max context length — use model's limit, capped by available VRAM
+    // Override with TURBO_CTX env var
     const char* ctx_env = getenv("TURBO_CTX");
-    m->max_seq_len = ctx_env ? atoi(ctx_env) : 2048;
+    if (ctx_env) {
+        m->max_seq_len = atoi(ctx_env);
+    } else {
+        // Default 8192 — good balance of context length vs attention speed.
+        // Attention is O(n) per token: ~6% overhead at 1K, ~24% at 4K, ~48% at 8K.
+        // Cap by VRAM: each token costs n_layer * n_head_kv * head_dim * 2 bytes (K+V, INT8)
+        //   + n_layer * n_head_kv * 2 * sizeof(float) for scale factors
+        int default_ctx = 8192;
+        size_t bytes_per_token = (size_t)cfg.n_layer * cfg.n_head_kv * head_dim * 2 * sizeof(int8_t)
+                               + (size_t)cfg.n_layer * cfg.n_head_kv * 2 * sizeof(float);
+        size_t free_mem = 0, total_mem = 0;
+        hipMemGetInfo(&free_mem, &total_mem);
+        size_t kv_budget = free_mem > 512*1024*1024 ? free_mem - 512*1024*1024 : free_mem / 2;
+        int max_by_vram = (int)(kv_budget / bytes_per_token);
+        m->max_seq_len = std::min(default_ctx, max_by_vram);
+    }
     if (m->max_seq_len < 128) m->max_seq_len = 128;
     printf("  Context length: %d\n", m->max_seq_len);
     size_t kv_size = (size_t)cfg.n_layer * m->max_seq_len * cfg.n_head_kv * head_dim;
-    GPU_CHECK(hipMalloc(&m->kv_cache_k, kv_size * sizeof(int16_t)));
-    GPU_CHECK(hipMalloc(&m->kv_cache_v, kv_size * sizeof(int16_t)));
-    hipMemset(m->kv_cache_k, 0, kv_size * sizeof(int16_t));
-    hipMemset(m->kv_cache_v, 0, kv_size * sizeof(int16_t));
-    printf("  KV cache: %.1f MB per K/V\n", kv_size * 2 / 1e6);
+    GPU_CHECK(hipMalloc(&m->kv_cache_k, kv_size * sizeof(int8_t)));
+    GPU_CHECK(hipMalloc(&m->kv_cache_v, kv_size * sizeof(int8_t)));
+    hipMemset(m->kv_cache_k, 0, kv_size * sizeof(int8_t));
+    hipMemset(m->kv_cache_v, 0, kv_size * sizeof(int8_t));
+    // Per-position, per-KV-head scale factors
+    size_t scale_size = (size_t)cfg.n_layer * m->max_seq_len * cfg.n_head_kv;
+    GPU_CHECK(hipMalloc(&m->kv_scale_k, scale_size * sizeof(float)));
+    GPU_CHECK(hipMalloc(&m->kv_scale_v, scale_size * sizeof(float)));
+    hipMemset(m->kv_scale_k, 0, scale_size * sizeof(float));
+    hipMemset(m->kv_scale_v, 0, scale_size * sizeof(float));
+    printf("  KV cache: %.1f MB per K/V (INT8, 2x smaller than BF16)\n", kv_size * 1 / 1e6);
 
     size_t gpu_mem = 0;
     hipMemGetInfo(nullptr, &gpu_mem);
@@ -298,6 +321,8 @@ void free_model(Model* model) {
 
     if (model->kv_cache_k) hipFree(model->kv_cache_k);
     if (model->kv_cache_v) hipFree(model->kv_cache_v);
+    if (model->kv_scale_k) hipFree(model->kv_scale_k);
+    if (model->kv_scale_v) hipFree(model->kv_scale_v);
 
     delete model;
 }

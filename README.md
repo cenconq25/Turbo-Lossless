@@ -1,6 +1,8 @@
 # Turbo Lossless — 1.33x Smaller, 2.93x Faster, Decode with 1 ADD
 
-### **1.33x** compression for most models. Up to **2.93x** faster than vLLM for multi-user. **3-7x fewer ops** than other lossless methods — just an ADD.
+> **Note:** This is a research proof of concept demonstrating that BF16 lossless compression works and the decode-fused kernels are viable. The KV cache and attention are not fully optimised — expect slowdown over long conversations. The focus is on the compression format and fused decode, not production chat.
+
+### **1.33x** compression for most models. Up to **2.93x** faster than vLLM for multi-user (B=256). **3-7x fewer ops** than other lossless methods — just an ADD.
 
 > **BF16 → 12-bit lossless. One integer ADD to decode. Zero precision loss.**
 
@@ -11,7 +13,7 @@ Turbo 12-bit: [group 4][sign 1][mantissa 7]     = 12 bits
 Decode: exponent = BaseExp + group   ← that's it. One ADD.
 ```
 
-**1.33x smaller. 2.93x faster than vLLM at B=256. Runs models where competitors OOM.**
+**1.33x smaller. Up to 2.93x faster than vLLM (at B=256). Runs models where competitors OOM.**
 
 ---
 
@@ -104,26 +106,6 @@ Dense LLMs: <0.1% escapes. MoE: same. Image/video: works. Multimodal: higher esc
 ./turbo models/mistral-7b-instruct-turbo -i
 ```
 
-Interactive mode loads the model **once** (~4s), then keeps it in VRAM. Every subsequent prompt goes straight to generation at full speed — no reloading:
-
-```
-  ✓ Model loaded in 4s — staying in VRAM
-
-  ▶ What is gravity?
-
-  turbo
-  Gravity is a fundamental force of nature...
-  ─────────────────────────────────────
-  153 tokens  •  60.3 tok/s  •  2.73s
-
-  ▶ What is DNA?          ← no reload, instant
-
-  turbo
-  DNA stands for deoxyribonucleic acid...
-  ─────────────────────────────────────
-  200 tokens  •  60.2 tok/s  •  3.52s
-```
-
 First run will auto-build the engine. To convert a HuggingFace model:
 ```bash
 ./turbo models/mistral-7b-instruct "Hello" 200    # auto-converts to turbo format
@@ -149,8 +131,88 @@ nvcc -O3 -arch=sm_120 -I.. -o turbo-engine \
 | `TURBO_FAST=1` | off | Pre-compute escape tables. **Recommended.** +10% speed |
 | `TURBO_CTX=N` | 2048 | Max context length |
 | `TURBO_PROFILE=1` | off | Per-token timing breakdown |
+| `TURBO_KERNEL=1\|2\|3` | auto | Force NVIDIA kernel version (V1/V2/V3 TMA) |
 
 BF16 and FP16 safetensors supported. No GGUF, no FP32, no quantized formats.
+
+---
+
+## Benchmarking
+
+### Single-User (B=1)
+```bash
+# Basic — output verified, 200 tokens
+CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./engine/turbo-engine \
+  models/mistral-7b-instruct-turbo "[INST] Write an essay about AI. [/INST]" 200
+
+# With profiling — shows per-token matvec/attn/norm/silu breakdown
+CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 TURBO_PROFILE=1 ./engine/turbo-engine \
+  models/mistral-7b-instruct-turbo "[INST] Write an essay about AI. [/INST]" 200
+```
+
+### Multi-User (B=4, 8, 16, 32, 64, 128, 256)
+```bash
+# B=32 — 32 concurrent sequences, same prompt
+CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./engine/turbo-engine \
+  models/mistral-7b-instruct-turbo "[INST] Write an essay about AI. [/INST]" 200 32
+
+# B=256 — maximum throughput test
+CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./engine/turbo-engine \
+  models/mistral-7b-instruct-turbo "[INST] Write an essay about AI. [/INST]" 200 256
+```
+
+### Comparing with vLLM
+```bash
+# vLLM BF16 baseline (same model, same prompt, same token count)
+python3 -m vllm.entrypoints.openai.api_server --model mistralai/Mistral-7B-Instruct-v0.3 \
+  --dtype bfloat16 --max-model-len 2048 --gpu-memory-utilization 0.95
+
+# Then benchmark with:
+python3 -m vllm.entrypoints.openai.api_server  # ... or use benchmark_serving.py
+```
+
+### What to Check
+
+1. **Verify output is coherent** — not garbage. If output is nonsensical, the benchmark is invalid.
+2. **Use a non-display GPU** — the GPU connected to the monitor has lower available bandwidth.
+3. **Run 3 times** — take the median. First run may be slower (cold caches).
+4. **Match token count** — compare same number of generated tokens across engines.
+
+### Reading Profile Output
+
+```
+[PROFILE] 100 tok: mv 154.2 (92%) | attn 7.7 norm 4.2 silu 0.8 misc 0.0 | total 166.9 (59.9 t/s)
+```
+
+| Field | Meaning |
+|-------|---------|
+| `100 tok` | Profile window (last 10 tokens, at position 100) |
+| `mv 154.2 (92%)` | Matvec time in ms (% of total). Constant regardless of context length |
+| `attn 7.7` | Attention time in ms. Grows linearly with context (~0.065ms per token) |
+| `norm 4.2` | RMSNorm + residual add time |
+| `silu 0.8` | SiLU activation time |
+| `total 166.9` | Total ms per 10 tokens |
+| `(59.9 t/s)` | Tokens per second |
+
+At B=1, matvec dominates (~85-95%). Attention grows with context but stays <15% under 1K tokens.
+
+---
+
+## Kernel Architecture
+
+Auto-selected by batch size. All decode Split12 weights on-the-fly with 1 ADD.
+
+| Batch | Kernel | How It Works |
+|:-----:|--------|--------------|
+| B=1 | Per-row matvec | Each thread streams weights, decodes inline, accumulates. 2 rows/block share activation loads. Portable NVIDIA + AMD |
+| B=4 | Per-row batch4 | Decode weight once, multiply by 4 activations. Inline escape handling via warp-shuffle prefix sum |
+| B=8 | Per-row batch8 | Same as B=4 but 8 activations. Single accumulator to save registers |
+| B=16..63 | **V1/V2** fused decode+GEMM | Decode weights directly into tensor core registers. Software `cp.async` pipeline. V2 uses smaller tiles for higher occupancy (2-3 blocks/SM vs 1) |
+| B≥64 | **V3 Blackwell TMA** | Hardware TMA copies entire tiles — 1 thread issues load, GPU handles the rest. Mbarrier sync, hardware swizzle. All 128 threads free for decode + `mma.sync` |
+
+V1/V2 differ only in tile size (128×64 vs 64×64) and occupancy. V3 is a fundamentally different architecture using Blackwell's Tensor Memory Accelerator. All three use [ZipServ](https://github.com/HPMLL/ZipServ_ASPLOS26)-style K-slice interleaving: `decode(slice N+1)` overlaps `mma.sync(slice N)`.
+
+Override with `TURBO_KERNEL=1|2|3`. See [CLAUDE.md](CLAUDE.md) for full kernel internals.
 
 ---
 

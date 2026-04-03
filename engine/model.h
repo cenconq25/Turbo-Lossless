@@ -66,9 +66,12 @@ struct Model {
     float* output_norm;           // [n_embd] FP32
     CompressedWeight output_proj; // [n_vocab, n_embd] compressed
 
-    // KV cache [n_layer, max_seq, n_head_kv, head_dim] as FP16
-    int16_t* kv_cache_k;
-    int16_t* kv_cache_v;
+    // KV cache [n_layer, max_seq, n_head_kv, head_dim] as INT8
+    int8_t* kv_cache_k;
+    int8_t* kv_cache_v;
+    // Per-position, per-KV-head scale factors [n_layer * max_seq * n_head_kv]
+    float* kv_scale_k;
+    float* kv_scale_v;
     int max_seq_len;
 };
 

@@ -7,6 +7,7 @@
 #include "inference.h"
 #include "tokenizer.h"
 #include "sampler.h"
+#include "../gpu_compat.h"
 
 static volatile Model* g_model = nullptr;
 static volatile InferenceState* g_state = nullptr;
@@ -70,7 +71,7 @@ int main(int argc, char** argv) {
     // Check for interactive mode
     bool interactive = false;
     std::string prompt;
-    int max_tokens = 200;
+    int max_tokens = 1024;
     int batch_size = 1;
 
     if (argc >= 3 && std::string(argv[2]) == "--interactive") {
@@ -90,6 +91,9 @@ int main(int argc, char** argv) {
         printf("Prompt: %s\n", prompt.c_str());
         printf("Max tokens: %d\n\n", max_tokens);
     }
+
+    // Force unbuffered stdout so progress lines reach FIFOs/pipes immediately
+    if (interactive) setvbuf(stdout, NULL, _IONBF, 0);
 
     printf("Loading model...\n");
     Model* model = load_model(model_path);
@@ -111,9 +115,14 @@ int main(int argc, char** argv) {
     fflush(stdout);
 
     if (interactive) {
-        // Interactive: read prompts from stdin, keep KV cache across turns
+        // Interactive: KV cache persists across turns (like llama.cpp)
+        // Each turn only prefills NEW tokens; previous context stays in cache.
+        // Format: <s>[INST] user1 [/INST] assistant1 </s>[INST] user2 [/INST] ...
         int current_pos = 0;
+        int n_vocab = model->config.n_vocab;
+        int eos_id = tok->eos_id;
         char line[4096];
+
         while (fgets(line, sizeof(line), stdin)) {
             // Strip trailing newline
             size_t len = strlen(line);
@@ -127,44 +136,56 @@ int main(int argc, char** argv) {
                 tokens.erase(tokens.begin());
             }
 
+            // Context shift: attention is O(n) per token (~8% at 500, ~15% at 1K).
+            // Shift when context exceeds 1024 to keep speed above ~55 tok/s.
+            // After shift, recent ~512 tokens of conversation memory are kept.
+            int shift_limit = 1024;
+            int headroom = (int)tokens.size() + max_tokens + 64;
+            if (current_pos + headroom > model->max_seq_len || current_pos > shift_limit) {
+                int discard = current_pos / 2;
+                printf("Context shifting: discarding %d oldest tokens\n", discard);
+                // Shift KV cache: move [discard..current_pos) → [0..current_pos-discard)
+                int kv_dim = model->config.n_head_kv * (model->config.n_embd / model->config.n_head);
+                size_t n_head_kv = model->config.n_head_kv;
+                for (int layer = 0; layer < model->config.n_layer; layer++) {
+                    size_t kv_off = (size_t)layer * model->max_seq_len * kv_dim;
+                    size_t src = kv_off + (size_t)discard * kv_dim;
+                    size_t dst = kv_off;
+                    size_t bytes = (size_t)(current_pos - discard) * kv_dim * sizeof(int8_t);
+                    hipMemcpy(model->kv_cache_k + dst, model->kv_cache_k + src, bytes, hipMemcpyDeviceToDevice);
+                    hipMemcpy(model->kv_cache_v + dst, model->kv_cache_v + src, bytes, hipMemcpyDeviceToDevice);
+
+                    // Shift scale factors (per-head per-position)
+                    size_t scale_layer_off = (size_t)layer * model->max_seq_len * n_head_kv;
+                    size_t scale_src = scale_layer_off + (size_t)discard * n_head_kv;
+                    size_t scale_dst = scale_layer_off;
+                    size_t scale_bytes = (size_t)(current_pos - discard) * n_head_kv * sizeof(float);
+                    hipMemcpy(model->kv_scale_k + scale_dst, model->kv_scale_k + scale_src, scale_bytes, hipMemcpyDeviceToDevice);
+                    hipMemcpy(model->kv_scale_v + scale_dst, model->kv_scale_v + scale_src, scale_bytes, hipMemcpyDeviceToDevice);
+                }
+                current_pos -= discard;
+            }
+
             printf("Generating...\n\n");
             struct timespec t0, t1;
             clock_gettime(CLOCK_MONOTONIC, &t0);
 
-            // Prefill: feed each prompt token, continuing from current_pos
+            // Prefill: only feed NEW prompt tokens (KV cache has previous turns)
             state->positions[0] = current_pos;
             for (int i = 0; i < (int)tokens.size(); i++) {
                 forward(state, &tokens[i]);
-                // forward_b1 auto-increments positions[0]
             }
             current_pos = state->positions[0];
 
-            // Decode: generate new tokens
-            int n_gen = 0;
-            int n_vocab = model->config.n_vocab;
-            int eos_id = tok->eos_id;
-
-            // Find stop token IDs (tokens that start a new instruction turn)
-            // These are model-specific but we check common ones
-            std::vector<int> stop_ids;
-            auto probe = [&](const std::string& s) {
-                auto ids = tokenize(tok, s);
-                if (!ids.empty()) stop_ids.push_back(ids.back());
-            };
-            probe("[INST]"); probe("[/INST]"); probe("</s>");
-
+            // Sync GPU before timing — otherwise first sample_greedy includes prefill latency
+            hipDeviceSynchronize();
             clock_gettime(CLOCK_MONOTONIC, &t0);  // restart timer for decode only
 
+            // Decode: generate new tokens
+            int n_gen = 0;
             for (int t = 0; t < max_tokens; t++) {
                 int next = sample_greedy(state->logits, n_vocab, state->stream);
-                if (next == eos_id || next == 2 || next == 1) break;
-
-                // Check stop tokens (model trying to start new turn)
-                bool is_stop = false;
-                for (int sid : stop_ids) {
-                    if (next == sid) { is_stop = true; break; }
-                }
-                if (is_stop && n_gen > 2) break;
+                if (next == eos_id || next == tok->bos_id) break;
 
                 printf("%s", detokenize_one(tok, next).c_str());
                 fflush(stdout);
@@ -174,29 +195,25 @@ int main(int argc, char** argv) {
                 n_gen++;
             }
 
-            clock_gettime(CLOCK_MONOTONIC, &t1);  // stop timer before EOS overhead
+            clock_gettime(CLOCK_MONOTONIC, &t1);
 
-            // Feed EOS/turn separator so model knows this turn ended
+            // Feed EOS so model knows this turn ended
+            // Mistral format: ... assistant_response </s> [INST] next_user [/INST]
             {
-                int eos_tok = tok->eos_id > 0 ? tok->eos_id : 2;
+                int eos_tok = eos_id > 0 ? eos_id : 2;
                 state->positions[0] = current_pos;
                 forward(state, &eos_tok);
                 current_pos = state->positions[0];
             }
+
             double secs = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
 
             printf("\n\n--- Stats ---\n");
             printf("Prompt tokens: %zu\n", tokens.size());
             printf("Generated tokens: %d\n", n_gen);
-            printf("Context position: %d / %d\n", current_pos, model->max_seq_len);
+            printf("Context: %d / %d tokens\n", current_pos, model->max_seq_len);
             printf("Total time: %.2f s\n", secs);
             if (n_gen > 0) printf("Decode speed: %.1f tok/s\n", n_gen / secs);
-
-            // Check context limit
-            if (current_pos > model->max_seq_len - 100) {
-                printf("Context nearly full (%d/%d). Resetting.\n", current_pos, model->max_seq_len);
-                current_pos = 0;
-            }
 
             printf("\n--- READY ---\n");
             fflush(stdout);

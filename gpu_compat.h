@@ -33,6 +33,7 @@
 #define hipMemGetInfo            cudaMemGetInfo
 #define hipMemcpyHostToDevice    cudaMemcpyHostToDevice
 #define hipMemcpyDeviceToHost    cudaMemcpyDeviceToHost
+#define hipMemcpyDeviceToDevice  cudaMemcpyDeviceToDevice
 
 // Device management
 #define hipSetDevice             cudaSetDevice

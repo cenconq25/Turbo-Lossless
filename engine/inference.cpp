@@ -12,12 +12,12 @@ extern "C" {
     void launch_silu_mul_bf16_batch(const float* gate, const float* up, int16_t* out, int n, int batch_size, hipStream_t stream);
     void launch_add_batch(float* y, const float* x, int n, int batch_size, hipStream_t stream);
     void launch_rope_batch(float* q, float* k, const int* positions, int head_dim, int n_head, int n_head_kv, int q_stride, int k_stride, float theta, int batch_size, hipStream_t stream);
-    void launch_store_kv_batch(const float* k, const float* v, int16_t* kv_k, int16_t* kv_v, const int* positions, int kv_dim, int max_seq, int batch_size, hipStream_t stream);
-    void launch_attention_all_heads(const float* q, const int16_t* k_cache, const int16_t* v_cache, int16_t* output, int n_head, int n_head_kv, int head_dim, int seq_len, int max_seq, float scale, hipStream_t stream);
-    void launch_attention_all_heads_batch(const float* q, const int16_t* kv_k, const int16_t* kv_v, int16_t* output, const int* positions, int n_head, int n_head_kv, int head_dim, int max_seq, float scale, int batch_size, int kv_stride, hipStream_t stream);
-    void launch_flash_attention(const float* q, const int16_t* k_cache, const int16_t* v_cache, int16_t* output, int n_head, int n_head_kv, int head_dim, int seq_len, int max_seq, float scale, hipStream_t stream);
-    void launch_flash_attention_batch(const float* q, const int16_t* kv_k, const int16_t* kv_v, int16_t* output, const int* positions, int n_head, int n_head_kv, int head_dim, int max_seq, float scale, int batch_size, int kv_stride, hipStream_t stream);
-    void launch_rope_store_kv(float* q, float* k, const float* v, int16_t* kv_k, int16_t* kv_v, int head_dim, int n_head, int n_head_kv, int position, int max_seq, float theta, hipStream_t stream);
+    void launch_store_kv_batch(const float* k, const float* v, int8_t* kv_k, int8_t* kv_v, float* scale_k, float* scale_v, const int* positions, int kv_dim, int max_seq, int n_head_kv, int head_dim, int batch_size, hipStream_t stream);
+    void launch_attention_all_heads(const float* q, const int8_t* k_cache, const int8_t* v_cache, const float* scale_k, const float* scale_v, int16_t* output, int n_head, int n_head_kv, int head_dim, int seq_len, int max_seq, float scale, hipStream_t stream);
+    void launch_attention_all_heads_batch(const float* q, const int8_t* kv_k, const int8_t* kv_v, const float* scale_k, const float* scale_v, int16_t* output, const int* positions, int n_head, int n_head_kv, int head_dim, int max_seq, float scale, int batch_size, int kv_stride, hipStream_t stream);
+    void launch_flash_attention(const float* q, const int8_t* k_cache, const int8_t* v_cache, const float* scale_k, const float* scale_v, int16_t* output, int n_head, int n_head_kv, int head_dim, int seq_len, int max_seq, float scale, hipStream_t stream);
+    void launch_flash_attention_batch(const float* q, const int8_t* kv_k, const int8_t* kv_v, const float* scale_k, const float* scale_v, int16_t* output, const int* positions, int n_head, int n_head_kv, int head_dim, int max_seq, float scale, int batch_size, int kv_stride, hipStream_t stream);
+    void launch_rope_store_kv(float* q, float* k, const float* v, int8_t* kv_k, int8_t* kv_v, float* scale_k, float* scale_v, int head_dim, int n_head, int n_head_kv, int position, int max_seq, float theta, hipStream_t stream);
 
     // Matvec launch wrappers (decompress_v2.hip)
     int launch_patches_v2_async(const void* row_offsets, const void* patch_cols, const void* correct_vals, const void* wrong_vals, const void* activations, void* output, int M, void* stream);
@@ -271,15 +271,19 @@ static void forward_b1(InferenceState* state, const int* token_ids) {
 
         PROF_START(stream);
         size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
+        size_t scale_off = (size_t)layer * m->max_seq_len * cfg.n_head_kv;
         launch_rope_store_kv(state->q_buf, state->k_buf, state->v_buf,
                              m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+                             m->kv_scale_k + scale_off, m->kv_scale_v + scale_off,
                              head_dim, cfg.n_head, cfg.n_head_kv, pos,
                              m->max_seq_len, cfg.rope_theta, stream);
         if (pos < 1024)
             launch_attention_all_heads(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+                m->kv_scale_k + scale_off, m->kv_scale_v + scale_off,
                 bf16_a, cfg.n_head, cfg.n_head_kv, head_dim, pos+1, m->max_seq_len, scale, stream);
         else
             launch_flash_attention(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+                m->kv_scale_k + scale_off, m->kv_scale_v + scale_off,
                 bf16_a, cfg.n_head, cfg.n_head_kv, head_dim, pos+1, m->max_seq_len, scale, stream);
         PROF_END_ATTN(stream);
 
@@ -409,20 +413,24 @@ static void forward_b4(InferenceState* state, const int token_ids[4]) {
         BATCH4_MATVEC(L.wv, bf16_a, state->v_buf, n, kv_dim, stream);
 
         size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
+        size_t scale_off = (size_t)layer * m->max_seq_len * cfg.n_head_kv;
         launch_rope_batch(state->q_buf, state->k_buf, state->d_positions,
                           head_dim, cfg.n_head, cfg.n_head_kv, n, kv_dim, cfg.rope_theta, BS, stream);
         launch_store_kv_batch(state->k_buf, state->v_buf,
                               m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
-                              state->d_positions, kv_dim, m->max_seq_len, BS, stream);
+                              m->kv_scale_k + scale_off, m->kv_scale_v + scale_off,
+                              state->d_positions, kv_dim, m->max_seq_len, cfg.n_head_kv, head_dim, BS, stream);
 
         int max_pos = 0;
         for (int s = 0; s < BS; s++) max_pos = std::max(max_pos, state->positions[s]);
         if (max_pos < 1024)
             launch_attention_all_heads_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+                m->kv_scale_k + scale_off, m->kv_scale_v + scale_off,
                 bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
                 max_pos + 1, scale, BS, 0, stream);
         else
             launch_flash_attention_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+                m->kv_scale_k + scale_off, m->kv_scale_v + scale_off,
                 bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
                 max_pos + 1, scale, BS, 0, stream);
 
@@ -478,20 +486,24 @@ static void forward_b8(InferenceState* state, const int token_ids[8]) {
         BATCH8_MATVEC(L.wv, bf16_a, state->v_buf, n, kv_dim, stream);
 
         size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
+        size_t scale_off = (size_t)layer * m->max_seq_len * cfg.n_head_kv;
         launch_rope_batch(state->q_buf, state->k_buf, state->d_positions,
                           head_dim, cfg.n_head, cfg.n_head_kv, n, kv_dim, cfg.rope_theta, BS, stream);
         launch_store_kv_batch(state->k_buf, state->v_buf,
                               m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
-                              state->d_positions, kv_dim, m->max_seq_len, BS, stream);
+                              m->kv_scale_k + scale_off, m->kv_scale_v + scale_off,
+                              state->d_positions, kv_dim, m->max_seq_len, cfg.n_head_kv, head_dim, BS, stream);
 
         int max_pos = 0;
         for (int s = 0; s < BS; s++) max_pos = std::max(max_pos, state->positions[s]);
         if (max_pos < 1024)
             launch_attention_all_heads_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+                m->kv_scale_k + scale_off, m->kv_scale_v + scale_off,
                 bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
                 max_pos + 1, scale, BS, 0, stream);
         else
             launch_flash_attention_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+                m->kv_scale_k + scale_off, m->kv_scale_v + scale_off,
                 bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
                 max_pos + 1, scale, BS, 0, stream);
 
@@ -596,20 +608,24 @@ static void forward_batch_tiled(InferenceState* state, const int* token_ids) {
         SYNC_PATCHES(s1, s2, ev);
 
         size_t kv_off = (size_t)layer * m->max_seq_len * kv_dim;
+        size_t scale_off = (size_t)layer * m->max_seq_len * cfg.n_head_kv;
         launch_rope_batch(state->q_buf, state->k_buf, state->d_positions,
                           head_dim, cfg.n_head, cfg.n_head_kv, n, kv_dim, cfg.rope_theta, BS, s1);
         launch_store_kv_batch(state->k_buf, state->v_buf,
                               m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
-                              state->d_positions, kv_dim, m->max_seq_len, BS, s1);
+                              m->kv_scale_k + scale_off, m->kv_scale_v + scale_off,
+                              state->d_positions, kv_dim, m->max_seq_len, cfg.n_head_kv, head_dim, BS, s1);
 
         int max_pos = 0;
         for (int s = 0; s < BS; s++) max_pos = std::max(max_pos, state->positions[s]);
         if (max_pos < 1024)
             launch_attention_all_heads_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+                m->kv_scale_k + scale_off, m->kv_scale_v + scale_off,
                 bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
                 max_pos + 1, scale, BS, 0, s1);
         else
             launch_flash_attention_batch(state->q_buf, m->kv_cache_k + kv_off, m->kv_cache_v + kv_off,
+                m->kv_scale_k + scale_off, m->kv_scale_v + scale_off,
                 bf16_a, state->d_positions, cfg.n_head, cfg.n_head_kv, head_dim,
                 max_pos + 1, scale, BS, 0, s1);
 
