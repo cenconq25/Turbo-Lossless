@@ -29,8 +29,7 @@ Stored as two byte-aligned arrays (**Split12**) — zero GPU read amplification:
 
 ---
 
-<details>
-<summary><b>Compared to Other Lossless BF16 Methods</b></summary>
+## Compared to Other Lossless BF16 Methods
 
 | | **Turbo** | **ZipServ** | **DFloat11** | **ZipNN** | **NeuZip** | **Huff-LLM** |
 |---|---|---|---|---|---|---|
@@ -44,16 +43,13 @@ Stored as two byte-aligned arrays (**Split12**) — zero GPU read amplification:
 
 **Our trade-off:** We use 0.7 more bits/weight than ZipServ, but decode with 1 instruction instead of 5-8, have 100x fewer escapes, and run on NVIDIA, AMD, Intel — you name it.
 
-</details>
-
 ---
 
 ## Benchmarks
 
 Single GPU — NVIDIA RTX 5070 Ti 16 GB. All tok/s, 200-token generation, output verified.
 
-<details>
-<summary><b>Single-User (B=1)</b></summary>
+### Single-User (B=1)
 
 | Model | Params | llama.cpp | vLLM | Turbo | Speedup |
 |-------|-------:|----------:|-----:|------:|--------:|
@@ -61,10 +57,7 @@ Single GPU — NVIDIA RTX 5070 Ti 16 GB. All tok/s, 200-token generation, output
 | Mistral 7B | 7.25B | 55.7 | 54.7 | **60.0** | **1.10x** vs vLLM |
 | Llama 3.1 8B | 8.03B | 52.9 | OOM | **57.0** | **1.08x** vs llama.cpp |
 
-</details>
-
-<details>
-<summary><b>Multi-User (total tok/s)</b></summary>
+### Multi-User (total tok/s)
 
 | Model | Params | B=32 | B=64 | B=128 | B=256 | vLLM B=256 | Speedup |
 |-------|-------:|-----:|-----:|------:|------:|-----------:|--------:|
@@ -72,10 +65,7 @@ Single GPU — NVIDIA RTX 5070 Ti 16 GB. All tok/s, 200-token generation, output
 | Mistral 7B | 7.25B | 1,136 | 1,514 | 2,197 | **2,554** | 872 | **2.93x** |
 | Llama 3.1 8B | 8.03B | 1,069 | 1,439 | 2,111 | **2,471** | OOM | — |
 
-</details>
-
-<details>
-<summary><b>VRAM Usage</b></summary>
+### VRAM Usage
 
 | Model | Model VRAM | Overhead (B=1) | Total (B=1) | Total (B=256) | vLLM Total |
 |-------|----------:|-----------:|------------:|--------------:|-----------:|
@@ -85,10 +75,7 @@ Single GPU — NVIDIA RTX 5070 Ti 16 GB. All tok/s, 200-token generation, output
 
 Overhead = KV cache + escape tables + TURBO_FAST + activation buffers + CUDA context. Llama 2 7B uses MHA (32/32 heads) — 4x larger KV cache than GQA models, OOMs at B=256 on 16 GB.
 
-</details>
-
-<details>
-<summary><b>Compression Works on Everything</b></summary>
+### Compression Works on Everything
 
 Tested across 11 models — LLMs up to 405B, MoE, image, and video:
 
@@ -102,8 +89,6 @@ Tested across 11 models — LLMs up to 405B, MoE, image, and video:
 | Gemma 4 E4B | 8.0B | Multimodal | 1.512% | 1.31x |
 
 Dense LLMs: <0.1% escapes. MoE: same. Image/video: works. Multimodal: higher escapes but still compresses.
-
-</details>
 
 ---
 
@@ -124,8 +109,7 @@ First run will auto-build the engine. To convert a HuggingFace model:
 ./turbo models/mistral-7b-instruct "Hello" 200    # auto-converts to turbo format
 ```
 
-<details>
-<summary>Manual build</summary>
+### Manual Build
 
 ```bash
 gcc -O3 -shared -fPIC -o split12_pack.so split12_pack.c
@@ -136,10 +120,8 @@ nvcc -O3 -arch=sm_120 -I.. -o turbo-engine \
   kernels.cu decompress_v2.cu ../nvidia_kernels.cu ../nvidia_kernels_v3.cu \
   -lcublas -lsentencepiece -lcuda -std=c++17
 ```
-</details>
 
-<details>
-<summary>Environment variables</summary>
+### Environment Variables
 
 | Variable | Default | Effect |
 |----------|:-------:|--------|
@@ -149,14 +131,11 @@ nvcc -O3 -arch=sm_120 -I.. -o turbo-engine \
 | `TURBO_PROFILE=1` | off | Per-token timing breakdown |
 | `TURBO_KERNEL=1\|2\|3` | auto | Force NVIDIA kernel version (V1/V2/V3 TMA) |
 
-</details>
-
 BF16 and FP16 safetensors supported. No GGUF, no FP32, no quantized formats.
 
 ---
 
-<details>
-<summary><b>Benchmarking Guide</b></summary>
+## Benchmarking Guide
 
 ### Single-User (B=1)
 ```bash
@@ -192,12 +171,9 @@ CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./engine/turbo-engine \
 | `silu 0.8` | SiLU activation |
 | `total 166.9 (59.9 t/s)` | Total ms per 10 tokens (speed) |
 
-</details>
-
 ---
 
-<details>
-<summary><b>Kernel Architecture</b></summary>
+## Kernel Architecture
 
 Auto-selected by batch size. All decode Split12 weights on-the-fly with 1 ADD.
 
@@ -213,8 +189,6 @@ V1/V2 differ only in tile size (128x64 vs 64x64) and occupancy. V3 is a fundamen
 
 Override with `TURBO_KERNEL=1|2|3`. See [CLAUDE.md](CLAUDE.md) for full kernel internals.
 
-</details>
-
 ---
 
 ## Acknowledgements
@@ -223,8 +197,7 @@ The V3 fused decode+GEMM kernel uses tensor core patterns inspired by [ZipServ /
 
 ---
 
-<details>
-<summary><b>File Map</b></summary>
+## File Map
 
 ~5,500 lines of C++/CUDA/Python.
 
@@ -240,5 +213,3 @@ The V3 fused decode+GEMM kernel uses tensor core patterns inspired by [ZipServ /
 | `split12_pack.c` | 128 | C packer library (find_base_exp + pack) |
 | `gpu_compat.h` | 100 | AMD/NVIDIA kernel compatibility layer |
 | `engine/main.cpp` | 104 | CLI entry point + signal handler |
-
-</details>
