@@ -29,7 +29,8 @@ Stored as two byte-aligned arrays (**Split12**) — zero GPU read amplification:
 
 ---
 
-## Compared to Other Lossless BF16 Methods
+<details>
+<summary><b>Compared to Other Lossless BF16 Methods</b></summary>
 
 | | **Turbo** | **ZipServ** | **DFloat11** | **ZipNN** | **NeuZip** | **Huff-LLM** |
 |---|---|---|---|---|---|---|
@@ -43,13 +44,16 @@ Stored as two byte-aligned arrays (**Split12**) — zero GPU read amplification:
 
 **Our trade-off:** We use 0.7 more bits/weight than ZipServ, but decode with 1 instruction instead of 5-8, have 100x fewer escapes, and run on NVIDIA, AMD, Intel — you name it.
 
+</details>
+
 ---
 
 ## Benchmarks
 
 Single GPU — NVIDIA RTX 5070 Ti 16 GB. All tok/s, 200-token generation, output verified.
 
-### Single-User (B=1)
+<details>
+<summary><b>Single-User (B=1)</b></summary>
 
 | Model | Params | llama.cpp | vLLM | Turbo | Speedup |
 |-------|-------:|----------:|-----:|------:|--------:|
@@ -57,7 +61,10 @@ Single GPU — NVIDIA RTX 5070 Ti 16 GB. All tok/s, 200-token generation, output
 | Mistral 7B | 7.25B | 55.7 | 54.7 | **60.0** | **1.10x** vs vLLM |
 | Llama 3.1 8B | 8.03B | 52.9 | OOM | **57.0** | **1.08x** vs llama.cpp |
 
-### Multi-User (total tok/s)
+</details>
+
+<details>
+<summary><b>Multi-User (total tok/s)</b></summary>
 
 | Model | Params | B=32 | B=64 | B=128 | B=256 | vLLM B=256 | Speedup |
 |-------|-------:|-----:|-----:|------:|------:|-----------:|--------:|
@@ -65,7 +72,10 @@ Single GPU — NVIDIA RTX 5070 Ti 16 GB. All tok/s, 200-token generation, output
 | Mistral 7B | 7.25B | 1,136 | 1,514 | 2,197 | **2,554** | 872 | **2.93x** |
 | Llama 3.1 8B | 8.03B | 1,069 | 1,439 | 2,111 | **2,471** | OOM | — |
 
-### VRAM Usage + Overhead
+</details>
+
+<details>
+<summary><b>VRAM Usage</b></summary>
 
 | Model | Model VRAM | Overhead (B=1) | Total (B=1) | Total (B=256) | vLLM Total |
 |-------|----------:|-----------:|------------:|--------------:|-----------:|
@@ -75,9 +85,10 @@ Single GPU — NVIDIA RTX 5070 Ti 16 GB. All tok/s, 200-token generation, output
 
 Overhead = KV cache + escape tables + TURBO_FAST + activation buffers + CUDA context. Llama 2 7B uses MHA (32/32 heads) — 4x larger KV cache than GQA models, OOMs at B=256 on 16 GB.
 
----
+</details>
 
-## Compression Works on Everything
+<details>
+<summary><b>Compression Works on Everything</b></summary>
 
 Tested across 11 models — LLMs up to 405B, MoE, image, and video:
 
@@ -92,6 +103,8 @@ Tested across 11 models — LLMs up to 405B, MoE, image, and video:
 
 Dense LLMs: <0.1% escapes. MoE: same. Image/video: works. Multimodal: higher escapes but still compresses.
 
+</details>
+
 ---
 
 ## Quick Start
@@ -102,7 +115,7 @@ Dense LLMs: <0.1% escapes. MoE: same. Image/video: works. Multimodal: higher esc
 # Single prompt
 ./turbo models/mistral-7b-instruct-turbo "What is the meaning of life?" 200
 
-# Interactive — model loads once, stays in VRAM, answer prompts instantly
+# Interactive — model loads once, stays in VRAM
 ./turbo models/mistral-7b-instruct-turbo -i
 ```
 
@@ -112,7 +125,7 @@ First run will auto-build the engine. To convert a HuggingFace model:
 ```
 
 <details>
-<summary>Manual build (if you prefer)</summary>
+<summary>Manual build</summary>
 
 ```bash
 gcc -O3 -shared -fPIC -o split12_pack.so split12_pack.c
@@ -125,80 +138,66 @@ nvcc -O3 -arch=sm_120 -I.. -o turbo-engine \
 ```
 </details>
 
+<details>
+<summary>Environment variables</summary>
+
 | Variable | Default | Effect |
 |----------|:-------:|--------|
 | `CUDA_VISIBLE_DEVICES=N` | all | Select GPU |
 | `TURBO_FAST=1` | off | Pre-compute escape tables. **Recommended.** +10% speed |
-| `TURBO_CTX=N` | 2048 | Max context length |
+| `TURBO_CTX=N` | 8192 | Max context length |
 | `TURBO_PROFILE=1` | off | Per-token timing breakdown |
 | `TURBO_KERNEL=1\|2\|3` | auto | Force NVIDIA kernel version (V1/V2/V3 TMA) |
+
+</details>
 
 BF16 and FP16 safetensors supported. No GGUF, no FP32, no quantized formats.
 
 ---
 
-## Benchmarking
+<details>
+<summary><b>Benchmarking Guide</b></summary>
 
 ### Single-User (B=1)
 ```bash
-# Basic — output verified, 200 tokens
 CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./engine/turbo-engine \
   models/mistral-7b-instruct-turbo "[INST] Write an essay about AI. [/INST]" 200
 
-# With profiling — shows per-token matvec/attn/norm/silu breakdown
+# With profiling
 CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 TURBO_PROFILE=1 ./engine/turbo-engine \
   models/mistral-7b-instruct-turbo "[INST] Write an essay about AI. [/INST]" 200
 ```
 
-### Multi-User (B=4, 8, 16, 32, 64, 128, 256)
+### Multi-User (B=32, 256)
 ```bash
-# B=32 — 32 concurrent sequences, same prompt
-CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./engine/turbo-engine \
-  models/mistral-7b-instruct-turbo "[INST] Write an essay about AI. [/INST]" 200 32
-
-# B=256 — maximum throughput test
 CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./engine/turbo-engine \
   models/mistral-7b-instruct-turbo "[INST] Write an essay about AI. [/INST]" 200 256
 ```
 
-### Comparing with vLLM
-```bash
-# vLLM BF16 baseline (same model, same prompt, same token count)
-python3 -m vllm.entrypoints.openai.api_server --model mistralai/Mistral-7B-Instruct-v0.3 \
-  --dtype bfloat16 --max-model-len 2048 --gpu-memory-utilization 0.95
-
-# Then benchmark with:
-python3 -m vllm.entrypoints.openai.api_server  # ... or use benchmark_serving.py
-```
-
 ### What to Check
-
-1. **Verify output is coherent** — not garbage. If output is nonsensical, the benchmark is invalid.
-2. **Use a non-display GPU** — the GPU connected to the monitor has lower available bandwidth.
+1. **Verify output is coherent** — not garbage. If nonsensical, the benchmark is invalid.
+2. **Use a non-display GPU** — the monitor GPU has lower available bandwidth.
 3. **Run 3 times** — take the median. First run may be slower (cold caches).
 4. **Match token count** — compare same number of generated tokens across engines.
 
 ### Reading Profile Output
-
 ```
 [PROFILE] 100 tok: mv 154.2 (92%) | attn 7.7 norm 4.2 silu 0.8 misc 0.0 | total 166.9 (59.9 t/s)
 ```
-
 | Field | Meaning |
 |-------|---------|
-| `100 tok` | Profile window (last 10 tokens, at position 100) |
-| `mv 154.2 (92%)` | Matvec time in ms (% of total). Constant regardless of context length |
-| `attn 7.7` | Attention time in ms. Grows linearly with context (~0.065ms per token) |
-| `norm 4.2` | RMSNorm + residual add time |
-| `silu 0.8` | SiLU activation time |
-| `total 166.9` | Total ms per 10 tokens |
-| `(59.9 t/s)` | Tokens per second |
+| `mv 154.2 (92%)` | Matvec time in ms (% of total). Constant regardless of context |
+| `attn 7.7` | Attention time. Grows linearly with context (~0.065ms per token) |
+| `norm 4.2` | RMSNorm + residual add |
+| `silu 0.8` | SiLU activation |
+| `total 166.9 (59.9 t/s)` | Total ms per 10 tokens (speed) |
 
-At B=1, matvec dominates (~85-95%). Attention grows with context but stays <15% under 1K tokens.
+</details>
 
 ---
 
-## Kernel Architecture
+<details>
+<summary><b>Kernel Architecture</b></summary>
 
 Auto-selected by batch size. All decode Split12 weights on-the-fly with 1 ADD.
 
@@ -208,11 +207,13 @@ Auto-selected by batch size. All decode Split12 weights on-the-fly with 1 ADD.
 | B=4 | Per-row batch4 | Decode weight once, multiply by 4 activations. Inline escape handling via warp-shuffle prefix sum |
 | B=8 | Per-row batch8 | Same as B=4 but 8 activations. Single accumulator to save registers |
 | B=16..63 | **V1/V2** fused decode+GEMM | Decode weights directly into tensor core registers. Software `cp.async` pipeline. V2 uses smaller tiles for higher occupancy (2-3 blocks/SM vs 1) |
-| B≥64 | **V3 Blackwell TMA** | Hardware TMA copies entire tiles — 1 thread issues load, GPU handles the rest. Mbarrier sync, hardware swizzle. All 128 threads free for decode + `mma.sync` |
+| B>=64 | **V3 Blackwell TMA** | Hardware TMA copies entire tiles — 1 thread issues load, GPU handles the rest. Mbarrier sync, hardware swizzle. All 128 threads free for decode + `mma.sync` |
 
-V1/V2 differ only in tile size (128×64 vs 64×64) and occupancy. V3 is a fundamentally different architecture using Blackwell's Tensor Memory Accelerator. All three use [ZipServ](https://github.com/HPMLL/ZipServ_ASPLOS26)-style K-slice interleaving: `decode(slice N+1)` overlaps `mma.sync(slice N)`.
+V1/V2 differ only in tile size (128x64 vs 64x64) and occupancy. V3 is a fundamentally different architecture using Blackwell's Tensor Memory Accelerator. All three use [ZipServ](https://github.com/HPMLL/ZipServ_ASPLOS26)-style K-slice interleaving: `decode(slice N+1)` overlaps `mma.sync(slice N)`.
 
 Override with `TURBO_KERNEL=1|2|3`. See [CLAUDE.md](CLAUDE.md) for full kernel internals.
+
+</details>
 
 ---
 
@@ -222,7 +223,8 @@ The V3 fused decode+GEMM kernel uses tensor core patterns inspired by [ZipServ /
 
 ---
 
-## File Map
+<details>
+<summary><b>File Map</b></summary>
 
 ~5,500 lines of C++/CUDA/Python.
 
@@ -234,7 +236,9 @@ The V3 fused decode+GEMM kernel uses tensor core patterns inspired by [ZipServ /
 | `nvidia_kernels.cu` | 586 | NVIDIA fused decode+GEMM (V1/V2/V3 TMA) |
 | `engine/tokenizer.cpp` | 363 | Sentencepiece + HF BPE auto-detect |
 | `engine/model.cpp` | 303 | Model loader + escape table builder |
-| `engine/convert_model.py` | 206 | BF16/FP16 safetensors → Turbo format |
+| `engine/convert_model.py` | 206 | BF16/FP16 safetensors -> Turbo format |
 | `split12_pack.c` | 128 | C packer library (find_base_exp + pack) |
 | `gpu_compat.h` | 100 | AMD/NVIDIA kernel compatibility layer |
 | `engine/main.cpp` | 104 | CLI entry point + signal handler |
+
+</details>
