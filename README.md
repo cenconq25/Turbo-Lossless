@@ -176,15 +176,21 @@ CUDA_VISIBLE_DEVICES=0 TURBO_FAST=1 ./turbo-engine models/mistral-7b-instruct-tu
 
 ---
 
+## Acknowledgements
+
+The V3 fused decode+GEMM kernel (`nvidia_kernels.cu`) uses K-slice interleaving and `mma.sync` tensor core patterns inspired by [ZipServ / ZipGEMM](https://github.com/HPMLL/ZipServ_ASPLOS26) (Fan et al., ASPLOS 2026). Their work on fusing lossless decompression directly into tensor core registers via PTX was instrumental in achieving our high-batch throughput on NVIDIA GPUs. The core compression scheme (Split12 encoding, byte-aligned storage, 1-ADD decode) is independently developed.
+
+---
+
 ## File Map
 
-~4,750 lines of C++/CUDA.
+~3,500 lines of C++/CUDA.
 
 | File | Purpose |
 |------|---------|
 | `gpu_compat.h` | AMD/NVIDIA kernel compatibility layer |
 | `decompress_v2.hip` | Split12 per-row matvec kernels (B=1/4/8) |
-| `nvidia_kernels.cu` | NVIDIA fused decode+GEMM (V1/V2/V3 TMA) |
+| `nvidia_kernels.cu` | NVIDIA fused decode+GEMM (V1/V2/V3 TMA, ZipGEMM-inspired) |
 | `engine/inference.cpp` | Forward pass + generation loop |
 | `engine/kernels.hip` | RMSNorm, RoPE, Flash Attention, SiLU, argmax |
 | `engine/model.cpp` | Model loader + escape table builder |
