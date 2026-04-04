@@ -1,12 +1,4 @@
-# Turbo Lossless
-
-- **1.33x smaller** -- 12 bits per weight, fixed rate, no entropy coding
-- **Up to 2.93x faster than vLLM** -- fused decode + matmul, zero decompression overhead
-- **99.97% of weights decode with a single ADD** -- consistent across models, layers, and tensors
-- **Zero precision loss** -- 100% bit-perfect, lossless
-- **GPU-friendly by design** -- byte-aligned storage, no LUT, no bitstream parsing, near-fixed-length decode that maps directly to GPU-native operations
-
-Lossless BF16 compression that replaces the 8-bit exponent with a 4-bit group code. One integer ADD to decode. Runs on NVIDIA and AMD.
+# Lossless BF16 in 12 bits: 99.97% of weights decode with 1 ADD
 
 **Byte-aligned split storage: true 12-bit per weight, no 16-bit padding waste, and zero HBM read amplification. Sign + mantissa: exactly 1 byte per element. Group: two nibbles packed into exactly 1 byte.**
 
