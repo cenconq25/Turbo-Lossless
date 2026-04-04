@@ -8,6 +8,8 @@
 
 Lossless BF16 compression that replaces the 8-bit exponent with a 4-bit group code. One integer ADD to decode. Runs on NVIDIA and AMD.
 
+**Byte-aligned split storage: true 12-bit per weight, no 16-bit padding waste, and zero HBM read amplification. Sign + mantissa: exactly 1 byte per element. Group: two nibbles packed into exactly 1 byte.**
+
 ![Turbo 12-bit Compression](docs/turbo-diagram.png)
 
 > **Note:** Research proof of concept. KV cache and attention are not fully optimised -- expect slowdown over long conversations.
