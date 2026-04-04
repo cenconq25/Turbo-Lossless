@@ -4,6 +4,8 @@
 
 100% bit-perfect lossless compression for BF16 safetensors models. Replaces the 8-bit exponent with a 4-bit group code -- decode is a single integer ADD.
 
+![Turbo 12-bit Compression](docs/turbo-diagram.png)
+
 > **Note:** Research proof of concept. KV cache and attention are not fully optimised -- expect slowdown over long conversations.
 
 ![Turbo Lossless CLI](docs/turbo-screenshot.png)
@@ -60,7 +62,6 @@ BF16 safetensors only. No GGUF, no FP32, no quantized formats.
 ## Learn More
 
 - **[Technical Details](docs/TECHNICAL.md)** -- encoding format, kernel architecture, full benchmarks, build instructions, file map
-- **[CLAUDE.md](CLAUDE.md)** -- complete kernel internals and engine data flow
 
 ## Acknowledgements
 
