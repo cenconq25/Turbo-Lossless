@@ -1,8 +1,10 @@
 # Turbo Lossless
 
-**1.33x smaller. Up to 2.93x faster than vLLM. Zero precision loss.**
+**1.33x smaller. Up to 2.93x faster than vLLM. 99.97% of weights decode with a single ADD. Zero precision loss.**
 
 100% bit-perfect lossless compression for BF16 safetensors models. Replaces the 8-bit exponent with a 4-bit group code -- decode is a single integer ADD.
+
+Near-fixed-length, ultra-low decode cost, GPU-friendly lossless compression. The 99.97% coverage holds across models, layers, and tensors.
 
 ![Turbo 12-bit Compression](docs/turbo-diagram.png)
 
